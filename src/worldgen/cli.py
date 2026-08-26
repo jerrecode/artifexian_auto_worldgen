@@ -6,11 +6,12 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import pstats
+import sys
 from typing import Any
 
 import yaml
 
-from .config import load_config
+from .config import config_schema, load_config
 from .logging_utils import configure_logging
 from .progress import StageProgress, expected_pipeline_stages
 from .runtime import (
@@ -19,6 +20,7 @@ from .runtime import (
     optional_backend_status,
     resolve_runtime_plan,
 )
+from .workflow import StageCheckpointStore
 
 
 def _resolution(value: str) -> tuple[int, int]:
@@ -74,13 +76,6 @@ def _apply_quick(cfg) -> None:
     cfg.society.settlement_count = min(cfg.society.settlement_count, 60)
 
 
-def _validate_resolution(cfg) -> None:
-    if cfg.resolution.width < 64 or cfg.resolution.height < 32:
-        raise ValueError("Resolution must be at least 64x32")
-    if cfg.resolution.width != 2 * cfg.resolution.height:
-        raise ValueError("Use a 2:1 equirectangular grid: width must equal 2*height")
-
-
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="worldgen",
@@ -88,7 +83,7 @@ def _parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("generate", nargs="?", default="generate", help=argparse.SUPPRESS)
-    p.add_argument("--version", action="version", version="%(prog)s 0.3.0")
+    p.add_argument("--version", action="version", version="%(prog)s 0.4.0")
 
     io = p.add_argument_group("configuration and output")
     io.add_argument("--config", type=Path, default=None, help="YAML configuration file")
@@ -106,6 +101,12 @@ def _parser() -> argparse.ArgumentParser:
     io.add_argument("--no-report", action="store_true", help="Skip Markdown report export")
     io.add_argument("--compress-npz", action=argparse.BooleanOptionalAction, default=None,
                     help="Enable/disable DEFLATE compression for world_arrays.npz")
+    io.add_argument("--checkpoint-dir", type=Path, default=None,
+                    help="Content-addressed stage checkpoint directory")
+    io.add_argument("--resume", action="store_true",
+                    help="Restore matching completed stages from checkpoints; defaults checkpoint dir inside --out")
+    io.add_argument("--clear-checkpoints", action="store_true",
+                    help="Clear the selected checkpoint store before generation")
 
     res = p.add_argument_group("resolution and rendering")
     res.add_argument("--resolution", type=_resolution, metavar="WIDTHxHEIGHT", help="Simulation grid resolution")
@@ -144,10 +145,79 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
+def _config_command(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="worldgen config", description="Inspect and validate worldgen configuration")
+    sub = p.add_subparsers(dest="action", required=True)
+    sub.add_parser("schema", help="Print the machine-readable configuration schema")
+    val = sub.add_parser("validate", help="Validate a YAML configuration")
+    val.add_argument("path", type=Path)
+    exp = sub.add_parser("explain", help="Explain one configuration field")
+    exp.add_argument("key")
+    args = p.parse_args(argv)
+    if args.action == "schema":
+        print(json.dumps(config_schema(), indent=2, default=str))
+        return 0
+    if args.action == "validate":
+        cfg = load_config(args.path)
+        print(json.dumps({"valid": True, "seed": cfg.seed, "resolution": [cfg.resolution.width, cfg.resolution.height]}, indent=2))
+        return 0
+    schema = config_schema()
+    if args.key not in schema:
+        p.error(f"unknown configuration field: {args.key}")
+    print(json.dumps({args.key: schema[args.key]}, indent=2, default=str))
+    return 0
+
+
+def _cache_command(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="worldgen cache", description="Inspect or clear stage checkpoints")
+    p.add_argument("action", choices=("status", "clear"))
+    p.add_argument("path", type=Path)
+    args = p.parse_args(argv)
+    store = StageCheckpointStore(args.path)
+    if args.action == "clear":
+        store.clear()
+        print(f"Cleared checkpoint store: {store.root}")
+        return 0
+    entries = store._index.get("stages", {})
+    total = sum(int(v.get("size_bytes", 0)) for v in entries.values())
+    print(json.dumps({"path": str(store.root), "objects": len(entries), "bytes": total}, indent=2))
+    return 0
+
+
+def _inspect_command(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="worldgen inspect", description="Inspect a generated world's run manifest")
+    p.add_argument("world", type=Path)
+    args = p.parse_args(argv)
+    path = args.world if args.world.name == "run_manifest.json" else args.world / "run_manifest.json"
+    if not path.is_file():
+        p.error(f"run manifest not found: {path}")
+    print(path.read_text(encoding="utf-8"))
+    return 0
+
+
+def _dispatch_special(argv: list[str]) -> int | None:
+    if not argv:
+        return None
+    if argv[0] == "config":
+        return _config_command(argv[1:])
+    if argv[0] == "cache":
+        return _cache_command(argv[1:])
+    if argv[0] == "inspect":
+        return _inspect_command(argv[1:])
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    special = _dispatch_special(argv)
+    if special is not None:
+        return special
+
     p = _parser()
     args = p.parse_args(argv)
 
+    if args.generate not in (None, "generate"):
+        p.error(f"unknown command {args.generate!r}; use generate, config, cache, or inspect")
     if args.resolution_scale <= 0:
         p.error("--resolution-scale must be > 0")
     if args.png_scale <= 0:
@@ -157,49 +227,44 @@ def main(argv: list[str] | None = None) -> int:
     if args.array_store_max_gb <= 0:
         p.error("--array-store-max-gb must be > 0")
 
-    cfg = load_config(args.config)
-    if args.quick:
-        _apply_quick(cfg)
     try:
+        cfg = load_config(args.config)
+        if args.quick:
+            _apply_quick(cfg)
         for expression in args.overrides:
             _set_config_value(cfg, expression)
+        if args.seed is not None:
+            cfg.seed = args.seed
+        if args.resolution is not None:
+            cfg.resolution.width, cfg.resolution.height = args.resolution
+        if args.resolution_scale != 1.0:
+            height = max(32, int(round(cfg.resolution.height * args.resolution_scale)))
+            cfg.resolution.height = height
+            cfg.resolution.width = 2 * height
+        if args.width is not None or args.height is not None:
+            if args.width is not None and args.height is not None:
+                cfg.resolution.width, cfg.resolution.height = args.width, args.height
+            elif args.width is not None:
+                if args.width % 2:
+                    p.error("--width must be even when --height is inferred")
+                cfg.resolution.width, cfg.resolution.height = args.width, args.width // 2
+            else:
+                cfg.resolution.height, cfg.resolution.width = args.height, 2 * args.height
+
+        if args.no_society:
+            cfg.society.enabled = False
+        if args.no_png:
+            cfg.output.save_png = False
+        if args.no_npz:
+            cfg.output.save_npz = False
+        if args.no_json:
+            cfg.output.save_json = False
+        if args.no_report:
+            cfg.output.save_report = False
+        if args.compress_npz is not None:
+            cfg.output.compress_npz = bool(args.compress_npz)
+        cfg.validate()
     except (ValueError, KeyError, TypeError) as exc:
-        p.error(str(exc))
-
-    if args.seed is not None:
-        cfg.seed = args.seed
-    if args.resolution is not None:
-        cfg.resolution.width, cfg.resolution.height = args.resolution
-    if args.resolution_scale != 1.0:
-        height = max(32, int(round(cfg.resolution.height * args.resolution_scale)))
-        cfg.resolution.height = height
-        cfg.resolution.width = 2 * height
-    if args.width is not None or args.height is not None:
-        if args.width is not None and args.height is not None:
-            cfg.resolution.width, cfg.resolution.height = args.width, args.height
-        elif args.width is not None:
-            if args.width % 2:
-                p.error("--width must be even when --height is inferred")
-            cfg.resolution.width, cfg.resolution.height = args.width, args.width // 2
-        else:
-            cfg.resolution.height, cfg.resolution.width = args.height, 2 * args.height
-
-    if args.no_society:
-        cfg.society.enabled = False
-    if args.no_png:
-        cfg.output.save_png = False
-    if args.no_npz:
-        cfg.output.save_npz = False
-    if args.no_json:
-        cfg.output.save_json = False
-    if args.no_report:
-        cfg.output.save_report = False
-    if args.compress_npz is not None:
-        cfg.output.compress_npz = bool(args.compress_npz)
-
-    try:
-        _validate_resolution(cfg)
-    except ValueError as exc:
         p.error(str(exc))
 
     plan = resolve_runtime_plan(
@@ -221,18 +286,15 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("runtime backend=%s workers=%s/%s threads_per_worker=%s",
                 plan.backend, plan.workers, plan.cpu_count, plan.threads_per_worker)
 
+    runtime_payload = {
+        "backend": plan.backend,
+        "workers": plan.workers,
+        "cpu_count": plan.cpu_count,
+        "memory_limit_bytes": plan.memory_limit_bytes,
+        "threads_per_worker": plan.threads_per_worker,
+    }
     if args.runtime_info:
-        payload = {
-            "runtime_plan": {
-                "backend": plan.backend,
-                "workers": plan.workers,
-                "cpu_count": plan.cpu_count,
-                "memory_limit_bytes": plan.memory_limit_bytes,
-                "threads_per_worker": plan.threads_per_worker,
-            },
-            "optional_backends": optional_backend_status(),
-        }
-        print(json.dumps(payload, indent=2))
+        print(json.dumps({"runtime_plan": runtime_payload, "optional_backends": optional_backend_status()}, indent=2))
 
     if args.write_config is not None:
         args.write_config.parent.mkdir(parents=True, exist_ok=True)
@@ -242,7 +304,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         return 0
 
-    from .pipeline import WorldPipeline
+    from .execution import WorldPipeline
+
+    checkpoint_dir = args.checkpoint_dir
+    if checkpoint_dir is None and args.resume:
+        checkpoint_dir = args.out / ".worldgen-checkpoints"
+    if args.clear_checkpoints:
+        target = checkpoint_dir or (args.out / ".worldgen-checkpoints")
+        StageCheckpointStore(target).clear()
+        checkpoint_dir = target
 
     total_stages = expected_pipeline_stages(cfg, include_output=True)
     progress = StageProgress(
@@ -250,7 +320,13 @@ def main(argv: list[str] | None = None) -> int:
         enabled=bool(args.progress and not args.quiet),
         log=logger.info if args.verbose or args.log_file else None,
     )
-    pipeline = WorldPipeline(cfg, progress=progress)
+    pipeline = WorldPipeline(
+        cfg,
+        progress=progress,
+        checkpoint_dir=checkpoint_dir,
+        resume=args.resume,
+        runtime_plan=runtime_payload,
+    )
 
     if args.profile is None:
         world = pipeline.generate(args.out)
@@ -265,8 +341,7 @@ def main(argv: list[str] | None = None) -> int:
             profiler.dump_stats(args.profile)
             summary = args.profile.with_suffix(args.profile.suffix + ".txt")
             with summary.open("w", encoding="utf-8") as f:
-                stats = pstats.Stats(profiler, stream=f).sort_stats("cumtime")
-                stats.print_stats(80)
+                pstats.Stats(profiler, stream=f).sort_stats("cumtime").print_stats(80)
             logger.info("profile written to %s and %s", args.profile, summary)
     progress.finish()
 
@@ -286,11 +361,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.array_store is not None:
         from .storage import store_array_mapping
         arrays = pipeline._array_export(world)
-        store = store_array_mapping(
-            arrays,
-            args.array_store,
-            max_bytes=int(args.array_store_max_gb * 1024**3),
-        )
+        store = store_array_mapping(arrays, args.array_store, max_bytes=int(args.array_store_max_gb * 1024**3))
         logger.info("random-access array store: %s (%d arrays, %.3f GiB on disk)",
                     store.root, len(store.keys()), store.disk_usage_bytes() / 1024**3)
         store.close()
@@ -300,15 +371,10 @@ def main(argv: list[str] | None = None) -> int:
         timing_payload = {
             "seed": cfg.seed,
             "resolution": [cfg.resolution.width, cfg.resolution.height],
-            "runtime": {
-                "backend": plan.backend,
-                "workers": plan.workers,
-                "cpu_count": plan.cpu_count,
-                "memory_limit_bytes": plan.memory_limit_bytes,
-                "threads_per_worker": plan.threads_per_worker,
-            },
+            "runtime": runtime_payload,
             "stage_seconds": pipeline.timings,
             "total_stage_seconds": sum(pipeline.timings.values()),
+            "checkpoint_dir": str(checkpoint_dir) if checkpoint_dir is not None else None,
         }
         args.timings_json.write_text(json.dumps(timing_payload, indent=2), encoding="utf-8")
 

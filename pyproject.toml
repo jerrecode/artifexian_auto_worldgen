@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "artifexian-auto-worldgen"
-version = "0.3.0"
+version = "0.4.0"
 description = "Hierarchical tectonic, climate, fluvial landscape-evolution and worldbuilding generator reconstructed from Artifexian Worldbuilder's Log workflows."
 license = {text = "MIT"}
 readme = "README.md"
@@ -32,11 +32,23 @@ storage = [
   "numcodecs>=0.16",
   "h5py>=3.11",
 ]
+scientific = [
+  "xarray>=2025.1",
+  "pyamg>=5.2",
+]
+gis = [
+  "rasterio>=1.4",
+  "pyarrow>=18.0",
+]
 render = [
   "Pillow>=10.4",
 ]
 dev = [
   "pytest>=8.0",
+  "hypothesis>=6.0",
+  "pytest-benchmark>=5.0",
+  "ruff>=0.9",
+  "mypy>=1.14",
   "build>=1.2",
 ]
 
@@ -51,6 +63,10 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
 
 [project.urls]
 Homepage = "https://github.com/jerrecode/artifexian_auto_worldgen"

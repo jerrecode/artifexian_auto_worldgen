@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 import copy
 import yaml
+
+
+class ConfigValidationError(ValueError):
+    """Raised when a configuration is structurally valid but physically/numerically unsafe."""
 
 
 @dataclass(slots=True)
@@ -13,8 +17,6 @@ class ResolutionConfig:
     height: int = 384
     history_step_myr: int = 25
     history_myr: int = 850
-
-
 
 
 @dataclass(slots=True)
@@ -68,8 +70,6 @@ class TectonicsConfig:
     ridge_uplift_km: float = 2.3
     trench_depth_km: float = 4.0
     terrain_noise_km: float = 0.55
-    # Hierarchical microplate/subplate model. Individual subplates have their own
-    # preferred Euler motion while parent plates transmit coupling and stress.
     mean_subplates_per_plate: float = 5.0
     min_subplates_per_plate: int = 3
     max_subplates_per_plate: int = 9
@@ -83,7 +83,6 @@ class TectonicsConfig:
     boundary_detail_octaves: int = 6
     boundary_deformation_iterations: int = 2
     strain_boundary_warp_deg: float = 2.6
-    # Shape-control anchors make individual rigid blocks non-convex instead of pure spherical Voronoi cells.
     shape_control_points_per_subplate: int = 2
     shape_control_spread_deg: float = 5.0
     history_grid_height: int = 96
@@ -198,14 +197,12 @@ class HydrologyConfig:
 
 @dataclass(slots=True)
 class SimulationConfig:
-    # Macro passes couple ocean circulation -> atmosphere -> runoff -> erosion/uplift/deltas -> terrain.
     earth_system_passes: int = 3
     final_climate_ocean_passes: int = 1
-    # Intermediate passes are predictors: they retain the same physics but use fewer expensive
-    # atmospheric/ocean iterations. The last macro pass and final coupling pass run full fidelity.
     intermediate_climate_fraction: float = 0.28
     intermediate_ocean_fraction: float = 0.52
     preserve_initial_sea_level: bool = True
+
 
 @dataclass(slots=True)
 class WeatherConfig:
@@ -235,8 +232,6 @@ class SocietyConfig:
     coastal_trade_bonus: float = 0.06
 
 
-
-
 @dataclass(slots=True)
 class AppearanceConfig:
     vegetation_temp_mid_c: float = 7.0
@@ -264,7 +259,6 @@ class OutputConfig:
     save_png: bool = True
     save_json: bool = True
     save_report: bool = True
-    # Compression is optional because deflate can dominate runtime on high-resolution monthly fields.
     compress_npz: bool = False
     map_dpi: int = 120
     rgb_dpi: int = 135
@@ -291,6 +285,104 @@ class WorldConfig:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    def validate(self) -> "WorldConfig":
+        r = self.resolution
+        _require(r.width >= 64 and r.height >= 32, "resolution must be at least 64x32")
+        _require(r.width == 2 * r.height, "resolution.width must equal 2*resolution.height")
+        _require(r.history_step_myr > 0 and r.history_myr > 0, "geological history durations must be positive")
+        _require(r.history_step_myr <= r.history_myr, "history_step_myr cannot exceed history_myr")
+
+        n = self.noise
+        _require(n.octaves >= 1, "noise.octaves must be >= 1")
+        _require(0 < n.persistence <= 1, "noise.persistence must be in (0, 1]")
+        _require(n.lacunarity > 1, "noise.lacunarity must be > 1")
+        _require(n.domain_warp_strength >= 0 and n.minimum_sigma_px > 0, "noise warp must be nonnegative and sigma positive")
+        weights = (n.value_weight, n.ridge_weight, n.billow_weight, n.wave_weight)
+        _require(all(x >= 0 for x in weights) and sum(weights) > 0, "noise mixture weights must be nonnegative and not all zero")
+        _require(n.wave_count >= 0, "noise.wave_count must be >= 0")
+
+        a = self.astronomy
+        _require(a.star_mass_solar > 0 and a.planet_mass_earth > 0 and a.planet_density_g_cm3 > 0, "stellar/planetary mass and density must be positive")
+        _require(0 <= a.eccentricity < 1, "astronomy.eccentricity must be in [0,1)")
+        _require(0 <= a.albedo < 1, "astronomy.albedo must be in [0,1)")
+        _require(0 <= a.axial_tilt_deg <= 180, "astronomy.axial_tilt_deg must be in [0,180]")
+        _require(a.rotation_hours > 0 and a.atmosphere_pressure_bar > 0, "rotation period and surface pressure must be positive")
+        _require(a.system_planet_count >= 1, "astronomy.system_planet_count must be >= 1")
+        _require(a.moon_mass_earth >= 0 and a.moon_orbit_km > 0, "moon mass must be nonnegative and orbit positive")
+        _require(bool(a.atmosphere) and all(float(v) >= 0 for v in a.atmosphere.values()) and sum(map(float, a.atmosphere.values())) > 0,
+                 "astronomy.atmosphere must contain nonnegative fractions with positive total")
+
+        t = self.tectonics
+        _require(t.plate_count >= 2, "tectonics.plate_count must be >= 2")
+        _fraction(t.continental_fraction_target, "tectonics.continental_fraction_target")
+        _fraction(t.continental_plate_fraction, "tectonics.continental_plate_fraction")
+        _fraction(t.parent_coupling, "tectonics.parent_coupling")
+        _fraction(t.collision_nudge, "tectonics.collision_nudge")
+        _require(t.max_plate_speed_cm_yr > 0 and t.lip_interval_myr > 0, "plate speed and LIP interval must be positive")
+        _require(t.hotspot_count >= 0, "tectonics.hotspot_count must be >= 0")
+        _require(1 <= t.min_subplates_per_plate <= t.max_subplates_per_plate, "subplate min/max are inconsistent")
+        _require(t.mean_subplates_per_plate >= t.min_subplates_per_plate, "mean_subplates_per_plate must be >= minimum")
+        _require(t.boundary_detail_octaves >= 1 and t.history_grid_height >= 16, "tectonic detail/history resolution is too small")
+        _require(t.boundary_deformation_iterations >= 0 and t.fuse_persistence_steps >= 1, "tectonic iteration counts are invalid")
+
+        tr = self.terrain
+        _require(bool(tr.sea_level_mode), "terrain.sea_level_mode cannot be empty")
+        _require(tr.lapse_rate_k_per_km > 0 and tr.shelf_depth_m > 0, "lapse rate and shelf depth must be positive")
+        _require(tr.shelf_width_km_passive > 0 and tr.shelf_width_km_active > 0, "shelf widths must be positive")
+        _require(tr.fractal_octaves >= 1 and tr.min_island_area_km2 >= 0, "terrain octave/island settings are invalid")
+        _require(0 <= tr.coastal_reworking_strength <= 1, "terrain.coastal_reworking_strength must be in [0,1]")
+
+        o = self.ocean
+        _require(o.young_crust_depth_m > 0 and o.max_abyss_depth_m > o.young_crust_depth_m, "ocean depth parameters are inconsistent")
+        _require(o.current_iterations >= 1 and o.heat_transport_iterations >= 1, "ocean iteration counts must be >= 1")
+        for name in ("wind_coupling", "ekman_strength", "seasonal_current_strength", "heat_advection_strength", "bathymetric_steering_strength"):
+            _require(getattr(o, name) >= 0, f"ocean.{name} must be nonnegative")
+
+        cl = self.climate
+        _require(cl.months == 12, "climate.months must currently equal 12")
+        _require(cl.moisture_iterations >= 1 and cl.thermal_memory_spinup_years >= 1, "climate iteration counts must be >= 1")
+        _require(cl.precip_scale_mm_year > 0 and cl.moisture_step_km > 0 and cl.inland_thermal_length_km > 0, "climate scales must be positive")
+        _require(0 < cl.precipitation_tail_exponent <= 1, "climate.precipitation_tail_exponent must be in (0,1]")
+        _require(cl.precipitation_extreme_softcap_mm_month > 0, "climate precipitation soft cap must be positive")
+        _require(cl.land_thermal_lag_months > 0 and cl.ocean_thermal_lag_months > 0, "thermal lag constants must be positive")
+
+        h = self.hydrology
+        _fraction(h.river_accumulation_quantile, "hydrology.river_accumulation_quantile", inclusive_upper=False)
+        _fraction(h.runoff_base_fraction, "hydrology.runoff_base_fraction")
+        _fraction(h.delta_retention_fraction, "hydrology.delta_retention_fraction")
+        _fraction(h.lake_area_soft_cap_fraction_land, "hydrology.lake_area_soft_cap_fraction_land")
+        _fraction(h.tributary_discharge_fraction, "hydrology.tributary_discharge_fraction")
+        _require(h.surface_evolution_iterations >= 0 and h.flow_refresh_interval >= 1 and h.sediment_routing_passes >= 1, "hydrology iteration counts are invalid")
+        _require(h.stream_power_m >= 0 and h.stream_power_n >= 0 and h.max_fluvial_erosion_m_per_iteration >= 0, "stream-power parameters must be nonnegative")
+        _require(h.min_drainage_area_km2 >= 0 and h.lake_min_catchment_km2 >= 0 and h.lake_min_depth_m >= 0, "hydrology area/depth thresholds must be nonnegative")
+
+        sim = self.simulation
+        _require(sim.earth_system_passes >= 1 and sim.final_climate_ocean_passes >= 1, "simulation pass counts must be >= 1")
+        _fraction(sim.intermediate_climate_fraction, "simulation.intermediate_climate_fraction")
+        _fraction(sim.intermediate_ocean_fraction, "simulation.intermediate_ocean_fraction")
+
+        w = self.weather
+        _require(0 <= w.hurricane_lat_min_deg < w.hurricane_lat_max_deg <= 90, "hurricane latitude bounds are invalid")
+        _require(w.hurricane_seed_count >= 0 and w.hurricane_max_steps >= 1, "hurricane count/step settings are invalid")
+
+        rs = self.resources
+        _require(rs.deposit_density >= 0 and rs.meteorite_expected_count >= 0, "resource density/count must be nonnegative")
+
+        s = self.society
+        _require(s.settlement_count >= 0 and s.history_years > 0 and s.history_step_years > 0, "society count/history settings are invalid")
+        _require(0 <= s.portal_latitude_max_deg <= 90, "society.portal_latitude_max_deg must be in [0,90]")
+        for name in ("agricultural_productivity_weight", "river_navigation_bonus", "coastal_trade_bonus"):
+            _fraction(getattr(s, name), f"society.{name}")
+
+        ap = self.appearance
+        _require(ap.vegetation_temp_scale_c > 0 and ap.forest_precip_scale_mm_year > 0, "appearance response scales must be positive")
+        _require(ap.alpine_bare_full_km > ap.alpine_bare_start_km, "appearance alpine thresholds are inconsistent")
+        for name in ("snow_albedo", "vegetation_albedo", "desert_albedo", "ocean_albedo", "turbidity_strength", "hillshade_strength", "cloud_max_optical_opacity"):
+            _fraction(getattr(ap, name), f"appearance.{name}")
+
+        _require(self.output.map_dpi > 0 and self.output.rgb_dpi > 0, "output DPI values must be positive")
+        return self
+
 
 _SECTION_TYPES = {
     "resolution": ResolutionConfig,
@@ -310,6 +402,56 @@ _SECTION_TYPES = {
 }
 
 
+CONFIG_UNITS: dict[str, str] = {
+    "resolution.history_step_myr": "Myr",
+    "resolution.history_myr": "Myr",
+    "astronomy.star_mass_solar": "solar_mass",
+    "astronomy.planet_mass_earth": "earth_mass",
+    "astronomy.planet_density_g_cm3": "g/cm3",
+    "astronomy.semimajor_axis_au": "AU",
+    "astronomy.rotation_hours": "h",
+    "astronomy.atmosphere_pressure_bar": "bar",
+    "tectonics.max_plate_speed_cm_yr": "cm/yr",
+    "terrain.shelf_depth_m": "m",
+    "ocean.young_crust_depth_m": "m",
+    "ocean.max_abyss_depth_m": "m",
+    "climate.precip_scale_mm_year": "mm/yr",
+    "climate.moisture_step_km": "km",
+    "hydrology.min_drainage_area_km2": "km2",
+    "hydrology.lake_min_depth_m": "m",
+    "weather.hurricane_sst_c": "degC",
+}
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ConfigValidationError(message)
+
+
+def _fraction(value: float, name: str, *, inclusive_upper: bool = True) -> None:
+    ok = 0 <= float(value) <= 1 if inclusive_upper else 0 <= float(value) < 1
+    if not ok:
+        bound = "[0,1]" if inclusive_upper else "[0,1)"
+        raise ConfigValidationError(f"{name} must be in {bound}")
+
+
+def config_schema() -> dict[str, dict[str, Any]]:
+    """Return a machine-readable flat schema for CLI/UI configuration tooling."""
+    cfg = WorldConfig()
+    out: dict[str, dict[str, Any]] = {"seed": {"type": "int", "default": cfg.seed, "unit": None}}
+    for section in _SECTION_TYPES:
+        obj = getattr(cfg, section)
+        for f in fields(obj):
+            key = f"{section}.{f.name}"
+            value = getattr(obj, f.name)
+            out[key] = {
+                "type": str(f.type),
+                "default": copy.deepcopy(value),
+                "unit": CONFIG_UNITS.get(key),
+            }
+    return out
+
+
 def _merge_dataclass(instance: Any, values: dict[str, Any]) -> Any:
     for key, value in values.items():
         if not hasattr(instance, key):
@@ -321,9 +463,11 @@ def _merge_dataclass(instance: Any, values: dict[str, Any]) -> Any:
 def load_config(path: str | Path | None = None) -> WorldConfig:
     cfg = WorldConfig()
     if path is None:
-        return cfg
+        return cfg.validate()
     with Path(path).open("r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
+    if not isinstance(raw, dict):
+        raise TypeError("top-level configuration must be a mapping")
     for key, value in raw.items():
         if key == "seed":
             cfg.seed = int(value)
@@ -333,8 +477,4 @@ def load_config(path: str | Path | None = None) -> WorldConfig:
             _merge_dataclass(getattr(cfg, key), value)
         else:
             raise KeyError(f"Unknown top-level configuration key: {key}")
-    if cfg.resolution.width < 64 or cfg.resolution.height < 32:
-        raise ValueError("Resolution must be at least 64x32")
-    if cfg.resolution.width != 2 * cfg.resolution.height:
-        raise ValueError("Use a 2:1 equirectangular grid: width must equal 2*height")
-    return cfg
+    return cfg.validate()
