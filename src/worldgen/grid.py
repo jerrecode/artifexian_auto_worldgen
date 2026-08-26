@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 import numpy as np
 from scipy import ndimage
@@ -29,17 +30,30 @@ class SphereGrid:
         self.dy_km = self.radius_km * self.dlat_rad
         self.dx_km = self.radius_km * self.dlon_rad * np.maximum(np.cos(lat_r), 1e-3)
 
+    @property
+    def ops(self):
+        # Lazy import prevents a module cycle while giving callers one canonical
+        # spherical-topology implementation.
+        from .topology import SphericalRasterOps
+        return SphericalRasterOps(self)
+
     def weighted_fraction(self, mask: np.ndarray) -> float:
         return float(np.sum(self.cell_area_weights * np.asarray(mask, dtype=float)))
 
     def weighted_quantile(self, data: np.ndarray, q: float) -> float:
-        a = np.asarray(data).ravel()
-        w = self.cell_area_weights.ravel()
-        idx = np.argsort(a)
-        aa = a[idx]
-        ww = w[idx]
+        a = np.asarray(data, dtype=np.float64).ravel()
+        w = np.asarray(self.cell_area_weights, dtype=np.float64).ravel()
+        finite = np.isfinite(a) & np.isfinite(w) & (w > 0)
+        if not np.any(finite):
+            return float("nan")
+        aa = a[finite]
+        ww = w[finite]
+        idx = np.argsort(aa)
+        aa = aa[idx]
+        ww = ww[idx]
         c = np.cumsum(ww)
-        return float(np.interp(q, c, aa))
+        c /= max(float(c[-1]), 1e-30)
+        return float(np.interp(float(np.clip(q, 0.0, 1.0)), c, aa))
 
     def great_circle_km(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         p1, p2 = np.deg2rad([lat1, lat2])
@@ -64,19 +78,23 @@ def spherical_voronoi_ids(grid: SphereGrid, seeds_xyz: np.ndarray, chunk: int = 
 
 
 def smooth_periodic(a: np.ndarray, sigma: float | tuple[float, float]) -> np.ndarray:
+    """Legacy equirectangular Gaussian smoothing.
+
+    Longitude is periodic. Latitude remains nearest-clamped for backward
+    compatibility; new topology-sensitive algorithms should prefer ``grid.ops``
+    primitives where possible.
+    """
     return ndimage.gaussian_filter(a, sigma=sigma, mode=("nearest", "wrap"))
 
 
 def distance_to(mask: np.ndarray, grid: SphereGrid) -> np.ndarray:
-    """Fast equirectangular approximation to distance to True pixels in km."""
-    if not np.any(mask):
-        return np.full(mask.shape, np.inf, dtype=np.float64)
-    # EDT does not wrap longitude. Triplication makes seam distances correct.
-    trip = np.concatenate([mask, mask, mask], axis=1)
-    dist_px = ndimage.distance_transform_edt(~trip)
-    dist_px = dist_px[:, grid.width:2 * grid.width]
-    # latitude-varying east-west pixel scale; EDT isotropic in px, use conservative mean.
-    return dist_px * grid.dy_km
+    """Great-circle distance in km to the nearest True region.
+
+    This now delegates to the canonical spherical topology implementation rather
+    than an isotropic equirectangular EDT approximation.
+    """
+    from .topology import geodesic_distance_to
+    return geodesic_distance_to(mask, grid)
 
 
 def boundary_mask(labels: np.ndarray) -> np.ndarray:
@@ -89,19 +107,21 @@ def boundary_mask(labels: np.ndarray) -> np.ndarray:
 
 
 def local_slope(elevation_km: np.ndarray, grid: SphereGrid) -> np.ndarray:
-    gy, gx = np.gradient(elevation_km)
-    dx = np.maximum(grid.dx_km, 1e-3)
-    sy = gy / grid.dy_km
-    sx = gx / dx
-    return np.hypot(sx, sy)
+    gy, gx = grid.ops.metric_gradient(elevation_km)
+    return np.hypot(gx, gy)
 
 
 def normalize01(a: np.ndarray, robust: bool = True) -> np.ndarray:
     arr = np.asarray(a, dtype=np.float64)
+    finite = np.isfinite(arr)
+    if not np.any(finite):
+        return np.zeros_like(arr)
     if robust:
-        lo, hi = np.nanpercentile(arr, [1.0, 99.0])
+        lo, hi = np.nanpercentile(arr[finite], [1.0, 99.0])
     else:
-        lo, hi = np.nanmin(arr), np.nanmax(arr)
+        lo, hi = np.nanmin(arr[finite]), np.nanmax(arr[finite])
     if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
         return np.zeros_like(arr)
-    return np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+    out = np.zeros_like(arr)
+    out[finite] = np.clip((arr[finite] - lo) / (hi - lo), 0.0, 1.0)
+    return out
