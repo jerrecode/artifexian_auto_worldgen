@@ -89,3 +89,120 @@ jobs:
 
       - name: Exercise JIT and optional-backend code paths
         run: pytest -q
+
+  integration:
+    name: End-to-end generation and resume
+    needs: [validate, optional-backends]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[performance,render]'
+          python -m pip check
+
+      - name: Generate complete small world
+        run: |
+          rm -rf /tmp/worldgen-e2e /tmp/worldgen-e2e-checkpoints /tmp/worldgen-e2e-arrays
+          worldgen \
+            --quick \
+            --resolution 128x64 \
+            --seed 20260826 \
+            --out /tmp/worldgen-e2e \
+            --checkpoint-dir /tmp/worldgen-e2e-checkpoints \
+            --checkpoint-max-gb 1 \
+            --array-store /tmp/worldgen-e2e-arrays \
+            --array-store-max-gb 1 \
+            --workers 2 \
+            --worker-cap 2 \
+            --threads-per-worker 1 \
+            --parallel-backend thread \
+            --png-scale 1.10 \
+            --max-png-megapixels 20 \
+            --timings-json /tmp/worldgen-e2e/timings-first.json \
+            --log-file /tmp/worldgen-e2e/run.jsonl \
+            --log-json \
+            --hash-outputs \
+            --no-progress
+
+      - name: Validate generated artifacts and invariants
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import json
+          import sqlite3
+          import numpy as np
+
+          out = Path('/tmp/worldgen-e2e')
+          required = [
+              'world_arrays.npz', 'world.json', 'features.geojson', 'world_report.md',
+              'diagnostics.json', 'run_manifest.json', 'run.jsonl', 'maps/render_manifest.json',
+          ]
+          for rel in required:
+              p = out / rel
+              assert p.is_file() and p.stat().st_size > 0, f'missing/empty artifact: {rel}'
+
+          diagnostics = json.loads((out / 'diagnostics.json').read_text())
+          assert diagnostics['all_invariants_passed'] is True, diagnostics
+
+          manifest = json.loads((out / 'run_manifest.json').read_text())
+          assert manifest['seed'] == 20260826
+          assert manifest['outputs'], 'manifest contains no outputs'
+
+          render_manifest = json.loads((out / 'maps/render_manifest.json').read_text())
+          assert len(render_manifest['files']) >= 30, len(render_manifest['files'])
+          assert len(list((out / 'maps').glob('*.png'))) >= 30
+
+          with np.load(out / 'world_arrays.npz', allow_pickle=False) as arrays:
+              assert arrays['elevation_km'].shape == (64, 128)
+              assert arrays['true_color_rgb'].shape == (64, 128, 3)
+              assert 'stream_order' in arrays
+              assert np.isfinite(arrays['annual_temperature_c']).all()
+
+          db = sqlite3.connect('/tmp/worldgen-e2e-arrays/index.sqlite3')
+          try:
+              count = db.execute('SELECT COUNT(*) FROM arrays').fetchone()[0]
+          finally:
+              db.close()
+          assert count >= 80, count
+          PY
+
+      - name: Resume identical physical world from checkpoints
+        run: |
+          worldgen \
+            --quick \
+            --resolution 128x64 \
+            --seed 20260826 \
+            --out /tmp/worldgen-e2e-second \
+            --checkpoint-dir /tmp/worldgen-e2e-checkpoints \
+            --checkpoint-max-gb 1 \
+            --workers 1 \
+            --no-png --no-npz --no-json --no-report \
+            --timings-json /tmp/worldgen-e2e-second/timings-second.json \
+            --no-progress
+
+      - name: Verify resume actually hit stage checkpoints
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import json
+          p = Path('/tmp/worldgen-e2e-second/timings-second.json')
+          assert p.is_file()
+          timings = json.loads(p.read_text())
+          stats = timings['checkpoint_stats']
+          assert stats['run_stage_hits'] >= 10, stats
+          assert stats['hits'] >= stats['run_stage_hits'], stats
+          stage = timings['stage_seconds']
+          zeroish = sum(float(v) == 0.0 for k, v in stage.items() if k != 'output')
+          assert zeroish >= 10, stage
+          leftovers = list(Path('/tmp/worldgen-e2e-checkpoints/objects').glob('.*.tmp-*'))
+          assert not leftovers, leftovers
+          PY
