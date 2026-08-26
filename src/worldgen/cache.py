@@ -71,13 +71,21 @@ class ByteBoundLRUCache(Generic[K, V]):
             return value
 
     def put(self, key: K, value: V, *, size_bytes: int | None = None) -> bool:
+        """Insert or replace *key* without destroying a valid value on rejection.
+
+        A replacement larger than the cache budget cannot be stored.  The previous
+        implementation popped the existing value before making that determination,
+        so a failed oversized update silently deleted otherwise valid cached state.
+        Capacity rejection is now checked first and is therefore transactional from
+        the caller's perspective.
+        """
         size = estimate_bytes(value) if size_bytes is None else max(0, int(size_bytes))
         with self._lock:
+            if self.max_bytes == 0 or size > self.max_bytes:
+                return False
             old = self._data.pop(key, None)
             if old is not None:
                 self._bytes -= old[1]
-            if self.max_bytes == 0 or size > self.max_bytes:
-                return False
             self._data[key] = (value, size, time.monotonic())
             self._bytes += size
             self._evict_to_limit()
