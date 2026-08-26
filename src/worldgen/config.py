@@ -19,6 +19,7 @@ class ResolutionConfig:
 @dataclass(slots=True)
 class NoiseConfig:
     """Shared hybrid multi-octave noise controls used by every map-like stochastic field."""
+
     octaves: int = 7
     persistence: float = 0.56
     lacunarity: float = 2.0
@@ -50,9 +51,9 @@ class AstronomyConfig:
     system_planet_count: int = 8
     stellar_neighborhood_radius_ly: float = 20.0
     stellar_density_per_ly3: float = 0.004
-    atmosphere: dict[str, float] = field(default_factory=lambda: {
-        "N2": 0.7800, "O2": 0.2090, "Ar": 0.0093, "CO2": 0.0006
-    })
+    atmosphere: dict[str, float] = field(
+        default_factory=lambda: {"N2": 0.7800, "O2": 0.2090, "Ar": 0.0093, "CO2": 0.0006}
+    )
 
 
 @dataclass(slots=True)
@@ -163,7 +164,17 @@ class HydrologyConfig:
     min_drainage_area_km2: float = 520.0
     runoff_base_fraction: float = 0.24
     surface_evolution_iterations: int = 4
+
+    # Legacy interval scheduling remains the default for exact backward compatibility.
+    # ``adaptive`` and ``hybrid`` compare physical geomorphic change against the state
+    # at the last receiver-graph rebuild and enforce a hard maximum reuse interval.
+    flow_refresh_mode: str = "interval"
     flow_refresh_interval: int = 1
+    flow_refresh_max_interval: int = 3
+    flow_refresh_elevation_threshold_m: float = 4.0
+    flow_refresh_land_change_fraction: float = 2.0e-4
+    flow_refresh_delta_threshold_m: float = 2.0
+
     stream_power_m: float = 0.50
     stream_power_n: float = 1.00
     max_fluvial_erosion_m_per_iteration: float = 15.0
@@ -194,11 +205,28 @@ class HydrologyConfig:
 
 @dataclass(slots=True)
 class SimulationConfig:
+    # Legacy fixed pass counts remain authoritative unless adaptive convergence is
+    # explicitly enabled. This preserves old-world reproducibility by default.
     earth_system_passes: int = 3
     final_climate_ocean_passes: int = 1
     intermediate_climate_fraction: float = 0.28
     intermediate_ocean_fraction: float = 0.52
     preserve_initial_sea_level: bool = True
+
+    adaptive_convergence: bool = False
+    min_earth_system_passes: int = 2
+    max_earth_system_passes: int = 6
+    convergence_temperature_c: float = 0.15
+    convergence_precip_mm_year: float = 15.0
+    convergence_elevation_m: float = 2.0
+    required_consecutive_converged_passes: int = 2
+
+    adaptive_final_coupling: bool = False
+    min_final_climate_ocean_passes: int = 1
+    max_final_climate_ocean_passes: int = 4
+    final_convergence_temperature_c: float = 0.08
+    final_convergence_precip_mm_year: float = 8.0
+    required_consecutive_final_converged_passes: int = 1
 
 
 @dataclass(slots=True)
@@ -261,8 +289,15 @@ class OutputConfig:
     rgb_dpi: int = 135
 
 
-def _number(name: str, value: Any, *, minimum: float | None = None, maximum: float | None = None,
-            min_inclusive: bool = True, max_inclusive: bool = True) -> float:
+def _number(
+    name: str,
+    value: Any,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+    min_inclusive: bool = True,
+    max_inclusive: bool = True,
+) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
         raise TypeError(f"{name} must be a finite number, got {value!r}")
     x = float(value)
@@ -275,7 +310,13 @@ def _number(name: str, value: Any, *, minimum: float | None = None, maximum: flo
     return x
 
 
-def _integer(name: str, value: Any, *, minimum: int | None = None, maximum: int | None = None) -> int:
+def _integer(
+    name: str,
+    value: Any,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(f"{name} must be an integer, got {value!r}")
     if minimum is not None and value < minimum:
@@ -287,6 +328,12 @@ def _integer(name: str, value: Any, *, minimum: int | None = None, maximum: int 
 
 def _fraction(name: str, value: Any) -> float:
     return _number(name, value, minimum=0.0, maximum=1.0)
+
+
+def _boolean(name: str, value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"{name} must be boolean, got {value!r}")
+    return value
 
 
 @dataclass(slots=True)
@@ -311,13 +358,9 @@ class WorldConfig:
         return asdict(self)
 
     def validate(self) -> "WorldConfig":
-        """Validate types, physical domains and algorithmic safety limits.
-
-        The validator is intentionally conservative about universally invalid values
-        while allowing unusual but scientifically meaningful planets (for example,
-        retrograde axial tilts above 90 degrees).
-        """
+        """Validate types, physical domains and algorithmic safety limits."""
         _integer("seed", self.seed)
+
         r = self.resolution
         _integer("resolution.width", r.width, minimum=64)
         _integer("resolution.height", r.height, minimum=32)
@@ -338,12 +381,18 @@ class WorldConfig:
         weights = [n.value_weight, n.ridge_weight, n.billow_weight, n.wave_weight]
         for i, value in enumerate(weights):
             _number(f"noise.weight[{i}]", value, minimum=0.0)
-        if sum(map(float, weights)) <= 0:
+        if sum(map(float, weights)) <= 0.0:
             raise ValueError("at least one noise blend weight must be positive")
 
         a = self.astronomy
-        for name in ("star_mass_solar", "planet_mass_earth", "planet_density_g_cm3", "rotation_hours",
-                     "atmosphere_pressure_bar", "moon_orbit_km"):
+        for name in (
+            "star_mass_solar",
+            "planet_mass_earth",
+            "planet_density_g_cm3",
+            "rotation_hours",
+            "atmosphere_pressure_bar",
+            "moon_orbit_km",
+        ):
             _number(f"astronomy.{name}", getattr(a, name), minimum=0.0, min_inclusive=False)
         if a.semimajor_axis_au is not None:
             _number("astronomy.semimajor_axis_au", a.semimajor_axis_au, minimum=0.0, min_inclusive=False)
@@ -360,7 +409,7 @@ class WorldConfig:
             if not isinstance(species, str) or not species:
                 raise TypeError("atmosphere species names must be non-empty strings")
             _number(f"astronomy.atmosphere.{species}", fraction, minimum=0.0)
-        if sum(float(x) for x in a.atmosphere.values()) <= 0:
+        if sum(float(x) for x in a.atmosphere.values()) <= 0.0:
             raise ValueError("astronomy.atmosphere fractions must sum to a positive value")
 
         t = self.tectonics
@@ -384,18 +433,36 @@ class WorldConfig:
         if tr.sea_level_mode not in {"target_land_fraction"}:
             raise ValueError(f"unsupported terrain.sea_level_mode: {tr.sea_level_mode!r}")
         _integer("terrain.fractal_octaves", tr.fractal_octaves, minimum=1, maximum=16)
-        for name in ("shelf_depth_m", "shelf_width_km_passive", "shelf_width_km_active", "coastal_reworking_sigma_px",
-                     "coastal_reworking_band_km", "min_island_area_km2"):
+        for name in (
+            "shelf_depth_m",
+            "shelf_width_km_passive",
+            "shelf_width_km_active",
+            "coastal_reworking_sigma_px",
+            "coastal_reworking_band_km",
+            "min_island_area_km2",
+        ):
             _number(f"terrain.{name}", getattr(tr, name), minimum=0.0)
         _fraction("terrain.coastal_reworking_strength", tr.coastal_reworking_strength)
 
         o = self.ocean
         _integer("ocean.current_iterations", o.current_iterations, minimum=1)
         _integer("ocean.heat_transport_iterations", o.heat_transport_iterations, minimum=1)
-        for name in ("young_crust_depth_m", "subsidence_sqrt_m_per_sqrt_myr", "max_abyss_depth_m", "boundary_current_width_km"):
+        for name in (
+            "young_crust_depth_m",
+            "subsidence_sqrt_m_per_sqrt_myr",
+            "max_abyss_depth_m",
+            "boundary_current_width_km",
+        ):
             _number(f"ocean.{name}", getattr(o, name), minimum=0.0, min_inclusive=False)
-        for name in ("wind_coupling", "ekman_strength", "seasonal_current_strength", "heat_advection_strength",
-                     "western_boundary_strength", "eastern_boundary_strength", "bathymetric_steering_strength"):
+        for name in (
+            "wind_coupling",
+            "ekman_strength",
+            "seasonal_current_strength",
+            "heat_advection_strength",
+            "western_boundary_strength",
+            "eastern_boundary_strength",
+            "bathymetric_steering_strength",
+        ):
             _number(f"ocean.{name}", getattr(o, name), minimum=0.0, maximum=2.0)
 
         c = self.climate
@@ -403,9 +470,17 @@ class WorldConfig:
             raise ValueError("climate.months must currently equal 12")
         _integer("climate.moisture_iterations", c.moisture_iterations, minimum=1)
         _integer("climate.thermal_memory_spinup_years", c.thermal_memory_spinup_years, minimum=1)
-        for name in ("precip_scale_mm_year", "orographic_lift_scale_km", "precipitation_softscale_mm_month",
-                     "precipitation_extreme_softcap_mm_month", "inland_thermal_length_km", "moisture_step_km",
-                     "land_thermal_lag_months", "ocean_thermal_lag_months", "precipitation_mesoscale_sigma_px"):
+        for name in (
+            "precip_scale_mm_year",
+            "orographic_lift_scale_km",
+            "precipitation_softscale_mm_month",
+            "precipitation_extreme_softcap_mm_month",
+            "inland_thermal_length_km",
+            "moisture_step_km",
+            "land_thermal_lag_months",
+            "ocean_thermal_lag_months",
+            "precipitation_mesoscale_sigma_px",
+        ):
             _number(f"climate.{name}", getattr(c, name), minimum=0.0, min_inclusive=False)
         _number("climate.precipitation_tail_exponent", c.precipitation_tail_exponent, minimum=0.1, maximum=1.5)
         _number("climate.topographic_wind_steering", c.topographic_wind_steering, minimum=0.0, maximum=1.0)
@@ -414,16 +489,39 @@ class WorldConfig:
         _fraction("hydrology.river_accumulation_quantile", h.river_accumulation_quantile)
         _fraction("hydrology.runoff_base_fraction", h.runoff_base_fraction)
         _integer("hydrology.surface_evolution_iterations", h.surface_evolution_iterations, minimum=0)
+        if h.flow_refresh_mode not in {"interval", "adaptive", "hybrid"}:
+            raise ValueError("hydrology.flow_refresh_mode must be interval, adaptive, or hybrid")
         _integer("hydrology.flow_refresh_interval", h.flow_refresh_interval, minimum=1)
+        _integer("hydrology.flow_refresh_max_interval", h.flow_refresh_max_interval, minimum=1)
+        _number("hydrology.flow_refresh_elevation_threshold_m", h.flow_refresh_elevation_threshold_m, minimum=0.0)
+        _fraction("hydrology.flow_refresh_land_change_fraction", h.flow_refresh_land_change_fraction)
+        _number("hydrology.flow_refresh_delta_threshold_m", h.flow_refresh_delta_threshold_m, minimum=0.0)
         _integer("hydrology.sediment_routing_passes", h.sediment_routing_passes, minimum=1)
         _integer("hydrology.max_river_centerlines", h.max_river_centerlines, minimum=0)
-        for name in ("stream_power_m", "stream_power_n", "min_drainage_area_km2", "max_fluvial_erosion_m_per_iteration",
-                     "meander_slope_scale", "delta_max_depth_m", "delta_spread_cells", "lake_min_depth_m",
-                     "lake_min_catchment_km2"):
+        for name in (
+            "stream_power_m",
+            "stream_power_n",
+            "min_drainage_area_km2",
+            "max_fluvial_erosion_m_per_iteration",
+            "meander_slope_scale",
+            "delta_max_depth_m",
+            "delta_spread_cells",
+            "lake_min_depth_m",
+            "lake_min_catchment_km2",
+        ):
             _number(f"hydrology.{name}", getattr(h, name), minimum=0.0)
-        for name in ("deposition_strength", "river_meander_strength", "lateral_erosion_fraction", "delta_retention_fraction",
-                     "delta_min_outlet_discharge_norm", "lake_area_soft_cap_fraction_land", "tributary_discharge_fraction",
-                     "delta_wave_reworking_strength", "delta_tide_reworking_strength", "delta_distributary_texture_strength"):
+        for name in (
+            "deposition_strength",
+            "river_meander_strength",
+            "lateral_erosion_fraction",
+            "delta_retention_fraction",
+            "delta_min_outlet_discharge_norm",
+            "lake_area_soft_cap_fraction_land",
+            "tributary_discharge_fraction",
+            "delta_wave_reworking_strength",
+            "delta_tide_reworking_strength",
+            "delta_distributary_texture_strength",
+        ):
             _fraction(f"hydrology.{name}", getattr(h, name))
 
         sim = self.simulation
@@ -431,10 +529,37 @@ class WorldConfig:
         _integer("simulation.final_climate_ocean_passes", sim.final_climate_ocean_passes, minimum=1)
         _fraction("simulation.intermediate_climate_fraction", sim.intermediate_climate_fraction)
         _fraction("simulation.intermediate_ocean_fraction", sim.intermediate_ocean_fraction)
+        _boolean("simulation.preserve_initial_sea_level", sim.preserve_initial_sea_level)
+        _boolean("simulation.adaptive_convergence", sim.adaptive_convergence)
+        _integer("simulation.min_earth_system_passes", sim.min_earth_system_passes, minimum=1)
+        _integer("simulation.max_earth_system_passes", sim.max_earth_system_passes, minimum=sim.min_earth_system_passes)
+        _number("simulation.convergence_temperature_c", sim.convergence_temperature_c, minimum=0.0)
+        _number("simulation.convergence_precip_mm_year", sim.convergence_precip_mm_year, minimum=0.0)
+        _number("simulation.convergence_elevation_m", sim.convergence_elevation_m, minimum=0.0)
+        _integer("simulation.required_consecutive_converged_passes", sim.required_consecutive_converged_passes, minimum=1)
+        _boolean("simulation.adaptive_final_coupling", sim.adaptive_final_coupling)
+        _integer("simulation.min_final_climate_ocean_passes", sim.min_final_climate_ocean_passes, minimum=1)
+        _integer(
+            "simulation.max_final_climate_ocean_passes",
+            sim.max_final_climate_ocean_passes,
+            minimum=sim.min_final_climate_ocean_passes,
+        )
+        _number("simulation.final_convergence_temperature_c", sim.final_convergence_temperature_c, minimum=0.0)
+        _number("simulation.final_convergence_precip_mm_year", sim.final_convergence_precip_mm_year, minimum=0.0)
+        _integer(
+            "simulation.required_consecutive_final_converged_passes",
+            sim.required_consecutive_final_converged_passes,
+            minimum=1,
+        )
 
         w = self.weather
         _number("weather.hurricane_lat_min_deg", w.hurricane_lat_min_deg, minimum=0.0, maximum=90.0)
-        _number("weather.hurricane_lat_max_deg", w.hurricane_lat_max_deg, minimum=w.hurricane_lat_min_deg, maximum=90.0)
+        _number(
+            "weather.hurricane_lat_max_deg",
+            w.hurricane_lat_max_deg,
+            minimum=w.hurricane_lat_min_deg,
+            maximum=90.0,
+        )
         _integer("weather.hurricane_seed_count", w.hurricane_seed_count, minimum=0)
         _integer("weather.hurricane_max_steps", w.hurricane_max_steps, minimum=1)
 
@@ -443,8 +568,7 @@ class WorldConfig:
         _integer("resources.meteorite_expected_count", rs.meteorite_expected_count, minimum=0)
 
         s = self.society
-        if not isinstance(s.enabled, bool):
-            raise TypeError("society.enabled must be boolean")
+        _boolean("society.enabled", s.enabled)
         _integer("society.settlement_count", s.settlement_count, minimum=0)
         _integer("society.history_years", s.history_years, minimum=1)
         _integer("society.history_step_years", s.history_step_years, minimum=1)
@@ -454,8 +578,15 @@ class WorldConfig:
         _fraction("society.coastal_trade_bonus", s.coastal_trade_bonus)
 
         ap = self.appearance
-        for name in ("snow_albedo", "vegetation_albedo", "desert_albedo", "ocean_albedo", "turbidity_strength",
-                     "hillshade_strength", "cloud_max_optical_opacity"):
+        for name in (
+            "snow_albedo",
+            "vegetation_albedo",
+            "desert_albedo",
+            "ocean_albedo",
+            "turbidity_strength",
+            "hillshade_strength",
+            "cloud_max_optical_opacity",
+        ):
             _fraction(f"appearance.{name}", getattr(ap, name))
         if ap.alpine_bare_full_km <= ap.alpine_bare_start_km:
             raise ValueError("appearance.alpine_bare_full_km must exceed alpine_bare_start_km")
