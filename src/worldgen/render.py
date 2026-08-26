@@ -234,11 +234,14 @@ def render_all(out: Path, world: dict) -> list[str]:
     paths.append(str(legend_path))
 
     manifest_path = maps / "render_manifest.json"
+    product_names = [Path(p).name for p in paths]
     manifest_path.write_text(json.dumps({
+        "schema_version": 1,
         "map_dpi": map_dpi,
         "rgb_dpi": rgb_dpi,
         "true_color_pixel_resolution": [int(appearance.true_color_rgb.shape[1]), int(appearance.true_color_rgb.shape[0])],
-        "products": [Path(p).name for p in paths],
+        "products": product_names,
+        "files": product_names,
     }, indent=2), encoding="utf-8")
     paths.append(str(manifest_path))
     return paths
