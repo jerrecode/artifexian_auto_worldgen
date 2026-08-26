@@ -88,7 +88,7 @@ def _parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("generate", nargs="?", default="generate", help=argparse.SUPPRESS)
-    p.add_argument("--version", action="version", version="%(prog)s 0.3.0")
+    p.add_argument("--version", action="version", version="%(prog)s 0.4.0")
 
     io = p.add_argument_group("configuration and output")
     io.add_argument("--config", type=Path, default=None, help="YAML configuration file")
@@ -106,6 +106,12 @@ def _parser() -> argparse.ArgumentParser:
     io.add_argument("--no-report", action="store_true", help="Skip Markdown report export")
     io.add_argument("--compress-npz", action=argparse.BooleanOptionalAction, default=None,
                     help="Enable/disable DEFLATE compression for world_arrays.npz")
+    io.add_argument("--diagnostics", action=argparse.BooleanOptionalAction, default=True,
+                    help="Write diagnostics.json with numerical/scientific invariants")
+    io.add_argument("--manifest", action=argparse.BooleanOptionalAction, default=True,
+                    help="Write run_manifest.json with provenance, runtime and output inventory")
+    io.add_argument("--hash-outputs", action="store_true",
+                    help="SHA-256 every produced file in the run manifest (can be slow for multi-GB output)")
 
     res = p.add_argument_group("resolution and rendering")
     res.add_argument("--resolution", type=_resolution, metavar="WIDTHxHEIGHT", help="Simulation grid resolution")
@@ -119,7 +125,7 @@ def _parser() -> argparse.ArgumentParser:
     res.add_argument("--max-png-megapixels", type=float, default=120.0,
                      help="Safety cap applied to each post-upscaled PNG")
 
-    perf = p.add_argument_group("runtime and performance")
+    perf = p.add_argument_group("runtime, resumability and performance")
     perf.add_argument("--workers", type=int, default=0, help="Requested worker count; 0 selects automatically")
     perf.add_argument("--worker-cap", type=int, default=8, help="Hard upper bound on managed workers")
     perf.add_argument("--parallel-backend", choices=("auto", "thread", "process", "serial"), default="auto")
@@ -131,6 +137,14 @@ def _parser() -> argparse.ArgumentParser:
     perf.add_argument("--array-store", type=Path, default=None,
                       help="Also export arrays into a random-access mmap/SQLite store")
     perf.add_argument("--array-store-max-gb", type=float, default=64.0, help="Disk cap for --array-store")
+    perf.add_argument("--checkpoint-dir", type=Path, default=None,
+                      help="Persist content-addressed stage checkpoints here for crash-safe resume")
+    perf.add_argument("--checkpoint-max-gb", type=float, default=64.0,
+                      help="LRU disk cap for --checkpoint-dir")
+    perf.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
+                      help="Reuse valid stage checkpoints when --checkpoint-dir is configured")
+    perf.add_argument("--clear-checkpoints", action="store_true",
+                      help="Clear --checkpoint-dir before starting the run")
     perf.add_argument("--profile", type=Path, default=None, help="Write cProfile statistics to this file")
     perf.add_argument("--timings-json", type=Path, default=None, help="Write per-stage timings/runtime metadata as JSON")
 
@@ -156,6 +170,10 @@ def main(argv: list[str] | None = None) -> int:
         p.error("--max-png-megapixels must be > 0")
     if args.array_store_max_gb <= 0:
         p.error("--array-store-max-gb must be > 0")
+    if args.checkpoint_max_gb <= 0:
+        p.error("--checkpoint-max-gb must be > 0")
+    if args.clear_checkpoints and args.checkpoint_dir is None:
+        p.error("--clear-checkpoints requires --checkpoint-dir")
 
     cfg = load_config(args.config)
     if args.quick:
@@ -239,6 +257,13 @@ def main(argv: list[str] | None = None) -> int:
         args.write_config.write_text(yaml.safe_dump(cfg.to_dict(), sort_keys=False), encoding="utf-8")
         logger.info("resolved configuration written to %s", args.write_config)
 
+    if args.clear_checkpoints:
+        from .checkpoint import CheckpointStore
+        store = CheckpointStore(args.checkpoint_dir, max_bytes=int(args.checkpoint_max_gb * 1024**3))
+        removed = store.clear()
+        store.close()
+        logger.info("cleared %d checkpoints from %s", removed, args.checkpoint_dir)
+
     if args.dry_run:
         return 0
 
@@ -250,7 +275,18 @@ def main(argv: list[str] | None = None) -> int:
         enabled=bool(args.progress and not args.quiet),
         log=logger.info if args.verbose or args.log_file else None,
     )
-    pipeline = WorldPipeline(cfg, progress=progress)
+    if args.checkpoint_dir is None:
+        pipeline = WorldPipeline(cfg, progress=progress)
+    else:
+        from .resumable import ResumableWorldPipeline
+        pipeline = ResumableWorldPipeline(
+            cfg,
+            progress=progress,
+            checkpoint_dir=args.checkpoint_dir,
+            resume=args.resume,
+            checkpoint_max_bytes=int(args.checkpoint_max_gb * 1024**3),
+        )
+        logger.info("stage checkpoints=%s resume=%s", args.checkpoint_dir, args.resume)
 
     if args.profile is None:
         world = pipeline.generate(args.out)
@@ -295,6 +331,13 @@ def main(argv: list[str] | None = None) -> int:
                     store.root, len(store.keys()), store.disk_usage_bytes() / 1024**3)
         store.close()
 
+    if args.diagnostics:
+        from .diagnostics import write_world_diagnostics
+        diag = write_world_diagnostics(world, args.out / "diagnostics.json")
+        logger.info("scientific diagnostics: all_invariants_passed=%s", diag["all_invariants_passed"])
+
+    checkpoint_stats = pipeline.checkpoint_stats() if hasattr(pipeline, "checkpoint_stats") else {}
+
     if args.timings_json is not None:
         args.timings_json.parent.mkdir(parents=True, exist_ok=True)
         timing_payload = {
@@ -309,8 +352,25 @@ def main(argv: list[str] | None = None) -> int:
             },
             "stage_seconds": pipeline.timings,
             "total_stage_seconds": sum(pipeline.timings.values()),
+            "checkpoint_stats": checkpoint_stats,
         }
         args.timings_json.write_text(json.dumps(timing_payload, indent=2), encoding="utf-8")
+
+    if args.manifest:
+        from .manifest import write_run_manifest
+        write_run_manifest(
+            args.out / "run_manifest.json",
+            config=cfg,
+            runtime_plan=plan,
+            timings=pipeline.timings,
+            output_root=args.out,
+            checkpoint_stats=checkpoint_stats,
+            with_output_hashes=args.hash_outputs,
+        )
+        logger.info("run manifest written to %s", args.out / "run_manifest.json")
+
+    if hasattr(pipeline, "close"):
+        pipeline.close()
 
     print(f"World written to: {args.out.resolve()}")
     return 0
