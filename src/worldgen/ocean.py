@@ -166,15 +166,19 @@ def build_ocean(
     elev = terrain.elevation_km.astype(float).copy()
     elev[ocean] = -depth[ocean] / 1000.0
 
-    # Basin-following gyre streamfunction; zeroed near coastlines.
+    # Basin-following gyre streamfunction; zeroed near coastlines. Convert the
+    # spherical metric derivative back to the historical per-grid-cell scale before
+    # mixing it with dimensionless background jets. This preserves the tuned balance
+    # while retaining correct seam/pole sampling and latitude-aware x derivatives.
     coast_dist = distance_to(terrain.land, grid)
     dscale = np.clip(coast_dist / 2500.0, 0, 1)
     latr = np.deg2rad(grid.lat)
     psi = dscale * (np.sin(2.0 * latr) - 0.28 * np.sin(4.0 * latr))
     psi = smooth_periodic(psi, sigma=(2.0, 3.0)) * ocean
     dpsi_dy, dpsi_dx = grid.ops.metric_gradient(psi)
-    base_u = ocfg.gyre_strength * dpsi_dy
-    base_v = -ocfg.gyre_strength * dpsi_dx
+    cell_scale_km = float(grid.dy_km)
+    base_u = ocfg.gyre_strength * dpsi_dy * cell_scale_km
+    base_v = -ocfg.gyre_strength * dpsi_dx * cell_scale_km
     # Small background jets remain, but seasonal atmospheric stress now supplies most zonal forcing;
     # basin geometry therefore has enough weight to bend currents into gyres around continents.
     base_u += -0.10 * np.exp(-(grid.lat / 11.0) ** 2)
