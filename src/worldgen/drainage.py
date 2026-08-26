@@ -57,38 +57,78 @@ def _strahler_kernel(receiver: np.ndarray, channel: np.ndarray, order: np.ndarra
     return result
 
 
-def topological_order(receiver: np.ndarray) -> np.ndarray:
-    """Return upstream-to-downstream order for a single-receiver acyclic graph.
-
-    Raises ``ValueError`` when receivers are out of bounds or a directed cycle is
-    present. The order is reusable for every scalar flux routed over the same
-    drainage network, eliminating repeated O(N log N) elevation sorts.
-    """
-    recv = np.asarray(receiver, dtype=np.int64).ravel()
-    n = recv.size
-    src = np.flatnonzero(recv >= 0)
-    if src.size and (np.any(recv[src] >= n) or np.any(recv[src] < 0)):
-        raise ValueError("receiver contains out-of-range index")
+@optional_njit(cache=True)
+def _topological_order_kernel(receiver: np.ndarray):
+    """Numba-friendly Kahn traversal returning (queue, count, error_code)."""
+    n = receiver.size
     indeg = np.zeros(n, dtype=np.int32)
-    if src.size:
-        np.add.at(indeg, recv[src], 1)
+    for node in range(n):
+        nxt = receiver[node]
+        if nxt < -1 or nxt >= n:
+            return np.empty(0, dtype=np.int64), 0, 1
+        if nxt >= 0:
+            indeg[nxt] += 1
+
     queue = np.empty(n, dtype=np.int64)
-    roots = np.flatnonzero(indeg == 0)
-    qn = roots.size
-    queue[:qn] = roots
+    qn = 0
+    for node in range(n):
+        if indeg[node] == 0:
+            queue[qn] = node
+            qn += 1
     head = 0
     while head < qn:
-        node = int(queue[head])
+        node = queue[head]
         head += 1
-        nxt = int(recv[node])
+        nxt = receiver[node]
         if nxt >= 0:
             indeg[nxt] -= 1
             if indeg[nxt] == 0:
                 queue[qn] = nxt
                 qn += 1
     if qn != n:
+        return queue, qn, 2
+    return queue, qn, 0
+
+
+@optional_njit(cache=True)
+def _donor_csr_kernel(receiver: np.ndarray):
+    n = receiver.size
+    counts = np.zeros(n, dtype=np.int64)
+    edge_count = 0
+    for node in range(n):
+        nxt = receiver[node]
+        if nxt >= 0:
+            counts[nxt] += 1
+            edge_count += 1
+    offsets = np.empty(n + 1, dtype=np.int64)
+    offsets[0] = 0
+    for i in range(n):
+        offsets[i + 1] = offsets[i] + counts[i]
+    donors = np.empty(edge_count, dtype=np.int64)
+    cursor = offsets[:-1].copy()
+    for node in range(n):
+        target = receiver[node]
+        if target >= 0:
+            pos = cursor[target]
+            donors[pos] = node
+            cursor[target] += 1
+    return offsets, donors
+
+
+def topological_order(receiver: np.ndarray) -> np.ndarray:
+    """Return reusable upstream-to-downstream order in O(N).
+
+    The traversal is JIT compiled when Numba is installed. It is deliberately
+    independent of terrain elevation, so one order can route water, drainage area,
+    sediment and other scalar fluxes over the same receiver graph.
+    """
+    recv = np.asarray(receiver, dtype=np.int64).ravel()
+    queue, qn, error = _topological_order_kernel(recv)
+    if error == 1:
+        raise ValueError("receiver contains out-of-range index")
+    if error == 2:
         raise ValueError("receiver graph contains a directed cycle")
-    return queue
+    return np.asarray(queue[:qn], dtype=np.int64)
 
 
 @dataclass(slots=True)
@@ -130,27 +170,13 @@ class DrainageGraph:
         src = np.flatnonzero(recv >= 0)
         if subset is not None:
             keep = np.asarray(subset, dtype=bool).ravel()
+            if keep.size != recv.size:
+                raise ValueError("subset size does not match drainage graph")
             src = src[keep[src] & keep[recv[src]]]
         if src.size:
             np.add.at(out, recv[src], 1)
         return out.reshape(self.shape)
 
     def donor_csr(self) -> tuple[np.ndarray, np.ndarray]:
-        """Return CSR offsets and donor indices for reverse graph traversal."""
-        recv = self.receiver
-        n = recv.size
-        src = np.flatnonzero(recv >= 0)
-        counts = np.zeros(n, dtype=np.int64)
-        if src.size:
-            np.add.at(counts, recv[src], 1)
-        offsets = np.empty(n + 1, dtype=np.int64)
-        offsets[0] = 0
-        np.cumsum(counts, out=offsets[1:])
-        donors = np.empty(src.size, dtype=np.int64)
-        cursor = offsets[:-1].copy()
-        for node in src:
-            target = recv[node]
-            pos = cursor[target]
-            donors[pos] = node
-            cursor[target] += 1
-        return offsets, donors
+        """Return CSR offsets and donors; JIT compiled when available."""
+        return _donor_csr_kernel(self.receiver)
