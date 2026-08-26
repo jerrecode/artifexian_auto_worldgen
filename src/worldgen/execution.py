@@ -4,18 +4,24 @@ from pathlib import Path
 import time
 from typing import Any, Callable
 
+from .drainage import install_into_hydrology
 from .manifest import write_run_manifest
 from .pipeline import WorldPipeline as _BaseWorldPipeline
 from .workflow import StageCheckpointStore, StageRecord, stage_key
+
+# Install the O(N) reusable drainage graph kernels once. This compatibility
+# bridge keeps the long-standing hydrology public API stable while moving its
+# expensive graph traversals into a dedicated optimized implementation.
+install_into_hydrology()
 
 
 class WorldPipeline(_BaseWorldPipeline):
     """Checkpointable pipeline façade over the deterministic core pipeline.
 
-    The inherited generation graph still defines the numerical workflow.  This
+    The inherited generation graph still defines the numerical workflow. This
     subclass intercepts every named stage, gives it a content-addressed key,
     optionally restores/saves its result, and records provenance for the final
-    run manifest.  Keeping the execution layer orthogonal to the scientific
+    run manifest. Keeping the execution layer orthogonal to the scientific
     kernels lets resumability evolve without duplicating the world model.
     """
 
@@ -44,8 +50,6 @@ class WorldPipeline(_BaseWorldPipeline):
             dependency_keys=dep_keys,
             implementation_version="2",
         )
-        # Output has external side effects in a caller-selected directory and is
-        # therefore intentionally never restored from a checkpoint.
         cacheable = self.checkpoints is not None and name != "output"
         if cacheable and self.resume and self.checkpoints.has(key):
             self.progress(f"[{name}] starting")
