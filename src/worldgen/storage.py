@@ -87,6 +87,13 @@ class MappedArrayStore(AbstractContextManager["MappedArrayStore"]):
         return hashlib.sha256(key.encode("utf-8")).hexdigest() + ".npy"
 
     def put(self, key: str, array: np.ndarray, *, overwrite: bool = True) -> StoredArray:
+        """Atomically store an array while preserving existing data on rejection.
+
+        The new payload is fully serialized and size-checked before replacing the
+        currently indexed file.  This matters for bounded stores: an oversized
+        replacement must not destroy a valid smaller value merely because the LRU
+        pruning pass would evict the replacement immediately afterwards.
+        """
         if not key:
             raise ValueError("Array key must be non-empty")
         arr = np.asarray(array)
@@ -97,34 +104,44 @@ class MappedArrayStore(AbstractContextManager["MappedArrayStore"]):
             exists = self._db.execute("SELECT 1 FROM arrays WHERE key=?", (key,)).fetchone() is not None
             if exists and not overwrite:
                 raise KeyError(f"Array already exists: {key}")
-            with tmp.open("wb") as f:
-                np.save(f, arr, allow_pickle=False)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
-            now = time.time()
-            file_bytes = path.stat().st_size
-            self._db.execute(
-                """
-                INSERT INTO arrays(key, relpath, shape_json, dtype, nbytes, file_bytes, created_at, last_access)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(key) DO UPDATE SET
-                    relpath=excluded.relpath,
-                    shape_json=excluded.shape_json,
-                    dtype=excluded.dtype,
-                    nbytes=excluded.nbytes,
-                    file_bytes=excluded.file_bytes,
-                    last_access=excluded.last_access
-                """,
-                (key, str(path.relative_to(self.root)), json.dumps(arr.shape), arr.dtype.str,
-                 int(arr.nbytes), int(file_bytes), now, now),
-            )
-            self._db.commit()
-            self.prune()
-            info = self.info(key)
-            if info is None:
-                raise RuntimeError(f"Array {key!r} was evicted immediately because the store cap is too small")
-            return info
+            try:
+                with tmp.open("wb") as f:
+                    np.save(f, arr, allow_pickle=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                file_bytes = tmp.stat().st_size
+                if self.max_bytes <= 0 or file_bytes > self.max_bytes:
+                    raise RuntimeError(
+                        f"Array {key!r} requires {file_bytes} bytes, exceeding store cap {self.max_bytes}"
+                    )
+                os.replace(tmp, path)
+                now = time.time()
+                self._db.execute(
+                    """
+                    INSERT INTO arrays(key, relpath, shape_json, dtype, nbytes, file_bytes, created_at, last_access)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        relpath=excluded.relpath,
+                        shape_json=excluded.shape_json,
+                        dtype=excluded.dtype,
+                        nbytes=excluded.nbytes,
+                        file_bytes=excluded.file_bytes,
+                        last_access=excluded.last_access
+                    """,
+                    (key, str(path.relative_to(self.root)), json.dumps(arr.shape), arr.dtype.str,
+                     int(arr.nbytes), int(file_bytes), now, now),
+                )
+                self._db.commit()
+                self.prune()
+                info = self.info(key)
+                if info is None:
+                    raise RuntimeError(f"Array {key!r} was evicted immediately because the store cap is too small")
+                return info
+            finally:
+                try:
+                    tmp.unlink()
+                except FileNotFoundError:
+                    pass
 
     def open(self, key: str, *, mode: str = "r") -> np.memmap:
         if mode not in ("r", "r+", "c"):
@@ -224,6 +241,10 @@ def store_array_mapping(
     max_bytes: int = 16 * 1024**3,
 ) -> MappedArrayStore:
     store = MappedArrayStore(root, max_bytes=max_bytes, persistent=True)
-    for key, value in arrays.items():
-        store.put(key, np.asarray(value))
-    return store
+    try:
+        for key, value in arrays.items():
+            store.put(key, np.asarray(value))
+        return store
+    except Exception:
+        store.close()
+        raise
