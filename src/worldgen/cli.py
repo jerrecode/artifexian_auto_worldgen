@@ -48,8 +48,7 @@ def _set_config_value(cfg: Any, expression: str) -> None:
     leaf = parts[-1]
     if not hasattr(target, leaf):
         raise KeyError(f"Unknown configuration path: {path!r}")
-    value = yaml.safe_load(raw_value)
-    setattr(target, leaf, value)
+    setattr(target, leaf, yaml.safe_load(raw_value))
 
 
 def _apply_quick(cfg) -> None:
@@ -74,13 +73,6 @@ def _apply_quick(cfg) -> None:
     cfg.society.settlement_count = min(cfg.society.settlement_count, 60)
 
 
-def _validate_resolution(cfg) -> None:
-    if cfg.resolution.width < 64 or cfg.resolution.height < 32:
-        raise ValueError("Resolution must be at least 64x32")
-    if cfg.resolution.width != 2 * cfg.resolution.height:
-        raise ValueError("Use a 2:1 equirectangular grid: width must equal 2*height")
-
-
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="worldgen",
@@ -99,7 +91,7 @@ def _parser() -> argparse.ArgumentParser:
     io.add_argument("--write-config", type=Path, default=None, help="Write the resolved configuration as YAML")
     io.add_argument("--dry-run", action="store_true", help="Validate configuration/runtime plan without generating")
     io.add_argument("--quick", action="store_true", help="Fast-preview preset with reduced numerical workload")
-    io.add_argument("--no-society", action="store_true", help="Stop after physical/geological generation")
+    io.add_argument("--no-society", action="store_true", help="Disable society generation")
     io.add_argument("--no-png", action="store_true", help="Skip PNG map rendering")
     io.add_argument("--no-npz", action="store_true", help="Skip NPZ array export")
     io.add_argument("--no-json", action="store_true", help="Skip JSON/GeoJSON export")
@@ -111,7 +103,7 @@ def _parser() -> argparse.ArgumentParser:
     io.add_argument("--manifest", action=argparse.BooleanOptionalAction, default=True,
                     help="Write run_manifest.json with provenance, runtime and output inventory")
     io.add_argument("--hash-outputs", action="store_true",
-                    help="SHA-256 every produced file in the run manifest (can be slow for multi-GB output)")
+                    help="SHA-256 every produced file in the run manifest")
 
     res = p.add_argument_group("resolution and rendering")
     res.add_argument("--resolution", type=_resolution, metavar="WIDTHxHEIGHT", help="Simulation grid resolution")
@@ -120,7 +112,7 @@ def _parser() -> argparse.ArgumentParser:
     res.add_argument("--resolution-scale", type=float, default=1.0,
                      help="Scale configured simulation resolution while preserving 2:1 aspect")
     res.add_argument("--png-scale", type=float, default=1.0,
-                     help="Post-render PNG upscale factor; >1 increases final image resolution")
+                     help="Post-render PNG upscale factor")
     res.add_argument("--png-resample", choices=("nearest", "bilinear", "bicubic", "lanczos"), default="lanczos")
     res.add_argument("--max-png-megapixels", type=float, default=120.0,
                      help="Safety cap applied to each post-upscaled PNG")
@@ -158,31 +150,14 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: list[str] | None = None) -> int:
-    p = _parser()
-    args = p.parse_args(argv)
-
-    if args.resolution_scale <= 0:
-        p.error("--resolution-scale must be > 0")
-    if args.png_scale <= 0:
-        p.error("--png-scale must be > 0")
-    if args.max_png_megapixels <= 0:
-        p.error("--max-png-megapixels must be > 0")
-    if args.array_store_max_gb <= 0:
-        p.error("--array-store-max-gb must be > 0")
-    if args.checkpoint_max_gb <= 0:
-        p.error("--checkpoint-max-gb must be > 0")
-    if args.clear_checkpoints and args.checkpoint_dir is None:
-        p.error("--clear-checkpoints requires --checkpoint-dir")
-
-    cfg = load_config(args.config)
+def _apply_cli_config(args, cfg, parser: argparse.ArgumentParser):
     if args.quick:
         _apply_quick(cfg)
     try:
         for expression in args.overrides:
             _set_config_value(cfg, expression)
     except (ValueError, KeyError, TypeError) as exc:
-        p.error(str(exc))
+        parser.error(str(exc))
 
     if args.seed is not None:
         cfg.seed = args.seed
@@ -197,7 +172,7 @@ def main(argv: list[str] | None = None) -> int:
             cfg.resolution.width, cfg.resolution.height = args.width, args.height
         elif args.width is not None:
             if args.width % 2:
-                p.error("--width must be even when --height is inferred")
+                parser.error("--width must be even when --height is inferred")
             cfg.resolution.width, cfg.resolution.height = args.width, args.width // 2
         else:
             cfg.resolution.height, cfg.resolution.width = args.height, 2 * args.height
@@ -215,18 +190,49 @@ def main(argv: list[str] | None = None) -> int:
     if args.compress_npz is not None:
         cfg.output.compress_npz = bool(args.compress_npz)
 
+    # Critical: load_config() validates the YAML, but every mutation above occurs
+    # afterward. Revalidate the fully resolved configuration so --set/--quick and
+    # command-line resolution changes cannot bypass physical/algorithmic guards.
     try:
-        _validate_resolution(cfg)
-    except ValueError as exc:
-        p.error(str(exc))
+        cfg.validate()
+    except (TypeError, ValueError) as exc:
+        parser.error(str(exc))
+    return cfg
 
-    plan = resolve_runtime_plan(
-        workers=args.workers,
-        worker_cap=args.worker_cap,
-        backend=args.parallel_backend,
-        memory_per_worker_mb=args.memory_per_worker_mb,
-        threads_per_worker=args.threads_per_worker,
-    )
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _parser()
+    args = parser.parse_args(argv)
+
+    if args.resolution_scale <= 0:
+        parser.error("--resolution-scale must be > 0")
+    if args.png_scale <= 0:
+        parser.error("--png-scale must be > 0")
+    if args.max_png_megapixels <= 0:
+        parser.error("--max-png-megapixels must be > 0")
+    if args.array_store_max_gb <= 0:
+        parser.error("--array-store-max-gb must be > 0")
+    if args.checkpoint_max_gb <= 0:
+        parser.error("--checkpoint-max-gb must be > 0")
+    if args.clear_checkpoints and args.checkpoint_dir is None:
+        parser.error("--clear-checkpoints requires --checkpoint-dir")
+
+    try:
+        cfg = load_config(args.config)
+    except (OSError, TypeError, ValueError, KeyError, yaml.YAMLError) as exc:
+        parser.error(f"configuration error: {exc}")
+    cfg = _apply_cli_config(args, cfg, parser)
+
+    try:
+        plan = resolve_runtime_plan(
+            workers=args.workers,
+            worker_cap=args.worker_cap,
+            backend=args.parallel_backend,
+            memory_per_worker_mb=args.memory_per_worker_mb,
+            threads_per_worker=args.threads_per_worker,
+        )
+    except (TypeError, ValueError) as exc:
+        parser.error(str(exc))
     configure_numeric_threads(plan.threads_per_worker)
 
     logger = configure_logging(
@@ -240,7 +246,7 @@ def main(argv: list[str] | None = None) -> int:
                 plan.backend, plan.workers, plan.cpu_count, plan.threads_per_worker)
 
     if args.runtime_info:
-        payload = {
+        print(json.dumps({
             "runtime_plan": {
                 "backend": plan.backend,
                 "workers": plan.workers,
@@ -249,8 +255,7 @@ def main(argv: list[str] | None = None) -> int:
                 "threads_per_worker": plan.threads_per_worker,
             },
             "optional_backends": optional_backend_status(),
-        }
-        print(json.dumps(payload, indent=2))
+        }, indent=2))
 
     if args.write_config is not None:
         args.write_config.parent.mkdir(parents=True, exist_ok=True)
@@ -260,8 +265,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.clear_checkpoints:
         from .checkpoint import CheckpointStore
         store = CheckpointStore(args.checkpoint_dir, max_bytes=int(args.checkpoint_max_gb * 1024**3))
-        removed = store.clear()
-        store.close()
+        try:
+            removed = store.clear()
+        finally:
+            store.close()
         logger.info("cleared %d checkpoints from %s", removed, args.checkpoint_dir)
 
     if args.dry_run:
@@ -288,89 +295,91 @@ def main(argv: list[str] | None = None) -> int:
         )
         logger.info("stage checkpoints=%s resume=%s", args.checkpoint_dir, args.resume)
 
-    if args.profile is None:
-        world = pipeline.generate(args.out)
-    else:
-        args.profile.parent.mkdir(parents=True, exist_ok=True)
-        profiler = cProfile.Profile()
-        profiler.enable()
-        try:
+    try:
+        if args.profile is None:
             world = pipeline.generate(args.out)
-        finally:
-            profiler.disable()
-            profiler.dump_stats(args.profile)
-            summary = args.profile.with_suffix(args.profile.suffix + ".txt")
-            with summary.open("w", encoding="utf-8") as f:
-                stats = pstats.Stats(profiler, stream=f).sort_stats("cumtime")
-                stats.print_stats(80)
-            logger.info("profile written to %s and %s", args.profile, summary)
-    progress.finish()
+        else:
+            args.profile.parent.mkdir(parents=True, exist_ok=True)
+            profiler = cProfile.Profile()
+            profiler.enable()
+            try:
+                world = pipeline.generate(args.out)
+            finally:
+                profiler.disable()
+                profiler.dump_stats(args.profile)
+                summary = args.profile.with_suffix(args.profile.suffix + ".txt")
+                with summary.open("w", encoding="utf-8") as f:
+                    pstats.Stats(profiler, stream=f).sort_stats("cumtime").print_stats(80)
+                logger.info("profile written to %s and %s", args.profile, summary)
+        progress.finish()
 
-    if cfg.output.save_png and args.png_scale != 1.0:
-        from .imageops import upscale_png_tree
-        image_plan = replace(plan, backend="thread" if plan.workers > 1 else "serial")
-        with ManagedExecutor(image_plan) as executor:
-            images = upscale_png_tree(
-                args.out / "maps",
-                scale=args.png_scale,
-                resample=args.png_resample,
-                max_megapixels=args.max_png_megapixels,
-                executor=executor,
+        if cfg.output.save_png and args.png_scale != 1.0:
+            from .imageops import upscale_png_tree
+            image_plan = replace(plan, backend="thread" if plan.workers > 1 else "serial")
+            with ManagedExecutor(image_plan) as executor:
+                images = upscale_png_tree(
+                    args.out / "maps",
+                    scale=args.png_scale,
+                    resample=args.png_resample,
+                    max_megapixels=args.max_png_megapixels,
+                    executor=executor,
+                )
+            logger.info("post-upscaled %d PNG maps by factor %.3f", len(images), args.png_scale)
+
+        if args.array_store is not None:
+            from .storage import store_array_mapping
+            arrays = pipeline._array_export(world)
+            store = store_array_mapping(
+                arrays,
+                args.array_store,
+                max_bytes=int(args.array_store_max_gb * 1024**3),
             )
-        logger.info("post-upscaled %d PNG maps by factor %.3f", len(images), args.png_scale)
+            try:
+                logger.info("random-access array store: %s (%d arrays, %.3f GiB on disk)",
+                            store.root, len(store.keys()), store.disk_usage_bytes() / 1024**3)
+            finally:
+                store.close()
 
-    if args.array_store is not None:
-        from .storage import store_array_mapping
-        arrays = pipeline._array_export(world)
-        store = store_array_mapping(
-            arrays,
-            args.array_store,
-            max_bytes=int(args.array_store_max_gb * 1024**3),
-        )
-        logger.info("random-access array store: %s (%d arrays, %.3f GiB on disk)",
-                    store.root, len(store.keys()), store.disk_usage_bytes() / 1024**3)
-        store.close()
+        if args.diagnostics:
+            from .diagnostics import write_world_diagnostics
+            diag = write_world_diagnostics(world, args.out / "diagnostics.json")
+            logger.info("scientific diagnostics: all_invariants_passed=%s", diag["all_invariants_passed"])
 
-    if args.diagnostics:
-        from .diagnostics import write_world_diagnostics
-        diag = write_world_diagnostics(world, args.out / "diagnostics.json")
-        logger.info("scientific diagnostics: all_invariants_passed=%s", diag["all_invariants_passed"])
+        checkpoint_stats = pipeline.checkpoint_stats() if hasattr(pipeline, "checkpoint_stats") else {}
 
-    checkpoint_stats = pipeline.checkpoint_stats() if hasattr(pipeline, "checkpoint_stats") else {}
+        if args.timings_json is not None:
+            args.timings_json.parent.mkdir(parents=True, exist_ok=True)
+            timing_payload = {
+                "seed": cfg.seed,
+                "resolution": [cfg.resolution.width, cfg.resolution.height],
+                "runtime": {
+                    "backend": plan.backend,
+                    "workers": plan.workers,
+                    "cpu_count": plan.cpu_count,
+                    "memory_limit_bytes": plan.memory_limit_bytes,
+                    "threads_per_worker": plan.threads_per_worker,
+                },
+                "stage_seconds": pipeline.timings,
+                "total_stage_seconds": sum(pipeline.timings.values()),
+                "checkpoint_stats": checkpoint_stats,
+            }
+            args.timings_json.write_text(json.dumps(timing_payload, indent=2), encoding="utf-8")
 
-    if args.timings_json is not None:
-        args.timings_json.parent.mkdir(parents=True, exist_ok=True)
-        timing_payload = {
-            "seed": cfg.seed,
-            "resolution": [cfg.resolution.width, cfg.resolution.height],
-            "runtime": {
-                "backend": plan.backend,
-                "workers": plan.workers,
-                "cpu_count": plan.cpu_count,
-                "memory_limit_bytes": plan.memory_limit_bytes,
-                "threads_per_worker": plan.threads_per_worker,
-            },
-            "stage_seconds": pipeline.timings,
-            "total_stage_seconds": sum(pipeline.timings.values()),
-            "checkpoint_stats": checkpoint_stats,
-        }
-        args.timings_json.write_text(json.dumps(timing_payload, indent=2), encoding="utf-8")
-
-    if args.manifest:
-        from .manifest import write_run_manifest
-        write_run_manifest(
-            args.out / "run_manifest.json",
-            config=cfg,
-            runtime_plan=plan,
-            timings=pipeline.timings,
-            output_root=args.out,
-            checkpoint_stats=checkpoint_stats,
-            with_output_hashes=args.hash_outputs,
-        )
-        logger.info("run manifest written to %s", args.out / "run_manifest.json")
-
-    if hasattr(pipeline, "close"):
-        pipeline.close()
+        if args.manifest:
+            from .manifest import write_run_manifest
+            write_run_manifest(
+                args.out / "run_manifest.json",
+                config=cfg,
+                runtime_plan=plan,
+                timings=pipeline.timings,
+                output_root=args.out,
+                checkpoint_stats=checkpoint_stats,
+                with_output_hashes=args.hash_outputs,
+            )
+            logger.info("run manifest written to %s", args.out / "run_manifest.json")
+    finally:
+        if hasattr(pipeline, "close"):
+            pipeline.close()
 
     print(f"World written to: {args.out.resolve()}")
     return 0
