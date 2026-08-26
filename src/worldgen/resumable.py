@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 import time
 from typing import Any, Callable
 
@@ -9,12 +10,13 @@ from .pipeline import WorldPipeline
 
 
 class ResumableWorldPipeline(WorldPipeline):
-    """WorldPipeline with transparent, content-addressed stage checkpoints.
+    """WorldPipeline with transparent, dependency-sensitive stage checkpoints.
 
-    Existing stage code does not need to know about persistence: every call to
-    ``self._stage`` is intercepted. The key includes the full resolved configuration
-    and a fingerprint of all installed ``worldgen`` Python sources, so stale results
-    are never reused after a source/configuration change.
+    Every stage key includes the installed source fingerprint, only the configuration
+    sections that can directly affect that stage, and a rolling digest of upstream
+    stage keys. Consequently a society-only configuration change can still reuse
+    astronomy/tectonics/climate checkpoints, while any upstream change invalidates
+    all dependent downstream state automatically.
     """
 
     def __init__(
@@ -31,13 +33,59 @@ class ResumableWorldPipeline(WorldPipeline):
         self.resume = bool(resume)
         self._source_fingerprint = package_source_fingerprint()
         self._config_dict = config.to_dict()
+        self._dependency_digest = hashlib.sha256(b"worldgen-stage-root-v2").hexdigest()
         self.checkpoint_hits: list[str] = []
+        self.stage_cache_keys: dict[str, str] = {}
+
+    def _stage_config(self, name: str) -> dict[str, Any]:
+        c = self._config_dict
+        sections: set[str] = {"seed"}
+        if name == "astronomy":
+            sections |= {"astronomy"}
+        elif name == "tectonics":
+            sections |= {"resolution", "tectonics", "noise"}
+        elif name == "noise_cache":
+            sections |= {"resolution", "noise"}
+        elif name.startswith("terrain"):
+            sections |= {"terrain", "tectonics", "simulation"}
+        elif name.startswith("ocean"):
+            sections |= {"ocean", "terrain", "noise", "simulation"}
+        elif name.startswith("climate"):
+            sections |= {"climate", "terrain", "noise", "simulation"}
+        elif name.startswith("geology"):
+            sections |= {"noise"}
+        elif name.startswith("surface") and name != "surface_appearance":
+            sections |= {"hydrology", "noise", "simulation"}
+        elif name == "hydrology_final":
+            sections |= {"hydrology"}
+        elif name == "weather":
+            sections |= {"weather"}
+        elif name == "surface_appearance":
+            sections |= {"appearance"}
+        elif name == "resources":
+            sections |= {"resources"}
+        elif name == "society":
+            sections |= {"society"}
+        elif name == "output":
+            sections |= {"output"}
+        else:
+            # Unknown future stages default to the whole configuration for safety.
+            return {"config": c, "dependency_digest": self._dependency_digest}
+        return {
+            "config": {key: c[key] for key in sorted(sections) if key in c},
+            "dependency_digest": self._dependency_digest,
+        }
+
+    def _advance_dependency_digest(self, cache_key: str) -> None:
+        h = hashlib.sha256()
+        h.update(self._dependency_digest.encode("ascii"))
+        h.update(cache_key.encode("ascii"))
+        self._dependency_digest = h.hexdigest()
 
     def _stage(self, name: str, fn: Callable[[], Any]) -> Any:
-        # Output is intentionally never checkpointed: it is a side-effect stage and
-        # may need to regenerate files after output flags/render settings change.
         cacheable = name != "output"
-        key = stage_cache_key(name, self._config_dict, self._source_fingerprint)
+        key = stage_cache_key(name, self._stage_config(name), self._source_fingerprint)
+        self.stage_cache_keys[name] = key
         if cacheable and self.resume:
             cached = self.checkpoint_store.get(key)
             if cached is not None:
@@ -46,6 +94,7 @@ class ResumableWorldPipeline(WorldPipeline):
                 self.timings[name] = 0.0
                 self.checkpoint_hits.append(name)
                 self.progress(f"[{name}] done in 0.000s")
+                self._advance_dependency_digest(key)
                 return cached
 
         value = super()._stage(name, fn)
@@ -53,6 +102,7 @@ class ResumableWorldPipeline(WorldPipeline):
             t0 = time.perf_counter()
             self.checkpoint_store.put(name, key, value)
             self.progress(f"[{name}] checkpoint saved in {time.perf_counter() - t0:.3f}s")
+        self._advance_dependency_digest(key)
         return value
 
     def close(self) -> None:
