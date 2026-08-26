@@ -4,7 +4,6 @@ from dataclasses import dataclass
 import hashlib
 import os
 import numpy as np
-from scipy import ndimage
 
 from .cache import ByteBoundLRUCache, CacheStats
 
@@ -95,7 +94,13 @@ def spherical_voronoi_ids(grid: SphereGrid, seeds_xyz: np.ndarray, chunk: int = 
 
 
 def smooth_periodic(a: np.ndarray, sigma: float | tuple[float, float]) -> np.ndarray:
-    return ndimage.gaussian_filter(a, sigma=sigma, mode=("nearest", "wrap"))
+    """Gaussian smoothing on a spherical equirectangular raster.
+
+    Longitude wraps and latitude is reflected through each pole with the required
+    antipodal longitude rotation. The public name is retained for compatibility.
+    """
+    from .topology import spherical_gaussian_filter
+    return spherical_gaussian_filter(a, sigma)
 
 
 def _mask_digest(mask: np.ndarray) -> str:
