@@ -68,20 +68,35 @@ def build_run_manifest(
     checkpoint_stats: Mapping[str, Any] | None = None,
     with_output_hashes: bool = False,
 ) -> dict[str, Any]:
-    cfg = config.to_dict() if hasattr(config, "to_dict") else config
+    cfg = config.to_dict() if hasattr(config, "to_dict") else dict(config)
     runtime = None
     if runtime_plan is not None:
         runtime = asdict(runtime_plan) if is_dataclass(runtime_plan) else dict(runtime_plan)
+
+    seed = int(getattr(config, "seed", cfg.get("seed", 0)))
+    resolution_cfg = cfg.get("resolution", {}) if isinstance(cfg, dict) else {}
+    width = int(getattr(getattr(config, "resolution", None), "width", resolution_cfg.get("width", 0)))
+    height = int(getattr(getattr(config, "resolution", None), "height", resolution_cfg.get("height", 0)))
+    config_hash = stable_json_hash(cfg)
+
+    # Keep the identity fields both at top level for easy machine inspection and
+    # in the richer reproducibility block for backwards-compatible provenance.
+    # A run manifest should answer "which world is this?" without requiring a
+    # consumer to know an internal nesting convention.
     manifest: dict[str, Any] = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
+        "seed": seed,
+        "resolution": [width, height],
+        "config_sha256": config_hash,
         "generator": {
             "version": "0.4.0",
             "git_commit": _git_commit(),
             "source_fingerprint_sha256": package_source_fingerprint(),
         },
         "reproducibility": {
-            "seed": int(getattr(config, "seed", cfg.get("seed", 0))),
-            "config_sha256": stable_json_hash(cfg),
+            "seed": seed,
+            "resolution": [width, height],
+            "config_sha256": config_hash,
             "config": cfg,
         },
         "environment": {
