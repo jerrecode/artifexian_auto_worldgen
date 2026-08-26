@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install package and test tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest build
+
+      - name: Compile all Python sources
+        run: python -m compileall -q src tests scripts
+
+      - name: CLI contract smoke test
+        run: |
+          worldgen --help >/tmp/worldgen-help.txt
+          python -m worldgen --help >/tmp/worldgen-module-help.txt
+          test -s /tmp/worldgen-help.txt
+          test -s /tmp/worldgen-module-help.txt
+
+      - name: Run test suite
+        run: pytest -q
+
+      - name: Verify distributable package build
+        run: python -m build
