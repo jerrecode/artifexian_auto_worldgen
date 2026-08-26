@@ -266,4 +266,4 @@ The pipeline intentionally separates stages by typed result objects so those upg
 
 ## License
 
-This project is open source under the [MIT License](LICENSE).
+This project is released under the MIT License. See `LICENSE`.

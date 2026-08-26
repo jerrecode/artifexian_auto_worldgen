@@ -1,3 +1,9 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
 # Python bytecode / caches
 __pycache__/
 *.py[cod]
@@ -5,20 +11,10 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.pyre/
-.pytype/
-.hypothesis/
+.pyright/
 .coverage
 .coverage.*
 htmlcov/
-coverage.xml
-
-# Virtual environments
-.venv/
-venv/
-env/
-ENV/
-.python-version
 
 # Packaging / build output
 build/
@@ -28,64 +24,79 @@ dist/
 *.egg
 pip-wheel-metadata/
 
-# Editors / IDEs
+# IDE / editor / OS noise
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-
-# OS metadata
 .DS_Store
 Thumbs.db
 
-# Logs / temporary files
+# Logs / temporary runtime files
 *.log
 *.tmp
 *.temp
 *.bak
 *.pid
 
-# World-generator runtime outputs
-# Canonical files written by WorldGenerator.save()
+# Generated world outputs
 world_arrays.npz
 world.json
 world_report.md
 features.geojson
-atlas_manifest.json
-categorical_legends.json
-
-# Canonical generated directories
 maps/
 atlas_all/
 data_tables/
 diagnostic_maps/
-
-# Common run/output directory conventions
-world-out/
-worldgen_run/
-worldgen_*/
-generated_planet_*/
-output/
+analysis/
 outputs/
-run/
-runs/
-artifacts/
+output/
+generated/
+generated_worlds/
+worldgen_run/
+worldgen_*_seed_*/
+worldgen_*_check*/
+worldgen_*_validation*/
+artifexian_*_world/
 
-# Generated archives/checksums
-*.tar.zst
-*.tar.gz
-*.tgz
-*.zip
-*.sha256
-
-# Large scientific/runtime data files
+# Large generated data / map / archive products
 *.npy
 *.npz
-*.nc
-*.netcdf
+*.zarr/
 *.h5
 *.hdf5
+*.nc
 *.tif
 *.tiff
 *.geotiff
+*.mbtiles
+*.parquet
+*.feather
+*.sqlite
+*.sqlite3
+*.db
+*.tar
+*.tar.gz
+*.tar.zst
+*.tgz
+*.zip
+
+# Generated image/map outputs
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.svg
+
+# Keep source-controlled documentation assets if added explicitly later
+!docs/**/*.png
+!docs/**/*.jpg
+!docs/**/*.jpeg
+!docs/**/*.webp
+!docs/**/*.svg
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
