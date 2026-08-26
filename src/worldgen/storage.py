@@ -10,7 +10,7 @@ import os
 import sqlite3
 import tempfile
 import time
-from typing import Mapping
+from typing import Callable, Mapping
 
 import numpy as np
 
@@ -28,11 +28,19 @@ class StoredArray:
 
 
 class MappedArrayStore(AbstractContextManager["MappedArrayStore"]):
-    """Random-access NumPy array store backed by .npy files + SQLite metadata.
+    """Crash-transactional random-access array store.
 
-    Arrays are opened with ``numpy.load(..., mmap_mode=...)`` so callers can slice
-    large datasets without loading the complete file. A byte cap and LRU pruning
-    keep temporary/persistent stores bounded.
+    Payloads are immutable content-addressed ``.npy`` objects. Replacing a logical
+    key follows this ordering:
+
+    1. serialize/fsync a new immutable object;
+    2. atomically publish that object;
+    3. commit the SQLite metadata pointer;
+    4. only then delete the old, now-unreferenced object.
+
+    A crash before step 3 preserves the old logical value and may leave only an
+    orphan object, which :meth:`reconcile` removes on the next open. A crash after
+    step 3 leaves the new logical value valid even if old-object cleanup did not run.
     """
 
     def __init__(
@@ -41,9 +49,11 @@ class MappedArrayStore(AbstractContextManager["MappedArrayStore"]):
         *,
         max_bytes: int = 4 * 1024**3,
         persistent: bool = False,
+        failure_injector: Callable[[str], None] | None = None,
     ) -> None:
         self.max_bytes = max(0, int(max_bytes))
         self.persistent = bool(persistent or root is not None)
+        self._failure_injector = failure_injector
         self._temp: tempfile.TemporaryDirectory[str] | None = None
         if root is None:
             self._temp = tempfile.TemporaryDirectory(prefix="worldgen-arrays-")
@@ -57,7 +67,7 @@ class MappedArrayStore(AbstractContextManager["MappedArrayStore"]):
         self._lock = RLock()
         self._db = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA synchronous=NORMAL")
+        self._db.execute("PRAGMA synchronous=FULL")
         self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS arrays (
@@ -74,6 +84,7 @@ class MappedArrayStore(AbstractContextManager["MappedArrayStore"]):
         )
         self._db.execute("CREATE INDEX IF NOT EXISTS idx_arrays_lru ON arrays(last_access)")
         self._db.commit()
+        self.reconcile()
 
     def __enter__(self) -> "MappedArrayStore":
         return self
@@ -82,40 +93,84 @@ class MappedArrayStore(AbstractContextManager["MappedArrayStore"]):
         self.close()
         return None
 
+    def _fail(self, stage: str) -> None:
+        hook = self._failure_injector
+        if hook is not None:
+            hook(stage)
+
     @staticmethod
-    def _filename_for_key(key: str) -> str:
-        return hashlib.sha256(key.encode("utf-8")).hexdigest() + ".npy"
+    def _key_hash(key: str) -> str:
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
+
+    @staticmethod
+    def _file_sha256(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+    def _object_path(self, key: str, content_sha256: str) -> Path:
+        return self.data_dir / f"{self._key_hash(key)}-{content_sha256}.npy"
 
     def put(self, key: str, array: np.ndarray, *, overwrite: bool = True) -> StoredArray:
-        """Atomically store an array while preserving existing data on rejection.
-
-        The new payload is fully serialized and size-checked before replacing the
-        currently indexed file.  This matters for bounded stores: an oversized
-        replacement must not destroy a valid smaller value merely because the LRU
-        pruning pass would evict the replacement immediately afterwards.
-        """
+        """Transactionally replace a logical array key without destroying old data."""
         if not key:
             raise ValueError("Array key must be non-empty")
         arr = np.asarray(array)
-        filename = self._filename_for_key(key)
-        path = self.data_dir / filename
-        tmp = self.data_dir / (filename + f".tmp-{os.getpid()}-{time.time_ns()}")
+        tmp = self.data_dir / f".object.tmp-{os.getpid()}-{time.time_ns()}"
+
         with self._lock:
-            exists = self._db.execute("SELECT 1 FROM arrays WHERE key=?", (key,)).fetchone() is not None
-            if exists and not overwrite:
+            row = self._db.execute(
+                "SELECT relpath, created_at FROM arrays WHERE key=?", (key,)
+            ).fetchone()
+            if row is not None and not overwrite:
                 raise KeyError(f"Array already exists: {key}")
+            old_relpath = None if row is None else str(row[0])
+            old_created = None if row is None else float(row[1])
+            self._fail("before_object_write")
+            object_path: Path | None = None
+            metadata_committed = False
             try:
                 with tmp.open("wb") as f:
                     np.save(f, arr, allow_pickle=False)
                     f.flush()
                     os.fsync(f.fileno())
-                file_bytes = tmp.stat().st_size
+                self._fail("after_object_write")
+                file_bytes = int(tmp.stat().st_size)
                 if self.max_bytes <= 0 or file_bytes > self.max_bytes:
                     raise RuntimeError(
                         f"Array {key!r} requires {file_bytes} bytes, exceeding store cap {self.max_bytes}"
                     )
-                os.replace(tmp, path)
+
+                content_hash = self._file_sha256(tmp)
+                object_path = self._object_path(key, content_hash)
+                if object_path.exists():
+                    tmp.unlink()
+                else:
+                    os.replace(tmp, object_path)
+                    self._fsync_directory(self.data_dir)
+                self._fail("after_object_publish")
+
                 now = time.time()
+                created = old_created if old_created is not None else now
+                self._db.execute("BEGIN IMMEDIATE")
                 self._db.execute(
                     """
                     INSERT INTO arrays(key, relpath, shape_json, dtype, nbytes, file_bytes, created_at, last_access)
@@ -128,15 +183,47 @@ class MappedArrayStore(AbstractContextManager["MappedArrayStore"]):
                         file_bytes=excluded.file_bytes,
                         last_access=excluded.last_access
                     """,
-                    (key, str(path.relative_to(self.root)), json.dumps(arr.shape), arr.dtype.str,
-                     int(arr.nbytes), int(file_bytes), now, now),
+                    (
+                        key,
+                        str(object_path.relative_to(self.root)),
+                        json.dumps(arr.shape),
+                        arr.dtype.str,
+                        int(arr.nbytes),
+                        file_bytes,
+                        created,
+                        now,
+                    ),
                 )
+                self._fail("before_db_commit")
                 self._db.commit()
+                metadata_committed = True
+                self._fail("after_db_commit")
+
+                if old_relpath is not None and old_relpath != str(object_path.relative_to(self.root)):
+                    old_path = self.root / old_relpath
+                    self._fail("during_old_object_delete")
+                    try:
+                        old_path.unlink()
+                        self._fsync_directory(old_path.parent)
+                    except FileNotFoundError:
+                        pass
+
                 self.prune()
                 info = self.info(key)
                 if info is None:
-                    raise RuntimeError(f"Array {key!r} was evicted immediately because the store cap is too small")
+                    raise RuntimeError(
+                        f"Array {key!r} was evicted immediately because the store cap is too small"
+                    )
                 return info
+            except BaseException:
+                # SQLite may have an active transaction if the injected/real failure
+                # occurred after BEGIN but before commit.
+                if not metadata_committed:
+                    try:
+                        self._db.rollback()
+                    except sqlite3.Error:
+                        pass
+                raise
             finally:
                 try:
                     tmp.unlink()
@@ -188,7 +275,37 @@ class MappedArrayStore(AbstractContextManager["MappedArrayStore"]):
             row = self._db.execute("SELECT COALESCE(SUM(file_bytes), 0) FROM arrays").fetchone()
         return int(row[0] or 0)
 
+    def reconcile(self) -> dict[str, int]:
+        """Remove stale metadata and orphan immutable objects after interrupted writes."""
+        with self._lock:
+            rows = self._db.execute("SELECT key, relpath FROM arrays").fetchall()
+            referenced = {str(relpath) for _, relpath in rows}
+            missing_keys = [key for key, relpath in rows if not (self.root / relpath).is_file()]
+            if missing_keys:
+                self._db.executemany("DELETE FROM arrays WHERE key=?", [(k,) for k in missing_keys])
+                self._db.commit()
+
+            orphaned = 0
+            for path in self.data_dir.glob("*.npy"):
+                rel = str(path.relative_to(self.root))
+                if rel not in referenced:
+                    try:
+                        path.unlink()
+                        orphaned += 1
+                    except FileNotFoundError:
+                        pass
+            for path in self.data_dir.glob(".object.tmp-*"):
+                try:
+                    path.unlink()
+                    orphaned += 1
+                except FileNotFoundError:
+                    pass
+            if orphaned:
+                self._fsync_directory(self.data_dir)
+            return {"missing_rows_removed": len(missing_keys), "orphan_files_removed": orphaned}
+
     def delete(self, key: str) -> bool:
+        """Delete metadata first; a crash during payload cleanup leaves only an orphan."""
         with self._lock:
             row = self._db.execute("SELECT relpath FROM arrays WHERE key=?", (key,)).fetchone()
             if row is None:
@@ -198,6 +315,7 @@ class MappedArrayStore(AbstractContextManager["MappedArrayStore"]):
             self._db.commit()
             try:
                 path.unlink()
+                self._fsync_directory(path.parent)
             except FileNotFoundError:
                 pass
             return True
