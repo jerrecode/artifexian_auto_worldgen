@@ -8,7 +8,6 @@ import json
 import os
 import pickle
 import sqlite3
-import tempfile
 import time
 from typing import Any
 
@@ -73,9 +72,10 @@ class CheckpointStore:
     """Transactional, byte-capped stage checkpoint store.
 
     Payloads use pickle protocol 5 because pipeline stages are Python dataclasses
-    containing NumPy arrays and structured metadata. Files are written to a sibling
-    temporary path, fsynced, hashed, atomically renamed, then indexed in SQLite.
-    A failed process therefore never exposes a half-written checkpoint as valid.
+    containing NumPy arrays and structured metadata. New payloads are written to a
+    content-specific sibling file, fsynced, then indexed atomically in SQLite.
+    Existing valid checkpoints are therefore preserved if a replacement is too
+    large or if metadata commit fails.
     """
 
     def __init__(self, root: str | Path, *, max_bytes: int = 64 * 1024**3) -> None:
@@ -108,7 +108,9 @@ class CheckpointStore:
         self._db.commit()
         self.reconcile()
 
-    def _filename(self, cache_key: str) -> str:
+    def _filename(self, cache_key: str, payload_sha256: str | None = None) -> str:
+        if payload_sha256:
+            return f"{cache_key}-{payload_sha256[:16]}.pkl"
         return f"{cache_key}.pkl"
 
     def _row_to_info(self, row) -> CheckpointInfo:
@@ -148,8 +150,6 @@ class CheckpointStore:
                     raise ValueError("checkpoint digest mismatch")
                 value = pickle.loads(data)
             except Exception:
-                # Corrupt/incompatible entries are invalidated rather than poisoning
-                # a resumed run.
                 self._db.execute("DELETE FROM checkpoints WHERE cache_key=?", (cache_key,))
                 self._db.commit()
                 try:
@@ -164,36 +164,63 @@ class CheckpointStore:
             return value
 
     def put(self, stage: str, cache_key: str, value: Any) -> CheckpointInfo | None:
-        if self.max_bytes == 0:
+        data = pickle.dumps(value, protocol=5)
+        size = len(data)
+        if self.max_bytes == 0 or size > self.max_bytes:
+            # Capacity rejection must not destroy a previous valid checkpoint for
+            # this key. Size-check before touching either its file or metadata.
             return None
-        filename = self._filename(cache_key)
+        digest = hashlib.sha256(data).hexdigest()
+        filename = self._filename(cache_key, digest)
         path = self.data_dir / filename
         tmp = self.data_dir / f".{filename}.tmp-{os.getpid()}-{time.time_ns()}"
-        data = pickle.dumps(value, protocol=5)
-        digest = hashlib.sha256(data).hexdigest()
         with self._lock:
-            with tmp.open("wb") as f:
-                f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
-            now = time.time()
-            size = path.stat().st_size
-            self._db.execute(
-                """
-                INSERT INTO checkpoints(stage,cache_key,relpath,file_bytes,payload_sha256,created_at,last_access)
-                VALUES(?,?,?,?,?,?,?)
-                ON CONFLICT(cache_key) DO UPDATE SET
-                  stage=excluded.stage, relpath=excluded.relpath,
-                  file_bytes=excluded.file_bytes, payload_sha256=excluded.payload_sha256,
-                  last_access=excluded.last_access
-                """,
-                (stage, cache_key, str(path.relative_to(self.root)), int(size), digest, now, now),
-            )
-            self._db.commit()
-            self._writes += 1
-            self.prune()
-            return self.info(cache_key)
+            old_row = self._db.execute(
+                "SELECT relpath FROM checkpoints WHERE cache_key=?", (cache_key,)
+            ).fetchone()
+            old_path = None if old_row is None else self.root / old_row[0]
+            try:
+                with tmp.open("wb") as f:
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, path)
+                now = time.time()
+                try:
+                    self._db.execute(
+                        """
+                        INSERT INTO checkpoints(stage,cache_key,relpath,file_bytes,payload_sha256,created_at,last_access)
+                        VALUES(?,?,?,?,?,?,?)
+                        ON CONFLICT(cache_key) DO UPDATE SET
+                          stage=excluded.stage, relpath=excluded.relpath,
+                          file_bytes=excluded.file_bytes, payload_sha256=excluded.payload_sha256,
+                          last_access=excluded.last_access
+                        """,
+                        (stage, cache_key, str(path.relative_to(self.root)), int(size), digest, now, now),
+                    )
+                    self._db.commit()
+                except Exception:
+                    self._db.rollback()
+                    # The old metadata still points at the old content-specific file.
+                    if old_path is None or path != old_path:
+                        try:
+                            path.unlink()
+                        except FileNotFoundError:
+                            pass
+                    raise
+                if old_path is not None and old_path != path:
+                    try:
+                        old_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                self._writes += 1
+                self.prune()
+                return self.info(cache_key)
+            finally:
+                try:
+                    tmp.unlink()
+                except FileNotFoundError:
+                    pass
 
     def invalidate_stage(self, stage: str) -> int:
         with self._lock:
