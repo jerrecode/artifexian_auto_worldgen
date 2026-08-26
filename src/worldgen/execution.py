@@ -5,25 +5,17 @@ import time
 from typing import Any, Callable
 
 from .drainage import install_into_hydrology
+from .field_schema import write_field_catalog
+from .invariants import write_validation_report
 from .manifest import write_run_manifest
 from .pipeline import WorldPipeline as _BaseWorldPipeline
 from .workflow import StageCheckpointStore, StageRecord, stage_key
 
-# Install the O(N) reusable drainage graph kernels once. This compatibility
-# bridge keeps the long-standing hydrology public API stable while moving its
-# expensive graph traversals into a dedicated optimized implementation.
 install_into_hydrology()
 
 
 class WorldPipeline(_BaseWorldPipeline):
-    """Checkpointable pipeline façade over the deterministic core pipeline.
-
-    The inherited generation graph still defines the numerical workflow. This
-    subclass intercepts every named stage, gives it a content-addressed key,
-    optionally restores/saves its result, and records provenance for the final
-    run manifest. Keeping the execution layer orthogonal to the scientific
-    kernels lets resumability evolve without duplicating the world model.
-    """
+    """Checkpointable, provenance-aware façade over the deterministic core pipeline."""
 
     def __init__(
         self,
@@ -48,7 +40,7 @@ class WorldPipeline(_BaseWorldPipeline):
             seed=self.cfg.seed,
             config=self.cfg,
             dependency_keys=dep_keys,
-            implementation_version="2",
+            implementation_version="3",
         )
         cacheable = self.checkpoints is not None and name != "output"
         if cacheable and self.resume and self.checkpoints.has(key):
@@ -95,6 +87,9 @@ class WorldPipeline(_BaseWorldPipeline):
 
     def save(self, world: dict[str, Any], out: Path) -> None:
         super().save(world, out)
+        arrays = self._array_export(world)
+        write_field_catalog(out / "field_catalog.json", arrays)
+        write_validation_report(out / "validation.json", world, strict=False)
         write_run_manifest(
             out / "run_manifest.json",
             self.cfg,
