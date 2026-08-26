@@ -1,0 +1,304 @@
+{
+  "archive_transcript_count": 49,
+  "detected_unique_logs": 49,
+  "missing_logs": [
+    33,
+    40
+  ],
+  "files": [
+    {
+      "log": 0,
+      "title": "New Series",
+      "filename": "yt-vid-transcript_[E-9U0wJxGBA].txt",
+      "bytes": 3478
+    },
+    {
+      "log": 1,
+      "title": "The Star",
+      "filename": "yt-vid-transcript_[N40f1Sn4bDU].txt",
+      "bytes": 15988
+    },
+    {
+      "log": 2,
+      "title": "The Planetary System",
+      "filename": "yt-vid-transcript_[t22MY6fhxog].txt",
+      "bytes": 16858
+    },
+    {
+      "log": 3,
+      "title": "The Stellar Neighbourhood",
+      "filename": "yt-vid-transcript_[F0YnTWWLMCk].txt",
+      "bytes": 21140
+    },
+    {
+      "log": 4,
+      "title": "Fixes and Tweaks",
+      "filename": "yt-vid-transcript_[s1AVVeqRIjo].txt",
+      "bytes": 12038
+    },
+    {
+      "log": 5,
+      "title": "The Home Planet",
+      "filename": "yt-vid-transcript_[cRAmeuwM4w8].txt",
+      "bytes": 32070
+    },
+    {
+      "log": 6,
+      "title": "The Moon",
+      "filename": "yt-vid-transcript_[AfEtaqz9r_k].txt",
+      "bytes": 21014
+    },
+    {
+      "log": 7,
+      "title": "Apparent Size & Brightness",
+      "filename": "yt-vid-transcript_[Obda0U7yvrs].txt",
+      "bytes": 20038
+    },
+    {
+      "log": 8,
+      "title": "Final Fixes and Tweaks",
+      "filename": "yt-vid-transcript_[WgFrhxeLXzE].txt",
+      "bytes": 16064
+    },
+    {
+      "log": 9,
+      "title": "Plate Tectonics: An Overview",
+      "filename": "yt-vid-transcript_[auRbMYFCXPc].txt",
+      "bytes": 29968
+    },
+    {
+      "log": 10,
+      "title": "GPlates: The Supercontinent",
+      "filename": "yt-vid-transcript_[AzD_WVsEIRM].txt",
+      "bytes": 26650
+    },
+    {
+      "log": 11,
+      "title": "GPlates: The First 100 Million Years",
+      "filename": "yt-vid-transcript_[v4CNDo6WLhI].txt",
+      "bytes": 34801
+    },
+    {
+      "log": 12,
+      "title": "GPlates: Subduction Zones & Island Arcs",
+      "filename": "yt-vid-transcript_[VzUVkigh34w].txt",
+      "bytes": 26142
+    },
+    {
+      "log": 13,
+      "title": "GPlates: Splitting Comoving Plates",
+      "filename": "yt-vid-transcript_[CtS9p8ltAKI].txt",
+      "bytes": 22861
+    },
+    {
+      "log": 14,
+      "title": "GPlates: Microcontinents",
+      "filename": "yt-vid-transcript_[4jvNBDqPEOc].txt",
+      "bytes": 21163
+    },
+    {
+      "log": 15,
+      "title": "GPlates: Island Arc Collisions",
+      "filename": "yt-vid-transcript_[ytmQHR2hNyc].txt",
+      "bytes": 14763
+    },
+    {
+      "log": 16,
+      "title": "GPlates: Continent Collisions",
+      "filename": "yt-vid-transcript_[reYOEUS3qN0].txt",
+      "bytes": 17306
+    },
+    {
+      "log": 17,
+      "title": "GPlates: Orogeny",
+      "filename": "yt-vid-transcript_[5k7BdgmO67E].txt",
+      "bytes": 19464
+    },
+    {
+      "log": 18,
+      "title": "GPlates: Large Igneous Provinces & Hotspots",
+      "filename": "yt-vid-transcript_[QCSproqYu9Q].txt",
+      "bytes": 17723
+    },
+    {
+      "log": 19,
+      "title": "GPlates: Ocean Age Heatmap",
+      "filename": "yt-vid-transcript_[DKqvfLmiRYw].txt",
+      "bytes": 10781
+    },
+    {
+      "log": 20,
+      "title": "GPlates: Using Topologies",
+      "filename": "yt-vid-transcript_[CxFpWyAzWqw].txt",
+      "bytes": 47392
+    },
+    {
+      "log": 21,
+      "title": "World Reveal: An 850 Million Year History",
+      "filename": "yt-vid-transcript_[4iVV3IvcWwI].txt",
+      "bytes": 20913
+    },
+    {
+      "log": 22,
+      "title": "World Map: Islands",
+      "filename": "yt-vid-transcript_[00ILRcZmX4I].txt",
+      "bytes": 10148
+    },
+    {
+      "log": 23,
+      "title": "World Map: Continents",
+      "filename": "yt-vid-transcript_[CgRhG7rCWfE].txt",
+      "bytes": 5600
+    },
+    {
+      "log": 24,
+      "title": "World Map: Land Topography",
+      "filename": "yt-vid-transcript_[vYHcSqQ1kwA].txt",
+      "bytes": 41685
+    },
+    {
+      "log": 25,
+      "title": "Using Blender to Map Directly onto a Sphere",
+      "filename": "yt-vid-transcript_[FHK9FlV_tyI].txt",
+      "bytes": 17428
+    },
+    {
+      "log": 26,
+      "title": "World Map: Sea Topography",
+      "filename": "yt-vid-transcript_[DwMKIuKsCAc].txt",
+      "bytes": 21214
+    },
+    {
+      "log": 27,
+      "title": "Ocean Depth Calculator",
+      "filename": "yt-vid-transcript_[LoVNwLT092A].txt",
+      "bytes": 7098
+    },
+    {
+      "log": 28,
+      "title": "Ocean Currents",
+      "filename": "yt-vid-transcript_[UgJ67AswrEs].txt",
+      "bytes": 27570
+    },
+    {
+      "log": 29,
+      "title": "Winds & Pressure",
+      "filename": "yt-vid-transcript_[gWYzAFi0MZ4].txt",
+      "bytes": 21702
+    },
+    {
+      "log": 30,
+      "title": "Upwelling & Coral Reefs",
+      "filename": "yt-vid-transcript_[vmoed42Zivg].txt",
+      "bytes": 20266
+    },
+    {
+      "log": 31,
+      "title": "Precipitation",
+      "filename": "yt-vid-transcript_[lHV-jZUB5WU].txt",
+      "bytes": 21014
+    },
+    {
+      "log": 32,
+      "title": "Precipitation & Pressure Redo",
+      "filename": "yt-vid-transcript_[2RMyd9vo2Qk].txt",
+      "bytes": 11921
+    },
+    {
+      "log": 34,
+      "title": "Temperature: Isotherms & Hot/Cold Spots",
+      "filename": "yt-vid-transcript_[Ihwv2EduEoM].txt",
+      "bytes": 13987
+    },
+    {
+      "log": 35,
+      "title": "Temperature: Final Maps",
+      "filename": "yt-vid-transcript_[bTWF-xl_R0A].txt",
+      "bytes": 30682
+    },
+    {
+      "log": 36,
+      "title": "Polar Climates",
+      "filename": "yt-vid-transcript_[uSMcnZV_Hh0].txt",
+      "bytes": 15286
+    },
+    {
+      "log": 37,
+      "title": "Tropical Climates",
+      "filename": "yt-vid-transcript_[vi66amwP2g0].txt",
+      "bytes": 14177
+    },
+    {
+      "log": 38,
+      "title": "Arid Climates",
+      "filename": "yt-vid-transcript_[e1EEKnliSK8].txt",
+      "bytes": 13793
+    },
+    {
+      "log": 39,
+      "title": "Temperate Climates",
+      "filename": "yt-vid-transcript_[BvZ1rlCLg8U].txt",
+      "bytes": 17515
+    },
+    {
+      "log": 41,
+      "title": "Rivers",
+      "filename": "yt-vid-transcript_[DOutB6-_LpE].txt",
+      "bytes": 24423
+    },
+    {
+      "log": 42,
+      "title": "Fog, Thunderstorms, Tornadoes, Auroras",
+      "filename": "yt-vid-transcript_[44lhdsDBCyo].txt",
+      "bytes": 20872
+    },
+    {
+      "log": 43,
+      "title": "Hurricanes, Blizzards, Dust Storms & More",
+      "filename": "yt-vid-transcript_[n83ja9WFiJk].txt",
+      "bytes": 28898
+    },
+    {
+      "log": 44,
+      "title": "Rocks",
+      "filename": "yt-vid-transcript_[HQ4NeMNap_0].txt",
+      "bytes": 22864
+    },
+    {
+      "log": 45,
+      "title": "Fuel & The Copper Age",
+      "filename": "yt-vid-transcript_[z38GgH8En3E].txt",
+      "bytes": 25530
+    },
+    {
+      "log": 46,
+      "title": "The Bronze Age",
+      "filename": "yt-vid-transcript_[OFaf-f_XY6I].txt",
+      "bytes": 23536
+    },
+    {
+      "log": 47,
+      "title": "The Iron Age",
+      "filename": "yt-vid-transcript_[d3VKSjEZwSw].txt",
+      "bytes": 16263
+    },
+    {
+      "log": 48,
+      "title": "Salt",
+      "filename": "yt-vid-transcript_[g3a0wXxsDTo].txt",
+      "bytes": 8884
+    },
+    {
+      "log": 49,
+      "title": "Humans",
+      "filename": "yt-vid-transcript_[DSq8rhuWTq4].txt",
+      "bytes": 57991
+    },
+    {
+      "log": 50,
+      "title": "You Fixed My Humans",
+      "filename": "yt-vid-transcript_[roZCzp6HcNE].txt",
+      "bytes": 23731
+    }
+  ]
+}

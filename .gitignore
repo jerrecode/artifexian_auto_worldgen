@@ -1,0 +1,91 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Packaging / build output
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Logs / temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+*.pid
+
+# World-generator runtime outputs
+# Canonical files written by WorldGenerator.save()
+world_arrays.npz
+world.json
+world_report.md
+features.geojson
+atlas_manifest.json
+categorical_legends.json
+
+# Canonical generated directories
+maps/
+atlas_all/
+data_tables/
+diagnostic_maps/
+
+# Common run/output directory conventions
+world-out/
+worldgen_run/
+worldgen_*/
+generated_planet_*/
+output/
+outputs/
+run/
+runs/
+artifacts/
+
+# Generated archives/checksums
+*.tar.zst
+*.tar.gz
+*.tgz
+*.zip
+*.sha256
+
+# Large scientific/runtime data files
+*.npy
+*.npz
+*.nc
+*.netcdf
+*.h5
+*.hdf5
+*.tif
+*.tiff
+*.geotiff
