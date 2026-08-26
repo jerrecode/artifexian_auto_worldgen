@@ -11,6 +11,147 @@ if TYPE_CHECKING:
     from .grid import SphereGrid
 
 
+def _map_spherical_lattice_indices(
+    y: np.ndarray, x: np.ndarray, shape: tuple[int, int]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map arbitrary integer raster indices onto the spherical equirectangular grid.
+
+    Longitude wraps periodically. Each latitude crossing reflects about the pole and
+    advances longitude by half a world, which is the discrete equivalent of passing
+    continuously over a pole on a sphere.
+    """
+    h, w = map(int, shape)
+    yy = np.asarray(y, dtype=np.int64).copy()
+    xx = np.asarray(x, dtype=np.int64).copy()
+    if h <= 0 or w <= 0:
+        raise ValueError("shape dimensions must be positive")
+    while np.any((yy < 0) | (yy >= h)):
+        north = yy < 0
+        south = yy >= h
+        if np.any(north):
+            yy = np.where(north, -yy - 1, yy)
+            xx = np.where(north, xx + w // 2, xx)
+        if np.any(south):
+            yy = np.where(south, 2 * h - yy - 1, yy)
+            xx = np.where(south, xx + w // 2, xx)
+    return yy.astype(np.int32, copy=False), (xx % w).astype(np.int32, copy=False)
+
+
+def prepare_spherical_bilinear_sampler(
+    src_y: np.ndarray, src_x: np.ndarray, shape: tuple[int, int]
+):
+    """Precompute bilinear indices/weights with true seam and pole topology.
+
+    Coordinates may lie outside the latitude raster. Rather than clamping them at
+    the first/last row, each interpolation corner is reflected across the pole and
+    shifted by 180 degrees in longitude. This keeps semi-Lagrangian transport
+    continuous across both poles as well as across the longitude seam.
+    """
+    h, w = map(int, shape)
+    sy, sx = np.broadcast_arrays(
+        np.asarray(src_y, dtype=np.float64), np.asarray(src_x, dtype=np.float64)
+    )
+    y0 = np.floor(sy).astype(np.int64)
+    x0 = np.floor(sx).astype(np.int64)
+    y1 = y0 + 1
+    x1 = x0 + 1
+    fy = (sy - y0).astype(np.float32)
+    fx = (sx - x0).astype(np.float32)
+
+    y00, x00 = _map_spherical_lattice_indices(y0, x0, (h, w))
+    y01, x01 = _map_spherical_lattice_indices(y0, x1, (h, w))
+    y10, x10 = _map_spherical_lattice_indices(y1, x0, (h, w))
+    y11, x11 = _map_spherical_lattice_indices(y1, x1, (h, w))
+
+    return (
+        (y00 * w + x00).ravel(),
+        (y01 * w + x01).ravel(),
+        (y10 * w + x10).ravel(),
+        (y11 * w + x11).ravel(),
+        ((1.0 - fy) * (1.0 - fx)).ravel(),
+        ((1.0 - fy) * fx).ravel(),
+        (fy * (1.0 - fx)).ravel(),
+        (fy * fx).ravel(),
+        sy.shape,
+    )
+
+
+def apply_bilinear_sampler(values: np.ndarray, sampler) -> np.ndarray:
+    """Apply a sampler created by :func:`prepare_spherical_bilinear_sampler`."""
+    i00, i01, i10, i11, w00, w01, w10, w11, shape = sampler
+    f = np.asarray(values).ravel()
+    return (
+        f[i00] * w00
+        + f[i01] * w01
+        + f[i10] * w10
+        + f[i11] * w11
+    ).reshape(shape)
+
+
+def spherical_gaussian_filter(
+    values: np.ndarray,
+    sigma: float | tuple[float, float],
+    *,
+    truncate: float = 4.0,
+) -> np.ndarray:
+    """Gaussian-filter the last two raster axes using spherical pole topology.
+
+    Longitude is wrapped by SciPy. Latitude receives an explicit reflected halo;
+    every reflected halo row is rotated by 180 degrees in longitude. This avoids
+    the artificial zero-normal-flow boundary implicit in ``mode='nearest'`` at the
+    poles while preserving the same Gaussian kernel and tuning elsewhere.
+    """
+    a = np.asarray(values)
+    if a.ndim < 2:
+        raise ValueError("spherical Gaussian filtering requires at least two dimensions")
+    if np.isscalar(sigma):
+        sy = sx = float(sigma)
+    else:
+        seq = tuple(float(s) for s in sigma)
+        if len(seq) != 2:
+            raise ValueError("sigma must be a scalar or a (latitude, longitude) pair")
+        sy, sx = seq
+    sy = max(0.0, sy)
+    sx = max(0.0, sx)
+    if sy <= 0.0 and sx <= 0.0:
+        return a.copy()
+
+    h, w = a.shape[-2:]
+    if h <= 0 or w <= 0:
+        return a.copy()
+    halo = int(np.ceil(max(float(truncate), 0.0) * sy)) if sy > 0.0 else 0
+
+    if halo > 0:
+        virtual_y = np.arange(-halo, h + halo, dtype=np.int64)
+        mapped_y = virtual_y.copy()
+        half_turns = np.zeros_like(mapped_y)
+        while np.any((mapped_y < 0) | (mapped_y >= h)):
+            north = mapped_y < 0
+            south = mapped_y >= h
+            if np.any(north):
+                mapped_y = np.where(north, -mapped_y - 1, mapped_y)
+                half_turns = np.where(north, half_turns + 1, half_turns)
+            if np.any(south):
+                mapped_y = np.where(south, 2 * h - mapped_y - 1, mapped_y)
+                half_turns = np.where(south, half_turns + 1, half_turns)
+        padded = np.take(a, mapped_y.astype(np.intp), axis=-2).copy()
+        if w > 1:
+            for row, turns in enumerate(half_turns):
+                if int(turns) & 1:
+                    padded[..., row, :] = np.roll(padded[..., row, :], -(w // 2), axis=-1)
+    else:
+        padded = a
+
+    sigmas = (0.0,) * (padded.ndim - 2) + (sy, sx)
+    modes = ("nearest",) * (padded.ndim - 1) + ("wrap",)
+    filtered = ndimage.gaussian_filter(
+        padded, sigma=sigmas, mode=modes, truncate=float(truncate)
+    )
+    if halo > 0:
+        filtered = filtered[..., halo : halo + h, :]
+    return filtered
+
+
 @dataclass(slots=True)
 class SphericalRasterOps:
     """Topology- and metric-aware operations for an equirectangular spherical raster.
@@ -30,21 +171,7 @@ class SphericalRasterOps:
     def neighbor_indices(self, dy: int, dx: int) -> tuple[np.ndarray, np.ndarray]:
         h, w = self.shape
         yy, xx = np.indices((h, w), dtype=np.int32)
-        ny = yy + int(dy)
-        nx = xx + int(dx)
-
-        # General reflection loop also supports halo offsets larger than one row.
-        # A pole crossing rotates the longitude by half a world.
-        while np.any((ny < 0) | (ny >= h)):
-            north = ny < 0
-            south = ny >= h
-            if np.any(north):
-                ny = np.where(north, -ny - 1, ny)
-                nx = np.where(north, nx + w // 2, nx)
-            if np.any(south):
-                ny = np.where(south, 2 * h - ny - 1, ny)
-                nx = np.where(south, nx + w // 2, nx)
-        return ny.astype(np.int32, copy=False), (nx % w).astype(np.int32, copy=False)
+        return _map_spherical_lattice_indices(yy + int(dy), xx + int(dx), (h, w))
 
     def shift(self, array: np.ndarray, dy: int, dx: int) -> np.ndarray:
         a = np.asarray(array)
@@ -54,6 +181,20 @@ class SphericalRasterOps:
         if a.ndim == 2:
             return a[ny, nx]
         return a[..., ny, nx]
+
+    def bilinear_sampler(self, src_y: np.ndarray, src_x: np.ndarray):
+        return prepare_spherical_bilinear_sampler(src_y, src_x, self.shape)
+
+    def bilinear_sample(self, values: np.ndarray, sampler) -> np.ndarray:
+        return apply_bilinear_sampler(values, sampler)
+
+    def gaussian_filter(
+        self, values: np.ndarray, sigma: float | tuple[float, float], *, truncate: float = 4.0
+    ) -> np.ndarray:
+        a = np.asarray(values)
+        if a.shape[-2:] != self.shape:
+            raise ValueError(f"last two dimensions must be {self.shape}, got {a.shape}")
+        return spherical_gaussian_filter(a, sigma, truncate=truncate)
 
     def neighbors8(self) -> Iterator[tuple[int, int]]:
         for dy in (-1, 0, 1):
