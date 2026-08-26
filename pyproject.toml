@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "artifexian-auto-worldgen"
-version = "0.2.0"
+version = "0.3.0"
 description = "Hierarchical tectonic, climate, fluvial landscape-evolution and worldbuilding generator reconstructed from Artifexian Worldbuilder's Log workflows."
 license = {text = "MIT"}
 readme = "README.md"
@@ -14,6 +14,30 @@ dependencies = [
   "scipy>=1.13",
   "matplotlib>=3.8",
   "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+performance = [
+  "numexpr>=2.10",
+  "bottleneck>=1.4",
+  "psutil>=6.0",
+  "threadpoolctl>=3.5",
+  "joblib>=1.4",
+]
+jit = [
+  "numba>=0.61",
+]
+storage = [
+  "zarr>=3.0",
+  "numcodecs>=0.16",
+  "h5py>=3.11",
+]
+render = [
+  "Pillow>=10.4",
+]
+dev = [
+  "pytest>=8.0",
+  "build>=1.2",
 ]
 
 [project.scripts]
