@@ -4,6 +4,7 @@ import numpy as np
 
 from worldgen.diagnostics import array_digest, receiver_graph_is_acyclic
 from worldgen.grid import SphereGrid, distance_to
+from worldgen.weather import _large_land_mask
 
 
 class SphericalTopologyTests(unittest.TestCase):
@@ -33,6 +34,34 @@ class SphericalTopologyTests(unittest.TestCase):
         labels, n = grid.ops.connected_components(mask)
         self.assertEqual(n, 1)
         self.assertEqual(int(labels[13, 0]), int(labels[13, -1]))
+
+    def test_grey_dilation_wraps_longitude_seam(self):
+        grid = SphereGrid(64, 32)
+        field = np.zeros((32, 64), dtype=np.float32)
+        field[16, 0] = 7.0
+        expanded = grid.ops.grey_dilation(field, iterations=1)
+        self.assertEqual(float(expanded[16, -1]), 7.0)
+        self.assertEqual(float(expanded[15, -1]), 7.0)
+
+    def test_grey_dilation_crosses_pole_with_antipodal_rotation(self):
+        grid = SphereGrid(64, 32)
+        field = np.zeros((32, 64), dtype=np.float32)
+        field[0, 32] = 9.0
+        expanded = grid.ops.grey_dilation(field, iterations=1)
+        # The north neighbor of top-row longitude 0 is the reflected top-row
+        # cell at longitude +180 degrees (half a raster away).
+        self.assertEqual(float(expanded[0, 0]), 9.0)
+
+    def test_large_land_mask_merges_seam_component_and_uses_spherical_area(self):
+        grid = SphereGrid(64, 32)
+        land = np.zeros((32, 64), dtype=bool)
+        # 32 equatorial cells split evenly across the map edges. Each planar half
+        # is below the legacy 30-cell threshold, but the spherical component is not.
+        land[8:24, 0] = True
+        land[8:24, -1] = True
+        large = _large_land_mask(grid, land)
+        self.assertTrue(large[16, 0])
+        self.assertTrue(large[16, -1])
 
     def test_metric_gradient_is_finite_at_poles(self):
         grid = SphereGrid(128, 64)

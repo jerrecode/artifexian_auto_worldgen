@@ -81,6 +81,25 @@ class SphericalRasterOps:
             out = shrunk
         return out
 
+    def grey_dilation(self, values: np.ndarray, iterations: int = 1) -> np.ndarray:
+        """Maximum filter over spherical 8-neighborhoods.
+
+        Each iteration expands the Chebyshev neighborhood radius by one cell while
+        preserving longitude wrap and the 180-degree rotation required when a
+        neighborhood crosses either pole. This is the spherical counterpart of a
+        square ``scipy.ndimage.maximum_filter`` / grey dilation.
+        """
+        out = np.asarray(values).copy()
+        if out.shape[-2:] != self.shape:
+            raise ValueError(f"last two dimensions must be {self.shape}, got {out.shape}")
+        for _ in range(max(0, int(iterations))):
+            src = out
+            expanded = src.copy()
+            for dy, dx in self.neighbors8():
+                expanded = np.maximum(expanded, self.shift(src, dy, dx))
+            out = expanded
+        return out
+
     def boundary(self, mask: np.ndarray) -> np.ndarray:
         m = np.asarray(mask, dtype=bool)
         if not np.any(m):

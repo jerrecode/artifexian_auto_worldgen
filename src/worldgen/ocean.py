@@ -1,7 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
-from scipy import ndimage
 
 from .config import OceanConfig, TerrainConfig, NoiseConfig
 from .grid import SphereGrid, distance_to, normalize01, smooth_periodic
@@ -66,8 +65,6 @@ def _normalize_monthly_vectors(u: np.ndarray, v: np.ndarray, ocean: np.ndarray) 
     return u, v
 
 
-
-
 def _prepare_bilinear_sampler(src_y: np.ndarray, src_x: np.ndarray, shape: tuple[int, int]):
     h, w = shape
     sy = np.clip(np.asarray(src_y, dtype=np.float64), 0.0, h - 1.0000001)
@@ -83,6 +80,7 @@ def _bilinear_sample(a: np.ndarray, sampler) -> np.ndarray:
     i00,i01,i10,i11,w00,w01,w10,w11,shape=sampler
     f=np.asarray(a).ravel()
     return (f[i00]*w00+f[i01]*w01+f[i10]*w10+f[i11]*w11).reshape(shape)
+
 
 def _advect_ocean_heat(
     grid: SphereGrid,
@@ -174,9 +172,9 @@ def build_ocean(
     latr = np.deg2rad(grid.lat)
     psi = dscale * (np.sin(2.0 * latr) - 0.28 * np.sin(4.0 * latr))
     psi = smooth_periodic(psi, sigma=(2.0, 3.0)) * ocean
-    dpsi_dy, dpsi_dx = np.gradient(psi)
+    dpsi_dy, dpsi_dx = grid.ops.metric_gradient(psi)
     base_u = ocfg.gyre_strength * dpsi_dy
-    base_v = -ocfg.gyre_strength * dpsi_dx / np.maximum(np.cos(latr), 0.18)
+    base_v = -ocfg.gyre_strength * dpsi_dx
     # Small background jets remain, but seasonal atmospheric stress now supplies most zonal forcing;
     # basin geometry therefore has enough weight to bend currents into gyres around continents.
     base_u += -0.10 * np.exp(-(grid.lat / 11.0) ** 2)
@@ -195,7 +193,7 @@ def build_ocean(
     # Western boundary currents are narrow and poleward; eastern boundary currents are broader and
     # weaker/equatorward. The sign of the coast-distance x-gradient identifies which side of a basin
     # a coastal ocean cell lies on without explicitly polygonizing every ocean basin.
-    cgy, cgx = np.gradient(coast_dist.astype(float))
+    cgy, cgx = grid.ops.metric_gradient(coast_dist.astype(float))
     cgn = np.hypot(cgx, cgy) + 1e-8
     east_from_coast = cgx / cgn
     near_coast = np.exp(-coast_dist / max(float(ocfg.boundary_current_width_km), 50.0)) * ocean
@@ -208,7 +206,7 @@ def build_ocean(
     # Bathymetric steering bends currents along continental slopes, ridges and seamount chains instead
     # of allowing vectors to cut indiscriminately across strong depth contours.
     sm_depth = smooth_periodic(depth.astype(float), (2.0, 2.8))
-    dzy, dzx = np.gradient(sm_depth)
+    dzy, dzx = grid.ops.metric_gradient(sm_depth)
     dzn = np.hypot(dzx, dzy) + 1e-8
     tx, ty = -dzy / dzn, dzx / dzn
     bsp = np.hypot(base_u, base_v)
@@ -272,9 +270,7 @@ def build_ocean(
     # Coastal/equatorial upwelling proxy from cold transported water and wind/current divergence.
     coast_factor = np.exp(-dist_land / 220.0) * ocean
     cold = np.clip(-sst_anom / 5.0, 0, 1)
-    # Approximate surface divergence from annual currents.
-    dvy, _ = np.gradient(v_ann.astype(float)); _, dux = np.gradient(u_ann.astype(float))
-    divergence = normalize01(np.maximum(0.0, dux + dvy))
+    divergence = normalize01(np.maximum(0.0, grid.ops.divergence(u_ann.astype(float), v_ann.astype(float))))
     up = coast_factor * (0.55 * cold + 0.45 * divergence)
     up += 0.62 * np.exp(-(grid.lat / 5.0) ** 2) * ocean
     up = normalize01(smooth_periodic(up, (1.1, 1.4))).astype(np.float32)

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import numpy as np
-from scipy import ndimage
 
 from .config import TerrainConfig, TectonicsConfig, NoiseConfig
 from .grid import SphereGrid, distance_to, normalize01, smooth_periodic
@@ -34,8 +33,9 @@ def _ridge_noise(shape: tuple[int, int], rng: np.random.Generator, octaves: int 
     return hybrid_noise01(shape, rng, base_scale_px=max(shape[0] / 8.0, 3.0),
                           **noise_kwargs(noise_cfg, profile=profile, octaves=octaves))
 
-def _rough_gradient(elev: np.ndarray) -> np.ndarray:
-    gy, gx = np.gradient(elev.astype(float))
+
+def _rough_gradient(elev: np.ndarray, grid: SphereGrid) -> np.ndarray:
+    gy, gx = grid.ops.metric_gradient(np.asarray(elev, float))
     return normalize01(np.hypot(gx, gy))
 
 
@@ -50,8 +50,8 @@ def rebuild_terrain_from_elevation(
     elev = np.asarray(elevation_km, float).copy()
     land = elev > 0.0
     ocean = ~land
-    coast_land = land & ndimage.binary_dilation(ocean, iterations=1)
-    coast_ocean = ocean & ndimage.binary_dilation(land, iterations=1)
+    coast_land = land & grid.ops.binary_dilation(ocean, iterations=1)
+    coast_ocean = ocean & grid.ops.binary_dilation(land, iterations=1)
     coast = coast_land | coast_ocean
     active_margin = distance_to(tect.convergent, grid) < 180.0
     dist_land = distance_to(land, grid)
@@ -59,7 +59,7 @@ def rebuild_terrain_from_elevation(
     shelf = ocean & (dist_land <= shelf_width)
 
     relief = np.maximum(elev, 0.0)
-    rough = _rough_gradient(elev)
+    rough = _rough_gradient(elev, grid)
     mountain = normalize01(relief + 1.2 * tect.convergence_strength + 0.55 * tect.strain_field + 0.30 * rough)
     # Continuous lowland score: flat, low-elevation land is strongest.
     low = land.astype(float) * np.exp(-np.maximum(elev, 0.0) / 0.85) * (1.0 - 0.70 * rough)
@@ -90,7 +90,7 @@ def _coastal_rework(grid: SphereGrid, elev: np.ndarray, cfg: TerrainConfig, targ
     min_area = max(0.0, float(cfg.min_island_area_km2))
     if min_area > 0:
         land = z > 0
-        labs, n = ndimage.label(land, structure=np.ones((3,3), dtype=np.int8))
+        labs, n = grid.ops.connected_components(land)
         surface_km2 = 4.0 * np.pi * grid.radius_km ** 2
         for lab in range(1, n + 1):
             m = labs == lab

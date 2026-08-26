@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import numpy as np
-from scipy import ndimage
 
 from .config import AppearanceConfig
 from .grid import SphereGrid, normalize01, smooth_periodic, distance_to
@@ -54,12 +53,9 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
 
 
 def _hillshade(grid: SphereGrid, elevation_km: np.ndarray) -> np.ndarray:
-    z = np.asarray(elevation_km, float)
-    gy, gx = np.gradient(z)
-    sx = gx / np.maximum(grid.dx_km, 1e-3)
-    sy = gy / max(grid.dy_km, 1e-3)
-    slope = np.arctan(np.hypot(sx, sy) * 65.0)
-    aspect = np.arctan2(-sx, sy)
+    gy, gx = grid.ops.metric_gradient(np.asarray(elevation_km, float))
+    slope = np.arctan(np.hypot(gx, gy) * 65.0)
+    aspect = np.arctan2(-gx, gy)
     az = np.deg2rad(315.0); alt = np.deg2rad(42.0)
     hs = np.sin(alt) * np.cos(slope) + np.cos(alt) * np.sin(slope) * np.cos(az - aspect)
     return normalize01(hs, robust=False).astype(np.float32)
@@ -120,7 +116,7 @@ def _render_rgb(
     rgb[land] = rgb[land] * (1.0 - bv[land]) + dry_rgb * bv[land]
 
     # Beaches/deltaic lowlands are subtle—avoid the previous neon cyan coastline outline.
-    coast_land = land & ndimage.binary_dilation(water, iterations=1)
+    coast_land = land & grid.ops.binary_dilation(water, iterations=1)
     beach = coast_land & (terrain.elevation_km < 0.10) & (vegetation < 0.65)
     if np.any(beach):
         rgb[beach] = 0.72 * rgb[beach] + 0.28 * np.asarray([0.78, 0.72, 0.56], np.float32)

@@ -1,7 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
-from scipy import ndimage
 
 from .config import WeatherConfig
 from .grid import SphereGrid, normalize01, smooth_periodic, local_slope
@@ -29,13 +28,25 @@ class WeatherResult:
     metadata: dict
 
 
-def _large_land_mask(land: np.ndarray) -> np.ndarray:
-    labels, n = ndimage.label(land)
+def _large_land_mask(grid: SphereGrid, land: np.ndarray) -> np.ndarray:
+    """Return components large enough to support continental weather regimes.
+
+    Component connectivity and size are spherical: pieces meeting across the
+    longitude seam or across a reflected pole are one landmass, and high-latitude
+    cells contribute their smaller physical area rather than one full pixel each.
+    """
+    labels, n = grid.ops.connected_components(land)
     if n == 0:
-        return np.zeros_like(land)
-    counts = np.bincount(labels.ravel())
-    cutoff = max(30, int(land.size * 0.003))
-    good = counts >= cutoff
+        return np.zeros_like(land, dtype=bool)
+    areas = np.bincount(
+        labels.ravel(),
+        weights=np.asarray(grid.cell_area_weights, float).ravel(),
+        minlength=n + 1,
+    )
+    # Preserve the former max(30 pixels, 0.3% of raster) intent, but measure it
+    # in spherical surface area so polar pixels are not over-weighted.
+    cutoff = max(30.0 / max(int(land.size), 1), 0.003)
+    good = areas >= cutoff
     good[0] = False
     return good[labels]
 
@@ -78,13 +89,14 @@ def build_weather(
     h, w = terrain.land.shape
     arid = np.char.startswith(climate.koppen, "B")
     polar = np.char.startswith(climate.koppen, "E")
-    large_land = _large_land_mask(terrain.land)
+    large_land = _large_land_mask(grid, terrain.land)
     slope = local_slope(ocean.elevation_km, grid)
     flat = slope < np.quantile(slope[terrain.land], 0.70) if np.any(terrain.land) else np.zeros_like(terrain.land)
 
     influence_sum = np.zeros((h, w), dtype=np.int8)
     tornado = np.zeros((h, w), float)
     lightning = np.zeros((h, w), float)
+    terrain_gy, terrain_gx = grid.ops.metric_gradient(ocean.elevation_km)
 
     # Combine summer and winter maps by retaining the annual maximum at each location.
     for m in range(12):
@@ -94,15 +106,14 @@ def build_weather(
         warm = (t >= 18.0) & ~arid & ~polar
         substantial = warm & large_land
         lowp = (p <= np.percentile(p, 42)) & ~arid & ~polar
-        ey, ex = np.gradient(ocean.elevation_km)
         sp = np.hypot(u, v)
-        upslope = (u * ex + v * ey) / np.maximum(sp, 0.2)
+        upslope = (u * terrain_gx + v * terrain_gy) / np.maximum(sp, 0.2)
         windward = (upslope > np.percentile(upslope[terrain.land], 75) if np.any(terrain.land) else False) & ~arid & ~polar
         s = warm.astype(np.int8) + substantial.astype(np.int8) + lowp.astype(np.int8) + windward.astype(np.int8)
         influence_sum = np.maximum(influence_sum, s)
 
         # Tornado proxy: warm moist air + strong temperature gradient/shear in 20–55° belts.
-        gy, gx = np.gradient(t)
+        gy, gx = grid.ops.metric_gradient(t)
         tempgrad = normalize01(np.hypot(gx, gy))
         if m > 0:
             shear = np.hypot(u - climate.wind_u[m - 1], v - climate.wind_v[m - 1])
@@ -129,7 +140,7 @@ def build_weather(
     humidity_proxy = normalize01(climate.annual_precipitation_mm)
     lowwind = 1.0 - normalize01(np.mean(np.hypot(climate.wind_u, climate.wind_v), axis=0))
     marine_fog = normalize01(ocean.upwelling + np.clip(-ocean.sst_anomaly_c / 5, 0, 1))
-    marine_fog = ndimage.grey_dilation(marine_fog, size=(7, 7))
+    marine_fog = grid.ops.grey_dilation(marine_fog, iterations=3)
     valley = normalize01(humidity_proxy * (1.0 - normalize01(slope))) * (hydro.rivers | hydro.lakes)
     fog = normalize01(0.55 * marine_fog * humidity_proxy + 0.30 * lowwind * humidity_proxy + 0.35 * valley)
 
@@ -139,7 +150,9 @@ def build_weather(
     sst_warmest = climate.temperature_c[warmest_month, yy, xx]
     p_warmest = climate.pressure_anomaly[warmest_month, yy, xx]
     u_w = climate.wind_u[warmest_month, yy, xx]; v_w = climate.wind_v[warmest_month, yy, xx]
-    shear_proxy = normalize01(ndimage.generic_gradient_magnitude(np.hypot(u_w, v_w), ndimage.sobel))
+    wind_speed_w = np.hypot(u_w, v_w)
+    shear_gy, shear_gx = grid.ops.metric_gradient(wind_speed_w)
+    shear_proxy = normalize01(np.hypot(shear_gx, shear_gy))
     lat_ok = (np.abs(grid.lat) >= cfg.hurricane_lat_min_deg) & (np.abs(grid.lat) <= cfg.hurricane_lat_max_deg)
     genesis = terrain.ocean * lat_ok * np.clip((sst_warmest - cfg.hurricane_sst_c) / 5.0, 0, 1)
     genesis *= normalize01(-p_warmest) * (1.0 - 0.65 * shear_proxy)
@@ -186,7 +199,7 @@ def build_weather(
 
     # Warm, shallow, low-upwelling water proxy for reef-building coral; river mouths and polar/arid edge
     # effects are excluded. This automates the upwelling/coral cross-reference step.
-    river_mouth_influence = ndimage.binary_dilation(hydro.rivers, iterations=5)
+    river_mouth_influence = grid.ops.binary_dilation(hydro.rivers, iterations=5)
     coral = (terrain.shelf & (climate.temperature_c.min(0) >= 18.0) &
              (climate.temperature_c.max(0) <= 32.5) & (ocean.upwelling < 0.50) &
              ~river_mouth_influence)
@@ -196,8 +209,9 @@ def build_weather(
         "magnetic_axis_tilt_deg": float(tilt),
         "magnetic_axis_lon_deg": float(lon0),
         "thunderstorm_levels": {"0": "low-to-none", "1": "basic", "2": "moderate", "3": "severe", "4": "tornado-prone"},
-        "sea_ice_max_fraction_ocean": float(np.mean(sea_ice_max[terrain.ocean])) if np.any(terrain.ocean) else 0.0,
-        "sea_ice_min_fraction_ocean": float(np.mean(sea_ice_min[terrain.ocean])) if np.any(terrain.ocean) else 0.0,
+        "sea_ice_max_fraction_ocean": float(np.average(sea_ice_max[terrain.ocean], weights=grid.cell_area_weights[terrain.ocean])) if np.any(terrain.ocean) else 0.0,
+        "sea_ice_min_fraction_ocean": float(np.average(sea_ice_min[terrain.ocean], weights=grid.cell_area_weights[terrain.ocean])) if np.any(terrain.ocean) else 0.0,
+        "coral_reef_area_fraction_ocean": grid.weighted_fraction(coral) / max(grid.weighted_fraction(terrain.ocean), 1e-12),
         "coral_reef_pixel_count": int(coral.sum()),
     }
     return WeatherResult(fog.astype(np.float32), level, lightning.astype(np.float32), tornado_norm.astype(np.float32),

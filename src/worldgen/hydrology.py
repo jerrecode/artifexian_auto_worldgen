@@ -349,7 +349,7 @@ def evolve_surface(
 
         channel = (meander > 0.06) & (qn > 0.08) & land
         banks = grid.ops.binary_dilation(channel, iterations=1) & land & ~channel
-        lateral_source = ndimage.maximum_filter(e * meander, size=3)
+        lateral_source = grid.ops.grey_dilation(e * meander, iterations=1)
         asym = 0.35 + 0.65 * normalize01(wiggle, robust=False)
         lateral = np.clip(
             cfg.lateral_erosion_fraction * lateral_source * asym * banks,
