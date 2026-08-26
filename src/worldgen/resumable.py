@@ -5,19 +5,13 @@ import hashlib
 import time
 from typing import Any, Callable
 
-from .checkpoint import CheckpointStore, package_source_fingerprint, stage_cache_key
+from .checkpoint import CheckpointStore, stage_cache_key
+from .fingerprints import stage_source_fingerprint
 from .pipeline import WorldPipeline
 
 
 class ResumableWorldPipeline(WorldPipeline):
-    """WorldPipeline with transparent, dependency-sensitive stage checkpoints.
-
-    Every stage key includes the installed source fingerprint, only the configuration
-    sections that can directly affect that stage, and a rolling digest of upstream
-    stage keys. Consequently a society-only configuration change can still reuse
-    astronomy/tectonics/climate checkpoints, while any upstream change invalidates
-    all dependent downstream state automatically.
-    """
+    """WorldPipeline with dependency-sensitive stage checkpoints."""
 
     def __init__(
         self,
@@ -31,11 +25,12 @@ class ResumableWorldPipeline(WorldPipeline):
         super().__init__(config, progress=progress)
         self.checkpoint_store = CheckpointStore(checkpoint_dir, max_bytes=checkpoint_max_bytes)
         self.resume = bool(resume)
-        self._source_fingerprint = package_source_fingerprint()
         self._config_dict = config.to_dict()
-        self._dependency_digest = hashlib.sha256(b"worldgen-stage-root-v2").hexdigest()
+        self._dependency_digest = hashlib.sha256(b"worldgen-stage-root-v3").hexdigest()
+        self._source_fingerprint_cache: dict[str, str] = {}
         self.checkpoint_hits: list[str] = []
         self.stage_cache_keys: dict[str, str] = {}
+        self.stage_source_fingerprints: dict[str, str] = {}
 
     def _stage_config(self, name: str) -> dict[str, Any]:
         c = self._config_dict
@@ -69,12 +64,19 @@ class ResumableWorldPipeline(WorldPipeline):
         elif name == "output":
             sections |= {"output"}
         else:
-            # Unknown future stages default to the whole configuration for safety.
             return {"config": c, "dependency_digest": self._dependency_digest}
         return {
             "config": {key: c[key] for key in sorted(sections) if key in c},
             "dependency_digest": self._dependency_digest,
         }
+
+    def _stage_source_fingerprint(self, name: str) -> str:
+        value = self._source_fingerprint_cache.get(name)
+        if value is None:
+            value = stage_source_fingerprint(name)
+            self._source_fingerprint_cache[name] = value
+        self.stage_source_fingerprints[name] = value
+        return value
 
     def _advance_dependency_digest(self, cache_key: str) -> None:
         h = hashlib.sha256()
@@ -84,7 +86,11 @@ class ResumableWorldPipeline(WorldPipeline):
 
     def _stage(self, name: str, fn: Callable[[], Any]) -> Any:
         cacheable = name != "output"
-        key = stage_cache_key(name, self._stage_config(name), self._source_fingerprint)
+        key = stage_cache_key(
+            name,
+            self._stage_config(name),
+            self._stage_source_fingerprint(name),
+        )
         self.stage_cache_keys[name] = key
         if cacheable and self.resume:
             cached = self.checkpoint_store.get(key)
