@@ -6,84 +6,115 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import colors
+from matplotlib import image as mpl_image
 
 from .geology import ROCK_NAMES
 
 
-def _save_field(path: Path, field: np.ndarray, title: str, cmap: str = "viridis", vmin=None, vmax=None) -> None:
-    fig = plt.figure(figsize=(14, 7), dpi=130)
+def _save_field(
+    path: Path, field: np.ndarray, title: str, cmap: str = "viridis",
+    vmin=None, vmax=None, *, dpi: int = 120,
+) -> None:
+    fig = plt.figure(figsize=(14, 7), dpi=dpi)
     ax = fig.add_axes([0.04, 0.06, 0.88, 0.88])
     im = ax.imshow(field, origin="upper", aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax, extent=(-180, 180, -90, 90))
     ax.set_title(title)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
     fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
-    fig.savefig(path, bbox_inches="tight")
+    # Axes are explicitly positioned, so bbox_inches='tight' only triggers an
+    # expensive second layout/render pass without providing useful information.
+    fig.savefig(path, dpi=dpi)
     plt.close(fig)
 
 
-
-def _save_power_field(path: Path, field: np.ndarray, title: str, cmap: str = "viridis", gamma: float = 0.5, percentile: float = 99.5) -> None:
-    arr=np.asarray(field,float)
-    finite=arr[np.isfinite(arr)]
-    vmax=float(np.percentile(finite,percentile)) if finite.size else 1.0
-    vmax=max(vmax,1e-6)
-    fig=plt.figure(figsize=(14,7),dpi=130)
-    ax=fig.add_axes([0.04,0.06,0.88,0.88])
-    im=ax.imshow(arr,origin="upper",aspect="auto",cmap=cmap,norm=colors.PowerNorm(gamma=gamma,vmin=0,vmax=vmax,clip=True),extent=(-180,180,-90,90))
-    ax.set_title(title); ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
-    fig.colorbar(im,ax=ax,fraction=0.025,pad=0.02)
-    fig.savefig(path,bbox_inches="tight"); plt.close(fig)
-
-
-def _save_rgb(path: Path, rgb: np.ndarray, title: str | None = None) -> None:
-    arr=np.asarray(rgb)
-    if arr.dtype!=np.uint8:
-        arr=(np.clip(arr,0,1)*255).astype(np.uint8)
-    fig=plt.figure(figsize=(14,7),dpi=150)
-    ax=fig.add_axes([0.04,0.06,0.92,0.88])
-    ax.imshow(arr,origin="upper",aspect="auto",extent=(-180,180,-90,90),interpolation="bilinear")
-    if title: ax.set_title(title)
-    ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
-    fig.savefig(path,bbox_inches="tight"); plt.close(fig)
+def _save_power_field(
+    path: Path, field: np.ndarray, title: str, cmap: str = "viridis",
+    gamma: float = 0.5, percentile: float = 99.5, *, dpi: int = 120,
+) -> None:
+    arr = np.asarray(field, float)
+    finite = arr[np.isfinite(arr)]
+    vmax = float(np.percentile(finite, percentile)) if finite.size else 1.0
+    vmax = max(vmax, 1e-6)
+    fig = plt.figure(figsize=(14, 7), dpi=dpi)
+    ax = fig.add_axes([0.04, 0.06, 0.88, 0.88])
+    im = ax.imshow(
+        arr, origin="upper", aspect="auto", cmap=cmap,
+        norm=colors.PowerNorm(gamma=gamma, vmin=0, vmax=vmax, clip=True),
+        extent=(-180, 180, -90, 90),
+    )
+    ax.set_title(title)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
+    fig.savefig(path, dpi=dpi)
+    plt.close(fig)
 
 
-def _save_vector(path: Path, u: np.ndarray, v: np.ndarray, title: str, background: np.ndarray | None = None) -> None:
-    fig = plt.figure(figsize=(14, 7), dpi=130)
+def _save_rgb(path: Path, rgb: np.ndarray, title: str | None = None, *, dpi: int = 135) -> None:
+    """Write true-color rasters directly at simulation resolution.
+
+    A Matplotlib Figure previously expanded every RGB raster to a large annotated
+    canvas and performed a layout pass. True-color products are remote-sensing
+    rasters rather than charts, so direct encoding is both faster and preserves
+    exact pixel-to-cell correspondence. ``dpi`` is retained as PNG metadata.
+    """
+    arr = np.asarray(rgb)
+    if arr.dtype != np.uint8:
+        arr = (np.clip(arr, 0, 1) * 255).astype(np.uint8)
+    mpl_image.imsave(path, arr, format="png", origin="upper", dpi=dpi)
+
+
+def _save_vector(
+    path: Path, u: np.ndarray, v: np.ndarray, title: str,
+    background: np.ndarray | None = None, *, dpi: int = 120,
+) -> None:
+    fig = plt.figure(figsize=(14, 7), dpi=dpi)
     ax = fig.add_axes([0.04, 0.06, 0.88, 0.88])
     speed = np.hypot(u, v)
     bg = speed if background is None else background
     im = ax.imshow(bg, origin="upper", aspect="auto", cmap="viridis", extent=(-180, 180, -90, 90))
     h, w = u.shape
-    sy = max(1, h // 24); sx = max(1, w // 48)
-    yy = np.linspace(90 - 90/h, -90 + 90/h, h)[::sy]
+    sy = max(1, h // 24)
+    sx = max(1, w // 48)
+    yy = np.linspace(90 - 90 / h, -90 + 90 / h, h)[::sy]
     xx = np.linspace(-180, 180, w, endpoint=False)[::sx]
-    U = u[::sy, ::sx]; V = -v[::sy, ::sx]  # matplotlib y is northward, raster +v is southward
+    U = u[::sy, ::sx]
+    V = -v[::sy, ::sx]
     ax.quiver(xx, yy, U, V, angles="xy", scale_units="xy", scale=0.13, width=0.0015)
-    ax.set_title(title); ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
+    ax.set_title(title)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
     fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
-    fig.savefig(path, bbox_inches="tight")
+    fig.savefig(path, dpi=dpi)
     plt.close(fig)
 
 
-def _save_river_centerlines(path: Path, elevation: np.ndarray, centerlines: list[dict], title: str) -> None:
-    fig = plt.figure(figsize=(14, 7), dpi=150)
+def _save_river_centerlines(
+    path: Path, elevation: np.ndarray, centerlines: list[dict], title: str, *, dpi: int = 120,
+) -> None:
+    fig = plt.figure(figsize=(14, 7), dpi=dpi)
     ax = fig.add_axes([0.04, 0.06, 0.92, 0.88])
     ax.imshow(elevation, origin="upper", aspect="auto", cmap="terrain", extent=(-180, 180, -90, 90))
     for r in centerlines:
         pts = np.asarray(r.get("points_lat_lon", []), float)
         if pts.ndim != 2 or len(pts) < 2:
             continue
-        lat = pts[:, 0]; lon = pts[:, 1]
+        lat = pts[:, 0]
+        lon = pts[:, 1]
         jumps = np.where(np.abs(np.diff(lon)) > 150)[0]
-        starts = np.r_[0, jumps + 1]; ends = np.r_[jumps + 1, len(lon)]
+        starts = np.r_[0, jumps + 1]
+        ends = np.r_[jumps + 1, len(lon)]
         lw = 0.45 + 0.75 * float(r.get("mean_meander_potential", 0.0))
         for a, b in zip(starts, ends):
             if b - a >= 2:
                 ax.plot(lon[a:b], lat[a:b], linewidth=lw, alpha=0.9)
-    ax.set_title(title); ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
-    fig.savefig(path, bbox_inches="tight")
+    ax.set_title(title)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    fig.savefig(path, dpi=dpi)
     plt.close(fig)
+
 
 def _categorical_codes(strings: np.ndarray) -> tuple[np.ndarray, list[str]]:
     cats = sorted(set(map(str, strings.ravel().tolist())))
@@ -97,31 +128,45 @@ def render_all(out: Path, world: dict) -> list[str]:
     maps = out / "maps"
     maps.mkdir(exist_ok=True)
     paths: list[str] = []
+    output_cfg = world["config"].output
+    map_dpi = int(output_cfg.map_dpi)
+    rgb_dpi = int(output_cfg.rgb_dpi)
 
     def add(name: str, field: np.ndarray, title: str, cmap: str = "viridis", **kw):
         p = maps / f"{name}.png"
-        _save_field(p, field, title, cmap, **kw)
+        _save_field(p, field, title, cmap, dpi=map_dpi, **kw)
         paths.append(str(p))
 
     def addpower(name: str, field: np.ndarray, title: str, cmap: str = "viridis", gamma: float = 0.5, percentile: float = 99.5):
-        p=maps/f"{name}.png"; _save_power_field(p,field,title,cmap,gamma,percentile); paths.append(str(p))
+        p = maps / f"{name}.png"
+        _save_power_field(p, field, title, cmap, gamma, percentile, dpi=map_dpi)
+        paths.append(str(p))
 
     def addrgb(name: str, rgb: np.ndarray, title: str):
-        p=maps/f"{name}.png"; _save_rgb(p,rgb,title); paths.append(str(p))
+        p = maps / f"{name}.png"
+        _save_rgb(p, rgb, title, dpi=rgb_dpi)
+        paths.append(str(p))
 
     def addvec(name: str, u: np.ndarray, v: np.ndarray, title: str, background: np.ndarray | None = None):
         p = maps / f"{name}.png"
-        _save_vector(p, u, v, title, background)
+        _save_vector(p, u, v, title, background, dpi=map_dpi)
         paths.append(str(p))
 
     def addrivers(name: str, title: str):
         p = maps / f"{name}.png"
-        _save_river_centerlines(p, ocean.elevation_km, hydro.river_centerlines, title)
+        _save_river_centerlines(p, ocean.elevation_km, hydro.river_centerlines, title, dpi=map_dpi)
         paths.append(str(p))
 
-    terrain = world["terrain"]; ocean = world["ocean"]; tect = world["tectonics"]
-    climate = world["climate"]; hydro = world["hydrology"]; weather = world["weather"]
-    geo = world["geology"]; appearance = world["appearance"]; resources = world["resources"]; society = world["society"]
+    terrain = world["terrain"]
+    ocean = world["ocean"]
+    tect = world["tectonics"]
+    climate = world["climate"]
+    hydro = world["hydrology"]
+    weather = world["weather"]
+    geo = world["geology"]
+    appearance = world["appearance"]
+    resources = world["resources"]
+    society = world["society"]
 
     add("01_plate_ids", tect.plate_id, "Hierarchical tectonic parent plates", "tab20")
     add("01b_subplate_ids", tect.subplate_id, "Tectonic subplates / rigid blocks", "nipy_spectral")
@@ -143,7 +188,7 @@ def render_all(out: Path, world: dict) -> list[str]:
     kcode, kcats = _categorical_codes(climate.koppen)
     add("06_koppen", kcode, "Köppen-Geiger climate classes (integer-coded; legend in metadata)", "tab20")
     add("07_continentality", climate.continentality_index_c, "Annual temperature range / continentality index (°C)", "magma")
-    river_hierarchy=hydro.stream_order.astype(float)+0.65*hydro.river_width_proxy+0.40*hydro.lakes.astype(float)
+    river_hierarchy = hydro.stream_order.astype(float) + 0.65 * hydro.river_width_proxy + 0.40 * hydro.lakes.astype(float)
     add("08_rivers", river_hierarchy, "Rainfall-fed river hierarchy: Strahler order + width/lakes", "Blues")
     add("08a_stream_order", hydro.stream_order, "Strahler stream order", "viridis", vmin=0)
     add("08a2_river_width", hydro.river_width_proxy, "Relative river-width/discharge proxy", "Blues", vmin=0, vmax=1)
@@ -183,8 +228,17 @@ def render_all(out: Path, world: dict) -> list[str]:
     if society.portal is not None:
         add("14_settlement_suitability", society.suitability, "Human settlement suitability", "YlGn", vmin=0, vmax=1)
 
-    # Write legends used by categorical maps.
-    with (maps / "legends.json").open("w", encoding="utf-8") as f:
+    legend_path = maps / "legends.json"
+    with legend_path.open("w", encoding="utf-8") as f:
         json.dump({"koppen": {i: c for i, c in enumerate(kcats)}, "rock": ROCK_NAMES}, f, indent=2)
-    paths.append(str(maps / "legends.json"))
+    paths.append(str(legend_path))
+
+    manifest_path = maps / "render_manifest.json"
+    manifest_path.write_text(json.dumps({
+        "map_dpi": map_dpi,
+        "rgb_dpi": rgb_dpi,
+        "true_color_pixel_resolution": [int(appearance.true_color_rgb.shape[1]), int(appearance.true_color_rgb.shape[0])],
+        "products": [Path(p).name for p in paths],
+    }, indent=2), encoding="utf-8")
+    paths.append(str(manifest_path))
     return paths

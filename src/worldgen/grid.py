@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import os
 import numpy as np
 from scipy import ndimage
+
+from .cache import ByteBoundLRUCache, CacheStats
 
 EARTH_RADIUS_KM = 6371.0088
 
@@ -12,10 +16,10 @@ class SphereGrid:
     width: int
     height: int
     radius_km: float = EARTH_RADIUS_KM
+    distance_cache_max_bytes: int | None = None
 
     def __post_init__(self) -> None:
         self.lon_1d = np.linspace(-180.0, 180.0, self.width, endpoint=False, dtype=np.float64)
-        # Pixel centers, not poles, prevent zero-area rows.
         dlat = 180.0 / self.height
         self.lat_1d = np.linspace(90.0 - dlat / 2, -90.0 + dlat / 2, self.height, dtype=np.float64)
         self.lon, self.lat = np.meshgrid(self.lon_1d, self.lat_1d)
@@ -30,12 +34,26 @@ class SphereGrid:
         self.dy_km = self.radius_km * self.dlat_rad
         self.dx_km = self.radius_km * self.dlon_rad * np.maximum(np.cos(lat_r), 1e-3)
 
+        if self.distance_cache_max_bytes is None:
+            try:
+                mb = float(os.environ.get("WORLDGEN_DISTANCE_CACHE_MB", "192"))
+            except ValueError:
+                mb = 192.0
+            self.distance_cache_max_bytes = max(0, int(mb * 1024**2))
+        self._distance_cache: ByteBoundLRUCache[str, np.ndarray] = ByteBoundLRUCache(
+            max_bytes=int(self.distance_cache_max_bytes)
+        )
+
     @property
     def ops(self):
-        # Lazy import prevents a module cycle while giving callers one canonical
-        # spherical-topology implementation.
         from .topology import SphericalRasterOps
         return SphericalRasterOps(self)
+
+    def clear_spatial_cache(self) -> None:
+        self._distance_cache.clear()
+
+    def spatial_cache_stats(self) -> CacheStats:
+        return self._distance_cache.stats()
 
     def weighted_fraction(self, mask: np.ndarray) -> float:
         return float(np.sum(self.cell_area_weights * np.asarray(mask, dtype=float)))
@@ -68,7 +86,6 @@ class SphereGrid:
 
 
 def spherical_voronoi_ids(grid: SphereGrid, seeds_xyz: np.ndarray, chunk: int = 65536) -> np.ndarray:
-    """Assign pixels to the nearest seed by maximum unit-vector dot product."""
     pts = grid.xyz.reshape(-1, 3)
     out = np.empty(len(pts), dtype=np.int16 if len(seeds_xyz) < 32767 else np.int32)
     for i in range(0, len(pts), chunk):
@@ -78,23 +95,34 @@ def spherical_voronoi_ids(grid: SphereGrid, seeds_xyz: np.ndarray, chunk: int = 
 
 
 def smooth_periodic(a: np.ndarray, sigma: float | tuple[float, float]) -> np.ndarray:
-    """Legacy equirectangular Gaussian smoothing.
-
-    Longitude is periodic. Latitude remains nearest-clamped for backward
-    compatibility; new topology-sensitive algorithms should prefer ``grid.ops``
-    primitives where possible.
-    """
     return ndimage.gaussian_filter(a, sigma=sigma, mode=("nearest", "wrap"))
 
 
-def distance_to(mask: np.ndarray, grid: SphereGrid) -> np.ndarray:
-    """Great-circle distance in km to the nearest True region.
+def _mask_digest(mask: np.ndarray) -> str:
+    m = np.asarray(mask, dtype=bool)
+    packed = np.packbits(m.ravel(order="C"))
+    h = hashlib.blake2b(digest_size=16)
+    h.update(np.asarray(m.shape, dtype=np.int64).tobytes())
+    h.update(packed)
+    return h.hexdigest()
 
-    This now delegates to the canonical spherical topology implementation rather
-    than an isotropic equirectangular EDT approximation.
+
+def distance_to(mask: np.ndarray, grid: SphereGrid) -> np.ndarray:
+    """Cached great-circle distance in km to the nearest True region.
+
+    Distance fields are among the most frequently repeated expensive spatial
+    primitives in climate, terrain, resources and society. The cache is LRU- and
+    byte-bounded; ``WORLDGEN_DISTANCE_CACHE_MB`` controls its default resident cap.
     """
+    m = np.asarray(mask, dtype=bool)
+    key = _mask_digest(m)
+    cached = grid._distance_cache.get(key)
+    if cached is not None:
+        return cached
     from .topology import geodesic_distance_to
-    return geodesic_distance_to(mask, grid)
+    result = geodesic_distance_to(m, grid).astype(np.float32)
+    grid._distance_cache.put(key, result, size_bytes=int(result.nbytes))
+    return result
 
 
 def boundary_mask(labels: np.ndarray) -> np.ndarray:
