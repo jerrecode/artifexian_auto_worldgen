@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-"""Fast deterministic hybrid multi-octave procedural noise.
+"""Deterministic hybrid multi-octave procedural noise.
 
-The generator deliberately avoids one single noise family.  Every octave mixes several
-statistically different fields (smooth/value-like, ridged, billow and oriented wave fields),
-then combines octaves with geometrically decreasing amplitude.  A low-frequency periodic
-coordinate warp breaks obvious octave alignment.
-
-All fields wrap in longitude and clamp at the polar rows, matching the world generator's
-2:1 equirectangular spherical raster convention.
+Every octave mixes smooth/value-like, ridged, billow and oriented-wave structure,
+then octaves are combined with geometrically decreasing amplitude. Coarse octaves
+are synthesized at their natural spatial resolution and resampled upward instead
+of allocating full-resolution white-noise rasters for wavelengths spanning tens or
+hundreds of pixels. This preserves multi-scale structure while sharply reducing
+random-generation/filter memory traffic at high world resolutions.
 """
 
 from dataclasses import dataclass
@@ -17,6 +16,7 @@ import numpy as np
 from scipy import ndimage
 
 from .grid import smooth_periodic
+from .mathops import auto_chunk_shape, iter_tiles_2d
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,21 +52,68 @@ def _standardize(a: np.ndarray) -> np.ndarray:
     return ((a - m) / s).astype(np.float32, copy=False)
 
 
+def _fit_shape(a: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    """Crop/pad interpolation roundoff to an exact requested shape."""
+    h, w = shape
+    out = np.asarray(a, dtype=np.float32)
+    if out.shape[0] < h:
+        out = np.pad(out, ((0, h - out.shape[0]), (0, 0)), mode="edge")
+    elif out.shape[0] > h:
+        out = out[:h]
+    if out.shape[1] < w:
+        need = w - out.shape[1]
+        out = np.concatenate((out, out[:, :need]), axis=1)
+    elif out.shape[1] > w:
+        out = out[:, :w]
+    return out.astype(np.float32, copy=False)
+
+
+def _resample_to_shape(a: np.ndarray, shape: tuple[int, int], *, order: int = 3) -> np.ndarray:
+    """Latitude-clamped, longitude-periodic two-pass resize."""
+    a = np.asarray(a, dtype=np.float32)
+    h, w = shape
+    if a.shape == (h, w):
+        return a
+    # Resample dimensions separately so each axis can use the correct boundary mode.
+    yzoom = h / max(a.shape[0], 1)
+    temp = ndimage.zoom(a, (yzoom, 1.0), order=order, mode="nearest", prefilter=order > 1)
+    temp = _fit_shape(temp, (h, a.shape[1]))
+    xzoom = w / max(temp.shape[1], 1)
+    out = ndimage.zoom(temp, (1.0, xzoom), order=order, mode="wrap", prefilter=order > 1)
+    return _fit_shape(out, (h, w))
+
+
+def _natural_octave_geometry(shape: tuple[int, int], sigma_px: float) -> tuple[tuple[int, int], float, float]:
+    """Choose a cheaper synthesis grid for a target correlation scale.
+
+    The local Gaussian width is kept near 1.25--2 pixels. Fine octaves remain at
+    native output resolution while large-wavelength octaves can be tens of times
+    smaller in area.
+    """
+    h, w = shape
+    if sigma_px <= 2.25 or min(h, w) < 32:
+        return (h, w), float(sigma_px), 1.0
+    factor = min(32.0, max(1.0, float(sigma_px) / 1.55))
+    ch = max(12, int(math.ceil(h / factor)))
+    cw = max(24, int(math.ceil(w / factor)))
+    # Maintain approximately the same aspect ratio even for non-2:1 unit tests.
+    cw = max(4, int(round(ch * (w / h))))
+    factor_y = h / ch
+    factor_x = w / cw
+    effective = math.sqrt(factor_y * factor_x)
+    sigma_local = max(0.65, float(sigma_px) / max(effective, 1.0))
+    return (ch, cw), sigma_local, effective
+
+
 def _wave_field(
     shape: tuple[int, int],
     rng: np.random.Generator,
     sigma_px: float,
     wave_count: int = 5,
 ) -> np.ndarray:
-    """Band-limited oriented wave field.
-
-    Integer longitudinal wavenumbers guarantee seam continuity. Several oblique waves with
-    incommensurate frequencies avoid the visual regularity of a single sinusoid.
-    """
     h, w = shape
     x = np.linspace(-math.pi, math.pi, w, endpoint=False, dtype=np.float32)[None, :]
     y = np.linspace(math.pi / 2, -math.pi / 2, h, endpoint=True, dtype=np.float32)[:, None]
-    # Approximate cycles corresponding to the Gaussian correlation scale.
     cycles = max(1.0, w / max(7.5 * sigma_px, 4.0))
     out = np.zeros(shape, dtype=np.float32)
     for _ in range(max(2, int(wave_count))):
@@ -78,27 +125,85 @@ def _wave_field(
     return _standardize(out)
 
 
-def _bilinear_warp(a: np.ndarray, dy: np.ndarray, dx: np.ndarray) -> np.ndarray:
-    """Warp a 2-D field with latitude clamp and longitude wrap using vectorized bilinear sampling."""
+def _native_smooth_random(
+    shape: tuple[int, int], rng: np.random.Generator, sigma_px: float,
+    *, anisotropy: float = 1.30,
+) -> np.ndarray:
+    synth_shape, sigma_local, _ = _natural_octave_geometry(shape, sigma_px)
+    raw = rng.standard_normal(synth_shape, dtype=np.float32)
+    smooth = smooth_periodic(raw, (sigma_local, sigma_local * anisotropy)).astype(np.float32, copy=False)
+    smooth = _standardize(smooth)
+    if synth_shape != shape:
+        smooth = _resample_to_shape(smooth, shape, order=3)
+    return _standardize(smooth)
+
+
+def _octave_field(
+    shape: tuple[int, int], rng: np.random.Generator, sigma_px: float,
+    blend: tuple[float, float, float, float], minimum_sigma_px: float, wave_count: int,
+) -> np.ndarray:
+    synth_shape, sigma_local, _ = _natural_octave_geometry(shape, sigma_px)
+    raw = rng.standard_normal(synth_shape, dtype=np.float32)
+    value = smooth_periodic(raw, (sigma_local, sigma_local * 1.30)).astype(np.float32, copy=False)
+    value = _standardize(value)
+
+    shift_y = max(1, int(round(0.73 * sigma_local)))
+    shift_x = max(1, int(round(1.17 * sigma_local)))
+    aux_raw = np.roll(raw, shift=(shift_y, shift_x), axis=(0, 1))
+    aux_sigma = max(minimum_sigma_px, sigma_local * 0.76)
+    aux = smooth_periodic(aux_raw, (aux_sigma, max(minimum_sigma_px, sigma_local * 1.04))).astype(np.float32, copy=False)
+    aux = _standardize(aux)
+    ridge = _standardize(1.0 - np.abs(value))
+    billow = _standardize(np.abs(aux))
+    wave = _wave_field(synth_shape, rng, sigma_local, wave_count=wave_count)
+    octave = _standardize(blend[0] * value + blend[1] * ridge + blend[2] * billow + blend[3] * wave)
+    if synth_shape != shape:
+        octave = _resample_to_shape(octave, shape, order=3)
+    return _standardize(octave)
+
+
+def _bilinear_warp_tiled(
+    a: np.ndarray,
+    dy: np.ndarray,
+    dx: np.ndarray,
+    *,
+    target_scratch_mb: float = 32.0,
+) -> np.ndarray:
+    """Warp with bounded scratch memory rather than full-raster coordinate arrays."""
+    a = np.asarray(a, dtype=np.float32)
+    dy = np.asarray(dy, dtype=np.float32)
+    dx = np.asarray(dx, dtype=np.float32)
+    if a.shape != dy.shape or a.shape != dx.shape:
+        raise ValueError("warp field shapes must match")
     h, w = a.shape
-    yy, xx = np.indices((h, w), dtype=np.float32)
-    sy = np.clip(yy + dy, 0.0, h - 1.00001)
-    sx = np.mod(xx + dx, w)
-    y0 = np.floor(sy).astype(np.int32)
-    x0 = np.floor(sx).astype(np.int32)
-    # Float32 remainder can round a wrapped coordinate exactly to ``w`` on large rasters.
-    # Enforce integer periodicity after flooring so seam samples always remain in [0, w-1].
-    x0 %= w
-    y1 = np.minimum(y0 + 1, h - 1)
-    x1 = (x0 + 1) % w
-    fy = sy - y0
-    fx = sx - x0
-    return (
-        a[y0, x0] * (1 - fy) * (1 - fx)
-        + a[y0, x1] * (1 - fy) * fx
-        + a[y1, x0] * fy * (1 - fx)
-        + a[y1, x1] * fy * fx
-    ).astype(np.float32)
+    out = np.empty_like(a)
+    chunk = auto_chunk_shape(a.shape, np.float32, target_mb=target_scratch_mb, arrays_in_flight=14)
+    for tile in iter_tiles_2d(a.shape, chunk_shape=chunk):
+        ys, xs = tile.core
+        y0, y1 = ys.start or 0, ys.stop or h
+        x0, x1 = xs.start or 0, xs.stop or w
+        yy = np.arange(y0, y1, dtype=np.float32)[:, None]
+        xx = np.arange(x0, x1, dtype=np.float32)[None, :]
+        sy = np.clip(yy + dy[ys, xs], 0.0, h - 1.00001)
+        sx = np.mod(xx + dx[ys, xs], w)
+        iy0 = np.floor(sy).astype(np.int32)
+        ix0 = np.floor(sx).astype(np.int32) % w
+        iy1 = np.minimum(iy0 + 1, h - 1)
+        ix1 = (ix0 + 1) % w
+        fy = sy - iy0
+        fx = sx - ix0
+        out[ys, xs] = (
+            a[iy0, ix0] * (1.0 - fy) * (1.0 - fx)
+            + a[iy0, ix1] * (1.0 - fy) * fx
+            + a[iy1, ix0] * fy * (1.0 - fx)
+            + a[iy1, ix1] * fy * fx
+        )
+    return out
+
+
+def _bilinear_warp(a: np.ndarray, dy: np.ndarray, dx: np.ndarray) -> np.ndarray:
+    """Compatibility wrapper for the bounded-memory tiled implementation."""
+    return _bilinear_warp_tiled(a, dy, dx)
 
 
 def hybrid_multifractal(
@@ -115,11 +220,11 @@ def hybrid_multifractal(
     wave_count: int = 5,
     robust_clip_sigma: float = 3.6,
 ) -> np.ndarray:
-    """Return a zero-mean, unit-variance hybrid multi-octave field.
+    """Return a zero-mean, unit-variance hybrid multifractal field.
 
-    Each octave is a weighted mixture of four noise families.  Octave amplitude is
-    ``persistence**octave`` and characteristic frequency grows as ``lacunarity**octave``.
-    This implements the requested "higher frequency -> lower intensity" behavior explicitly.
+    Octave amplitude is ``persistence**o`` while characteristic frequency grows as
+    ``lacunarity**o``. Low-frequency octaves are generated on coarse natural grids,
+    reducing work without reducing their represented spatial bandwidth.
     """
     h, w = map(int, shape)
     if h < 2 or w < 2:
@@ -135,46 +240,20 @@ def hybrid_multifractal(
     for o in range(octaves):
         sigma = max(float(minimum_sigma_px), base / (lacunarity ** o))
         amp = persistence ** o
-        # One white field supplies two decorrelated smooth components by periodic translation;
-        # this keeps memory traffic low compared with allocating several full random maps per octave.
-        raw = rng.standard_normal((h, w), dtype=np.float32)
-        value = smooth_periodic(raw, (sigma, sigma * 1.30)).astype(np.float32, copy=False)
-        value = _standardize(value)
-
-        shift_y = max(1, int(round(0.73 * sigma)))
-        shift_x = max(1, int(round(1.17 * sigma)))
-        aux_raw = np.roll(raw, shift=(shift_y, shift_x), axis=(0, 1))
-        aux = smooth_periodic(aux_raw, (max(minimum_sigma_px, sigma * 0.76),
-                                        max(minimum_sigma_px, sigma * 1.04))).astype(np.float32, copy=False)
-        aux = _standardize(aux)
-        # Distinct distribution families derived from correlated underlying structure.
-        ridge = _standardize(1.0 - np.abs(value))
-        billow = _standardize(np.abs(aux))
-        wave = _wave_field((h, w), rng, sigma, wave_count=wave_count)
-        octave = (bw[0] * value + bw[1] * ridge + bw[2] * billow + bw[3] * wave).astype(np.float32)
-        octave = _standardize(octave)
+        octave = _octave_field((h, w), rng, sigma, bw, minimum_sigma_px, wave_count)
         acc += float(amp) * octave
         weight_sum += float(amp)
-        # Let raw be reclaimed before the next octave on high-resolution runs.
-        del raw, aux_raw, value, aux, ridge, billow, wave, octave
-
     acc /= max(weight_sum, 1e-8)
 
-    # Low-frequency domain warp after octave synthesis.  This bends ridges/isocontours without
-    # multiplying the expensive per-octave interpolation cost.
     warp_strength = max(0.0, float(domain_warp_strength))
     if warp_strength > 1e-5:
         wsigma = max(2.0, base * 1.35)
-        wy = rng.standard_normal((h, w), dtype=np.float32)
-        wx = np.roll(wy, shift=(max(1, int(wsigma * 0.37)), max(1, int(wsigma * 0.61))), axis=(0, 1))
-        wy = _standardize(smooth_periodic(wy, (wsigma, wsigma * 1.25)))
-        wx = _standardize(smooth_periodic(wx, (wsigma * 0.86, wsigma * 1.12)))
-        # Warp amount is relative to the largest structural wavelength, capped for topology safety.
+        wy = _native_smooth_random((h, w), rng, wsigma, anisotropy=1.25)
+        wx = _native_smooth_random((h, w), rng, wsigma * 0.86, anisotropy=1.30)
         warp_px = min(base * warp_strength, 0.09 * min(h, w))
-        # East-west degrees collapse near poles; suppress x warp there.
         lat = np.linspace(90 - 90 / h, -90 + 90 / h, h, dtype=np.float32)[:, None]
         taper = np.clip(np.cos(np.deg2rad(lat)), 0.18, 1.0)
-        acc = _bilinear_warp(acc, wy * warp_px, wx * warp_px * taper)
+        acc = _bilinear_warp_tiled(acc, wy * warp_px, wx * warp_px * taper)
 
     acc = _standardize(acc)
     if robust_clip_sigma > 0:
@@ -184,14 +263,11 @@ def hybrid_multifractal(
 
 
 def hybrid_noise01(*args, **kwargs) -> np.ndarray:
-    """Convenience 0..1 version using a fixed robust logistic-like remap."""
     z = hybrid_multifractal(*args, **kwargs)
-    # Tanh avoids percentile sorting of million-cell arrays and is stable across resolutions.
     return (0.5 + 0.5 * np.tanh(0.72 * z)).astype(np.float32)
 
 
 def configured_blend(cfg, profile: NoiseBlend = TERRAIN_BLEND) -> NoiseBlend:
-    """Combine global user weights with a stage profile and renormalize lazily in NoiseBlend."""
     if cfg is None:
         return profile
     return NoiseBlend(
@@ -215,6 +291,7 @@ def noise_kwargs(cfg, *, profile: NoiseBlend = TERRAIN_BLEND, octaves: int | Non
         "wave_count": int(getattr(cfg, "wave_count", 5)),
     }
 
+
 @dataclass(slots=True)
 class StaticNoiseFields:
     ocean_fine: np.ndarray
@@ -226,26 +303,24 @@ class StaticNoiseFields:
     delta_texture: np.ndarray
 
 
-def build_static_noise_fields(shape: tuple[int,int], cfg, rng_factory) -> StaticNoiseFields:
-    """Precompute stationary stochastic fields reused across coupled Earth-system passes.
-
-    Reusing these fields is both physically sensible (sub-grid geology does not reroll every model
-    iteration) and materially faster at high resolution.
-    """
-    h,w=shape
-    octv=int(getattr(cfg,"octaves",7))
-    ocean_fine=hybrid_multifractal(shape,rng_factory("noise:ocean"),base_scale_px=max(h/32.0,2.5),
-        **noise_kwargs(cfg,profile=OCEAN_BLEND,octaves=max(5,min(8,octv))))
-    climate_texture=hybrid_multifractal(shape,rng_factory("noise:climate"),base_scale_px=max(h/16.0,4.0),
-        **noise_kwargs(cfg,profile=CLIMATE_BLEND,octaves=max(4,min(7,octv))))
-    convective_texture=hybrid_noise01(shape,rng_factory("noise:convection"),base_scale_px=max(h/20.0,3.0),
-        **noise_kwargs(cfg,profile=NoiseBlend(0.48,0.07,0.27,0.18),octaves=max(4,min(6,octv))))
-    geology_lith=hybrid_noise01(shape,rng_factory("noise:geology-lith"),base_scale_px=max(h/22.0,3.0),
-        **noise_kwargs(cfg,profile=GEOLOGY_BLEND,octaves=max(5,min(8,octv))))
-    geology_igneous=hybrid_noise01(shape,rng_factory("noise:geology-igneous"),base_scale_px=max(h/30.0,2.5),
-        **noise_kwargs(cfg,profile=NoiseBlend(0.34,0.28,0.12,0.26),octaves=max(4,min(7,octv))))
-    hydro_wiggle=hybrid_multifractal(shape,rng_factory("noise:hydro"),base_scale_px=max(h/36.0,2.5),
-        **noise_kwargs(cfg,profile=HYDRO_BLEND,octaves=max(5,min(8,octv))))
-    delta_texture=hybrid_noise01(shape,rng_factory("noise:delta"),base_scale_px=max(h/50.0,2.0),
-        **noise_kwargs(cfg,profile=NoiseBlend(0.36,0.25,0.12,0.27),octaves=max(4,min(7,octv))))
-    return StaticNoiseFields(ocean_fine,climate_texture,convective_texture,geology_lith,geology_igneous,hydro_wiggle,delta_texture)
+def build_static_noise_fields(shape: tuple[int, int], cfg, rng_factory) -> StaticNoiseFields:
+    h, _ = shape
+    octv = int(getattr(cfg, "octaves", 7))
+    ocean_fine = hybrid_multifractal(shape, rng_factory("noise:ocean"), base_scale_px=max(h / 32.0, 2.5),
+        **noise_kwargs(cfg, profile=OCEAN_BLEND, octaves=max(5, min(8, octv))))
+    climate_texture = hybrid_multifractal(shape, rng_factory("noise:climate"), base_scale_px=max(h / 16.0, 4.0),
+        **noise_kwargs(cfg, profile=CLIMATE_BLEND, octaves=max(4, min(7, octv))))
+    convective_texture = hybrid_noise01(shape, rng_factory("noise:convection"), base_scale_px=max(h / 20.0, 3.0),
+        **noise_kwargs(cfg, profile=NoiseBlend(0.48, 0.07, 0.27, 0.18), octaves=max(4, min(6, octv))))
+    geology_lith = hybrid_noise01(shape, rng_factory("noise:geology-lith"), base_scale_px=max(h / 22.0, 3.0),
+        **noise_kwargs(cfg, profile=GEOLOGY_BLEND, octaves=max(5, min(8, octv))))
+    geology_igneous = hybrid_noise01(shape, rng_factory("noise:geology-igneous"), base_scale_px=max(h / 30.0, 2.5),
+        **noise_kwargs(cfg, profile=NoiseBlend(0.34, 0.28, 0.12, 0.26), octaves=max(4, min(7, octv))))
+    hydro_wiggle = hybrid_multifractal(shape, rng_factory("noise:hydro"), base_scale_px=max(h / 36.0, 2.5),
+        **noise_kwargs(cfg, profile=HYDRO_BLEND, octaves=max(5, min(8, octv))))
+    delta_texture = hybrid_noise01(shape, rng_factory("noise:delta"), base_scale_px=max(h / 50.0, 2.0),
+        **noise_kwargs(cfg, profile=NoiseBlend(0.36, 0.25, 0.12, 0.27), octaves=max(4, min(7, octv))))
+    return StaticNoiseFields(
+        ocean_fine, climate_texture, convective_texture, geology_lith,
+        geology_igneous, hydro_wiggle, delta_texture,
+    )
