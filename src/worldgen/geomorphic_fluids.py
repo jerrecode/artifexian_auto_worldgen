@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 
 from .grid import SphereGrid, normalize01, smooth_periodic
+from .planetary_chemistry import CHEMICALS
 
 
 @dataclass(slots=True)
@@ -48,6 +49,53 @@ class ExoticGeomorphologyResult:
         return dict(self.metadata)
 
 
+def _screening_fluid_properties(species: str) -> tuple[float, float, float]:
+    """Return screening-grade liquid density, viscosity and surface tension.
+
+    This fallback is used when a volatile is hydrologically active but the current
+    global surface-liquid equilibrium contains no mobile sea.  That is physically
+    distinct from saying the world is a water world: episodic rain/runoff can still
+    be methane-, ethane-, CO2-, etc. dominated even when standing liquid is absent.
+    """
+    sp = CHEMICALS.get(species)
+    if sp is None:
+        return 997.0, 1.0, 72.0
+    rho = 997.0 if sp.liquid_density_kg_m3 is None else float(sp.liquid_density_kg_m3)
+    mu = 1.0 if sp.viscosity_mpa_s is None else float(sp.viscosity_mpa_s)
+    sigma = 72.0 if sp.surface_tension_mn_m is None else float(sp.surface_tension_mn_m)
+    return max(rho, 30.0), max(mu, 0.01), max(sigma, 1.0)
+
+
+def _volatile_cycle_reference_fluid(volatile_cycle: Any | None) -> str | None:
+    if volatile_cycle is None:
+        return None
+    cycles = getattr(volatile_cycle, "species", {}) or {}
+    if cycles:
+        def cycle_score(item):
+            key, cyc = item
+            precip = np.asarray(getattr(cyc, "annual_precipitation_mm_equivalent", 0.0), dtype=float)
+            mean_precip = float(np.mean(precip)) if precip.size else 0.0
+            frac = max(float(getattr(cyc, "atmospheric_fraction", 0.0)), 0.0)
+            cond = max(float(getattr(cyc, "condensation_index", 0.0)), 0.0)
+            return mean_precip + 100.0 * frac * cond
+        return max(cycles.items(), key=cycle_score)[0]
+
+    condensates = getattr(volatile_cycle, "condensates", {}) or {}
+    candidates = [
+        (key, cand)
+        for key, cand in condensates.items()
+        if bool(getattr(cand, "precipitation_capable", False))
+        and not bool(getattr(cand, "aerosol_only", False))
+    ]
+    if candidates:
+        return max(
+            candidates,
+            key=lambda kv: max(float(getattr(kv[1], "atmospheric_fraction", 0.0)), 0.0)
+            * max(float(getattr(kv[1], "condensation_index", 0.0)), 0.0),
+        )[0]
+    return None
+
+
 def build_geomorphic_fluid_parameters(
     astronomy: Any,
     exotic_ocean: Any | None,
@@ -56,15 +104,17 @@ def build_geomorphic_fluid_parameters(
 ) -> GeomorphicFluidParameters:
     planet = getattr(astronomy, "planet", {}) or {}
     gravity = max(float(planet.get("surface_gravity_m_s2", 9.80665)), 0.05)
-    if exotic_ocean is None or not getattr(exotic_ocean, "composition_mass_fraction", {}):
-        active = "H2O"
-        rho, mu, sigma = 997.0, 1.0, 72.0
-    else:
-        comp = dict(exotic_ocean.composition_mass_fraction)
+    comp = {} if exotic_ocean is None else dict(getattr(exotic_ocean, "composition_mass_fraction", {}) or {})
+    if comp:
         active = max(comp, key=comp.get)
         rho = max(float(exotic_ocean.bulk_density_kg_m3), 30.0)
         mu = max(float(exotic_ocean.dynamic_viscosity_mpa_s), 0.01)
         sigma = max(float(exotic_ocean.surface_tension_mn_m), 1.0)
+        selection_source = "mobile_surface_liquid_mixture"
+    else:
+        active = _volatile_cycle_reference_fluid(volatile_cycle) or "H2O"
+        rho, mu, sigma = _screening_fluid_properties(active)
+        selection_source = "active_precipitating_volatile" if active != "H2O" else "water_reference_fallback"
 
     # Bed shear scales with rho*g and turbulent competence rises as viscosity falls.
     # Exponents are intentionally sub-linear to avoid suppressing Titan-like fluvial
@@ -117,6 +167,7 @@ def build_geomorphic_fluid_parameters(
         metadata={
             "model": "dimensionless Shields/stream-power-inspired fluid property scaling",
             "reference_fluid": "liquid water near 288 K and Earth gravity",
+            "active_fluid_selection_source": selection_source,
             "limitations": "No grain-resolved Shields curve, sediment-size distribution, cohesive bank mechanics, infiltration PDE, or explicit storm duration.",
         },
     )
