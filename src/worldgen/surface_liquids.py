@@ -5,24 +5,25 @@ from __future__ import annotations
 The solver deliberately separates three questions:
 
 1. how much of each configured volatile inventory is currently atmospheric vapor,
-   condensed solid, or mobile liquid at the supplied temperature/pressure field;
+   condensed solid, mobile liquid, or incompatible with the prescribed atmospheric
+   pressure/phase state;
 2. what volume the mobile liquid occupies at its thermodynamic density; and
 3. what equipotential liquid level produces exactly that volume over the spherical
    solid-surface heightmap.
 
-The geometric integration treats each raster cell as a spherical wedge.  A cell with
+The geometric integration treats each raster cell as a spherical wedge. A cell with
 solid angle ``omega`` and bed radius ``r_b`` contributes
 
     omega/3 * (r_l**3 - r_b**3)
 
-to the reservoir when the liquid radius ``r_l`` lies above its bed.  This is more
+to the reservoir when the liquid radius ``r_l`` lies above its bed. This is more
 accurate than a planar area*depth approximation and remains well behaved for planets
 whose radius differs substantially from Earth.
 
-The volatile phase partition is a reduced-order equilibrium approximation.  It is
-not a full atmosphere-ocean-ice chemical potential solver and multicomponent liquid
-mixtures are currently volume-additive.  Those limitations are recorded explicitly
-in the diagnostics rather than hidden behind Earth-specific constants.
+The volatile phase partition is a reduced-order equilibrium approximation. It is
+not a full atmosphere-ocean-ice chemical-potential solver and multicomponent liquid
+mixtures are currently volume-additive. Those limitations are recorded explicitly
+in diagnostics rather than hidden behind Earth-specific constants.
 """
 
 from dataclasses import asdict, dataclass
@@ -48,6 +49,7 @@ class VolatilePartition:
     vapor_mass_kg: float
     solid_mass_kg: float
     liquid_mass_kg: float
+    noncondensed_excess_mass_kg: float
     liquid_density_kg_m3: float
     liquid_volume_m3: float
     vapor_capacity_kg: float
@@ -150,7 +152,7 @@ def solve_global_liquid_level(
     """Fill the deepest raster elevations upward until the target volume is reached.
 
     The algorithm sorts cells by bed elevation once, then advances the common liquid
-    radius through those breakpoints while accumulating active solid angle.  The last
+    radius through those breakpoints while accumulating active solid angle. The last
     partial interval is solved analytically/numerically in radius, so no iterative
     bisection over the complete map is necessary.
     """
@@ -188,7 +190,9 @@ def solve_global_liquid_level(
             j += 1
         current = float(z[i])
         if j >= n:
-            d = _radial_increment_for_volume(radius_m + current, remaining / max(active_omega, 1e-30))
+            d = _radial_increment_for_volume(
+                radius_m + current, remaining / max(active_omega, 1e-30)
+            )
             level_m = current + d
             remaining = 0.0
             break
@@ -197,7 +201,9 @@ def solve_global_liquid_level(
         delta = next_z - current
         capacity = active_omega * _shell_volume_per_sr(radius_m + current, delta)
         if remaining <= capacity:
-            d = _radial_increment_for_volume(radius_m + current, remaining / max(active_omega, 1e-30))
+            d = _radial_increment_for_volume(
+                radius_m + current, remaining / max(active_omega, 1e-30)
+            )
             level_m = current + d
             remaining = 0.0
             break
@@ -206,7 +212,9 @@ def solve_global_liquid_level(
     else:  # pragma: no cover - defensive, loop always exits via final active interval
         level_m = current
 
-    depth_m = np.maximum(level_m - bed.reshape(grid.shape) * 1000.0, 0.0).astype(np.float32)
+    depth_m = np.maximum(
+        level_m - bed.reshape(grid.shape) * 1000.0, 0.0
+    ).astype(np.float32)
     integrated = integrate_liquid_volume_m3(grid, bed, level_m / 1000.0)
     return float(level_m / 1000.0), depth_m, float(integrated)
 
@@ -256,11 +264,14 @@ def partition_volatile_inventory(
     """Partition one volatile inventory into vapor, fixed solid, and mobile liquid.
 
     Atmospheric vapor is capped by local saturation pressure (times relative
-    humidity) integrated hydrostatically over the sphere.  Remaining condensed mass
-    is assigned to fixed solid in proportion to the area where the pure condensed
-    phase is solid, modulated by ``ice_fixation_efficiency``.  If no liquid-stable
-    area exists, all condensed material is fixed solid; if no solid-stable area
-    exists, it remains mobile liquid.
+    humidity) integrated hydrostatically over the sphere. Remaining inventory is
+    condensed only where a solid or liquid phase is thermodynamically available.
+
+    If the supplied temperature/pressure field is gas-only or supercritical while
+    the prescribed atmospheric column is too small to contain all configured mass,
+    the remainder is reported as ``noncondensed_excess_mass_kg`` rather than being
+    falsely converted to a surface liquid. Such a state means atmospheric pressure
+    should ultimately be solved together with inventory in a higher-fidelity model.
     """
     key = canonical_species(species)
     total = max(float(total_mass_kg), 0.0)
@@ -271,30 +282,38 @@ def partition_volatile_inventory(
     rh = float(np.clip(relative_humidity, 0.0, 1.0))
     pressure = max(float(surface_pressure_bar), 1e-12)
 
-    psat_bar = np.asarray(saturation_pressure_bar(key, t_k, backend="builtin"), dtype=np.float64)
+    psat_bar = np.asarray(
+        saturation_pressure_bar(key, t_k, backend="builtin"), dtype=np.float64
+    )
     vapor_pressure_pa = np.minimum(psat_bar * rh, pressure) * 1e5
-    vapor_capacity = float(np.sum(vapor_pressure_pa * _cell_area_m2(grid) / g, dtype=np.float64))
+    vapor_capacity = float(
+        np.sum(vapor_pressure_pa * _cell_area_m2(grid) / g, dtype=np.float64)
+    )
     vapor_mass = min(total, vapor_capacity)
-    condensed = max(total - vapor_mass, 0.0)
+    remainder = max(total - vapor_mass, 0.0)
 
     phase = phase_code_grid(key, t_k, pressure)
     weights = np.asarray(grid.cell_area_weights, dtype=np.float64)
     solid_fraction_area = float(np.sum(weights[phase == 2]))
     liquid_fraction_area = float(np.sum(weights[phase == 1]))
 
-    if condensed <= 0.0:
-        solid_mass = 0.0
-        liquid_mass = 0.0
-    elif liquid_fraction_area <= 1e-12:
-        solid_mass = condensed if solid_fraction_area > 0.0 else 0.0
-        liquid_mass = condensed - solid_mass
-    elif solid_fraction_area <= 1e-12:
-        solid_mass = 0.0
-        liquid_mass = condensed
-    else:
-        fixed_fraction = float(np.clip(solid_fraction_area * ice_fixation_efficiency, 0.0, 1.0))
-        solid_mass = condensed * fixed_fraction
-        liquid_mass = condensed - solid_mass
+    solid_mass = 0.0
+    liquid_mass = 0.0
+    noncondensed_excess = 0.0
+    if remainder > 0.0:
+        if liquid_fraction_area <= 1e-12 and solid_fraction_area <= 1e-12:
+            # No condensed surface phase exists anywhere at the prescribed P/T.
+            noncondensed_excess = remainder
+        elif liquid_fraction_area <= 1e-12:
+            solid_mass = remainder
+        elif solid_fraction_area <= 1e-12:
+            liquid_mass = remainder
+        else:
+            fixed_fraction = float(
+                np.clip(solid_fraction_area * ice_fixation_efficiency, 0.0, 1.0)
+            )
+            solid_mass = remainder * fixed_fraction
+            liquid_mass = remainder - solid_mass
 
     liquid_cells = phase == 1
     if np.any(liquid_cells):
@@ -305,12 +324,18 @@ def partition_volatile_inventory(
     density = _liquid_density(key, mean_t, pressure, thermodynamics_backend)
     liquid_volume = liquid_mass / max(density, 1e-30)
 
+    # Explicit inventory closure catches future partition regressions.
+    closure = vapor_mass + solid_mass + liquid_mass + noncondensed_excess
+    if not math.isclose(closure, total, rel_tol=2e-12, abs_tol=1e-6):
+        raise RuntimeError("volatile partition failed mass closure")
+
     return VolatilePartition(
         species=key,
         total_mass_kg=total,
         vapor_mass_kg=float(vapor_mass),
         solid_mass_kg=float(solid_mass),
         liquid_mass_kg=float(liquid_mass),
+        noncondensed_excess_mass_kg=float(noncondensed_excess),
         liquid_density_kg_m3=float(density),
         liquid_volume_m3=float(liquid_volume),
         vapor_capacity_kg=float(vapor_capacity),
@@ -364,6 +389,9 @@ def solve_surface_liquids(
     total_inventory = float(sum(p.total_mass_kg for p in partitions.values()))
     vapor = float(sum(p.vapor_mass_kg for p in partitions.values()))
     solid = float(sum(p.solid_mass_kg for p in partitions.values()))
+    noncondensed = float(
+        sum(p.noncondensed_excess_mass_kg for p in partitions.values())
+    )
 
     return SurfaceLiquidResult(
         liquid_level_km=float(level_km),
@@ -380,12 +408,16 @@ def solve_surface_liquids(
             "inventory_total_kg": total_inventory,
             "vapor_mass_kg": vapor,
             "solid_fixed_mass_kg": solid,
+            "noncondensed_excess_mass_kg": noncondensed,
             "liquid_mass_kg": total_mass,
             "liquid_volume_m3": total_volume,
             "relative_humidity": float(np.clip(relative_humidity, 0.0, 1.0)),
-            "ice_fixation_efficiency": float(np.clip(ice_fixation_efficiency, 0.0, 1.0)),
+            "ice_fixation_efficiency": float(
+                np.clip(ice_fixation_efficiency, 0.0, 1.0)
+            ),
             "thermodynamics_backend": thermodynamics_backend,
             "mixture_model": "volume-additive independent pure-species phase partitions; no activity/fugacity mixture correction yet",
+            "pressure_coupling": "fixed supplied surface pressure; excess gas/supercritical inventory is diagnosed rather than converted to liquid",
             "geometry": "spherical raster wedges using exact radial shell volume per cell solid angle",
         },
     )
