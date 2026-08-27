@@ -165,11 +165,11 @@ copper = w["resource_copper_rich"]
 
 ## Performance architecture
 
-The implementation is designed around arrays rather than Python objects per map cell. Expensive spatial operations use NumPy/SciPy vectorization and image morphology; spherical plate assignment uses chunked matrix multiplication; longitude is periodic; hydrology is the principal intentionally sequential operation because the drainage graph must be topologically accumulated.
+The implementation is designed around arrays rather than Python objects per map cell. Expensive spatial operations use NumPy/SciPy vectorization through a canonical spherical topology layer; pole crossings reflect latitude and rotate longitude by 180 degrees, while longitude is periodic. Spherical plate assignment uses chunked matrix multiplication. Hydrology remains the principal intentionally sequential operation because the drainage graph must be topologically accumulated.
 
 Every stage receives an independent deterministic `PCG64DXSM` random stream derived from the root seed and a stage name. This is important for worldbuilding: changing ore density should not unexpectedly reroll the star, and changing the climate implementation should not intentionally reroll plate seeds.
 
-`--quick` uses a 256×128 map, 50 Myr tectonic history sampling, and fewer moisture-advection iterations. The default is 512×256. The pipeline can be raised to 1024×512 or more in the YAML, with roughly quadratic growth in raster work.
+`--quick` uses a 256×128 map, 50 Myr tectonic history sampling, and fewer moisture-advection iterations. `config/default.yaml` is 768×384; the separate `config/fast.yaml` preset is 512×256. The pipeline can be raised to 1536×768 or more in YAML, with roughly quadratic growth in raster work.
 
 ## Important mathematical substitutions
 

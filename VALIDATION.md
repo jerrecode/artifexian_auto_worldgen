@@ -1,22 +1,33 @@
 # Validation
 
-The delivered build was executed end-to-end in the sandbox before packaging.
+Validation combines deterministic software tests, analytic numerical tests,
+failure injection, and generated-world diagnostics. Results remain
+machine/environment dependent unless a test specifies an exact invariant.
 
 ## Automated tests
 
-```text
-test_astronomy_target ... ok
-test_reproducible ... ok
-test_seed_changes_world ... ok
-test_world_has_expected_layers ... ok
-Ran 4 tests ... OK
-```
+Run the complete suite with `python -m pytest -q`. It covers target-temperature
+orbital calibration, moon/Hill-radius consistency, exact same-seed
+reproducibility, different-seed divergence, populated physical/worldbuilding
+layers, drainage acyclicity, adaptive convergence, checkpoint dependency hashes,
+crash-transactional storage, Priority-Flood backend equivalence, runtime planning,
+2-D tiling, and benchmark contracts.
 
-The tests verify target-temperature orbital calibration, moon/Hill-radius consistency, exact same-seed reproducibility, different-seed divergence, populated resource output, river generation, multiple climate classes, and settlement generation.
+Spherical numerical regressions use analytic vector fields and explicit seam/pole
+fixtures. Geographic morphology, connected components, tectonic boundary
+classification, coarse-field resizing, noise octave interpolation, Gaussian
+filtering, and domain warping all exercise longitude wrapping plus antipodal pole
+crossing. These tests establish discrete implementation correctness; they do not
+by themselves validate every reduced-order physical parameterization.
 
-## Default 512×256 benchmark in the build environment
+## Resolution and benchmark interpretation
 
-The latest complete default run executed all computational stages in a few seconds; PNG/NPZ/JSON output serialization and rendering was the largest single cost. Timing is machine-dependent and is included in each generated `world.json`.
+The current `config/default.yaml` simulation grid is 768×384. The 512×256
+`config/fast.yaml` preset and the 256×128 `--quick` override are separate fidelity
+choices. Use `python -m worldgen.benchmarks --profile micro --output benchmark.json`
+for machine-readable kernel and whole-pipeline measurements; generated timing JSON
+and `world.json` carry run-specific stage data. Do not compare timings from unlike
+resolutions, fidelity settings, optional backends, or output selections.
 
 The validation world produced, among other checks:
 
