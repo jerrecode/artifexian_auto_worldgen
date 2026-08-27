@@ -1,0 +1,56 @@
+seed: 20260831
+astronomy:
+  star_mass_solar: 0.95
+  planet_mass_earth: 5.0
+  planet_density_g_cm3: 5.8
+  semimajor_axis_au: 0.95
+  eccentricity: 0.035
+  axial_tilt_deg: 18.0
+  rotation_hours: 31.0
+  albedo: 0.31
+  greenhouse_model: composition
+  thermodynamics_backend: auto
+  atmosphere_pressure_bar: 2.0
+  atmosphere_top_pressure_bar: 1.0e-7
+  atmosphere:
+    N2: 0.83
+    O2: 0.15
+    CO2: 0.015
+    H2O: 0.005
+  surface_volatiles:
+    H2O: 1.0
+  surface_condensible: H2O
+  radiogenic_heat_flux_w_m2: 0.13
+  moons:
+    - name: Selene-A
+      mass_earth: 0.035
+      orbit_km: 520000
+      eccentricity: 0.015
+      love_number_k2: 0.12
+      quality_factor_q: 120
+    - name: Selene-B
+      mass_earth: 0.008
+      orbit_km: 910000
+      eccentricity: 0.025
+      love_number_k2: 0.10
+      quality_factor_q: 140
+    - name: Selene-C
+      mass_earth: 0.002
+      orbit_km: 1450000
+      eccentricity: 0.04
+      love_number_k2: 0.08
+      quality_factor_q: 160
+tectonics:
+  geological_activity_mode: active
+  activity_strength: 1.25
+  max_plate_speed_cm_yr: 10.0
+  hotspot_count: 30
+  ice_geology_mode: inactive
+climate:
+  condensible_species: H2O
+  precip_scale_mm_year: 1350.0
+  phase_coupled_evaporation: true
+ocean:
+  fluid_species: H2O
+society:
+  enabled: false
