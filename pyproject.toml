@@ -32,6 +32,9 @@ storage = [
   "numcodecs>=0.16",
   "h5py>=3.11",
 ]
+thermodynamics = [
+  "CoolProp>=7.0",
+]
 render = [
   "Pillow>=10.4",
 ]
