@@ -9,6 +9,7 @@ from .ocean import OceanResult
 from .terrain import TerrainResult
 from .noise import hybrid_multifractal, hybrid_noise01, noise_kwargs, CLIMATE_BLEND, NoiseBlend, StaticNoiseFields
 from .topology import prepare_spherical_bilinear_sampler, apply_bilinear_sampler
+from .planetary_physics import canonical_species, phase_code_grid, relative_vapor_capacity, saturation_pressure_bar
 
 
 @dataclass(slots=True)
@@ -29,6 +30,8 @@ class ClimateResult:
     continentality_index_c: np.ndarray
     continentality_class: np.ndarray
     snow_fraction: np.ndarray
+    condensible_phase_code_monthly: np.ndarray
+    condensible_saturation_pressure_bar_monthly: np.ndarray
     metadata: dict
 
 
@@ -85,14 +88,25 @@ def _bilinear_sample(a: np.ndarray, sampler) -> np.ndarray:
 def _advective_precip(grid: SphereGrid, temp: np.ndarray, p: np.ndarray, u: np.ndarray, v: np.ndarray,
                       elevation_km: np.ndarray, ocean: np.ndarray, cfg: ClimateConfig,
                       sst_anomaly_c: np.ndarray | None = None,
-                      convective_texture: np.ndarray | None = None):
+                      convective_texture: np.ndarray | None = None,
+                      *, condensible_species: str = "H2O", reference_temperature_k: float = 288.0,
+                      surface_pressure_bar: float = 1.0):
     h, w = temp.shape; yy, xx = np.indices((h, w), dtype=float)
     speed = np.hypot(u, v); un = u / np.maximum(speed, 0.15); vn = v / np.maximum(speed, 0.15)
     if sst_anomaly_c is None: sst_anomaly_c = np.zeros_like(temp)
     ocean_t = temp + np.asarray(sst_anomaly_c, float)
-    humidity_capacity = np.exp(cfg.humidity_temperature_sensitivity * np.clip(ocean_t - 15.0, -35.0, 25.0))
-    evap = ocean * np.clip(humidity_capacity, 0.12, 3.2); moisture = 0.48 * evap + 0.012; rain = np.zeros_like(temp, dtype=float)
-    lowp = normalize01(-p); warm_conv = np.clip((temp - 4.0) / 26.0, 0, 1)
+    if cfg.phase_coupled_evaporation:
+        humidity_capacity = relative_vapor_capacity(condensible_species, ocean_t + 273.15, reference_temperature_k)
+        phase = phase_code_grid(condensible_species, ocean_t + 273.15, surface_pressure_bar)
+        # Liquid reservoirs evaporate efficiently; frozen reservoirs can sublimate,
+        # while a nominal ocean whose condensable is unstable as liquid is strongly suppressed.
+        reservoir = np.where(phase == 1, 1.0, np.where(phase == 2, 0.12, np.where(phase == 3, 0.35, 0.03)))
+        evap = ocean * np.clip(humidity_capacity, 0.02, 6.0) * reservoir
+    else:
+        humidity_capacity = np.exp(cfg.humidity_temperature_sensitivity * np.clip(ocean_t - 15.0, -35.0, 25.0))
+        evap = ocean * np.clip(humidity_capacity, 0.12, 3.2)
+    moisture = 0.48 * evap + 0.012; rain = np.zeros_like(temp, dtype=float)
+    lowp = normalize01(-p); warm_conv = np.clip((temp - (reference_temperature_k - 273.15) + 11.0) / 26.0, 0, 1)
     step_km = max(float(cfg.moisture_step_km), 25.0)
     src_y = yy - vn * (step_km / max(grid.dy_km, 1e-6))
     src_x = xx - un * (step_km / np.maximum(grid.dx_km, 1e-6))
@@ -161,7 +175,12 @@ def build_climate(grid: SphereGrid, astronomy: AstronomyResult, terrain: Terrain
                   noise_cfg: NoiseConfig | None = None, static_noise: StaticNoiseFields | None = None) -> ClimateResult:
     if cfg.months != 12: raise ValueError("Current climate implementation requires 12 months")
     h,w=terrain.land.shape; temp=np.empty((12,h,w),np.float32); precip_raw=np.empty_like(temp); pressure=np.empty_like(temp); wu=np.empty_like(temp); wv=np.empty_like(temp); gwu=np.empty_like(temp); gwv=np.empty_like(temp); humidity=np.empty_like(temp); hfu=np.empty_like(temp); hfv=np.empty_like(temp)
+    phase_monthly=np.empty((12,h,w),np.uint8); saturation_monthly=np.empty((12,h,w),np.float32)
     mean_target=astronomy.planet["mean_surface_temperature_c_approx"]; tilt=astronomy.planet["axial_tilt_deg"]; dist_ocean=distance_to(terrain.ocean,grid)
+    requested=cfg.condensible_species
+    condensible = astronomy.volatile_chemistry.get("active_condensible") if requested == "auto" else requested
+    condensible = canonical_species(condensible or "H2O")
+    surface_pressure=float(astronomy.atmosphere.get("surface_pressure_bar",1.0)); reference_temp=float(mean_target+273.15)
     continentality=np.clip(dist_ocean/max(cfg.inland_thermal_length_km,1.0),0,1)**0.78*terrain.land
     ocean_anom=ocean.sst_anomaly_c.astype(float); ocean_anom_fill=grid.ops.grey_dilation(ocean_anom,iterations=1); coastal_current=smooth_periodic(ocean_anom_fill,(5,8))*np.exp(-dist_ocean/650.0)
     lat_base=mean_target-0.48*np.abs(grid.lat)-0.0028*grid.lat**2; lat_base += mean_target-np.sum(lat_base*grid.cell_area_weights)
@@ -176,7 +195,11 @@ def build_climate(grid: SphereGrid, astronomy: AstronomyResult, terrain: Terrain
         tm=lat_base+response*seasonal_forcing[m]+coastal_current-tcfg.lapse_rate_k_per_km*np.maximum(ocean.elevation_km,0.0)
         sst_m=np.asarray(ocean.sst_anomaly_c_monthly[m] if hasattr(ocean,"sst_anomaly_c_monthly") else ocean.sst_anomaly_c,float)
         tm += sst_m*terrain.ocean + smooth_periodic(sst_m,(3.0,5.0))*np.exp(-dist_ocean/520.0)*terrain.land + texture
-        itcz_lat=cfg.seasonal_itcz_shift_fraction*declinations[m]; p,u,v,gu,gv=_pressure_and_winds(grid,tm,terrain.land,ocean.elevation_km,cfg,itcz_lat); pr,hm=_advective_precip(grid,tm,p,u,v,ocean.elevation_km,terrain.ocean,cfg,sst_m,conv_texture)
+        phase_monthly[m]=phase_code_grid(condensible,tm+273.15,surface_pressure)
+        saturation_monthly[m]=np.asarray(saturation_pressure_bar(condensible,tm+273.15,backend="builtin"),dtype=np.float32)
+        itcz_lat=cfg.seasonal_itcz_shift_fraction*declinations[m]; p,u,v,gu,gv=_pressure_and_winds(grid,tm,terrain.land,ocean.elevation_km,cfg,itcz_lat)
+        pr,hm=_advective_precip(grid,tm,p,u,v,ocean.elevation_km,terrain.ocean,cfg,sst_m,conv_texture,
+                                condensible_species=condensible,reference_temperature_k=reference_temp,surface_pressure_bar=surface_pressure)
         temp[m]=tm; pressure[m]=p; wu[m]=u; wv[m]=v; gwu[m]=gu; gwv[m]=gv; humidity[m]=hm; hfu[m]=hm*u; hfv[m]=hm*v; precip_raw[m]=pr
     raw_ann=precip_raw.sum(0); lm=terrain.land&(raw_ann>0)
     raw_ref=float(np.average(raw_ann[lm],weights=grid.cell_area_weights[lm])) if np.any(lm) else (float(np.average(raw_ann[raw_ann>0],weights=grid.cell_area_weights[raw_ann>0])) if np.any(raw_ann>0) else 1.0)
@@ -192,7 +215,17 @@ def build_climate(grid: SphereGrid, astronomy: AstronomyResult, terrain: Terrain
         mid=.5*(lo+hi)
         if mean_alpha(mid)<target: lo=mid
         else: hi=mid
-    precip_alpha=.5*(lo+hi); precip=(cap*np.tanh(precip_alpha*shaped/cap)).astype(np.float32); annp=precip.sum(0); annt=temp.mean(0); koppen=classify_koppen(temp,precip); cont_index=temp.max(0)-temp.min(0)
-    cont_class=np.full((h,w),"hyperoceanic",dtype="<U16"); cont_class[cont_index>=11.0]="oceanic"; cont_class[cont_index>=21.0]="subcontinental"; cont_class[cont_index>=28.0]="continental"; cont_class[cont_index>=46.0]="hypercontinental"; snow=np.mean((temp<=0.0)&(precip>1.0),axis=0).astype(np.float32)
-    meta={"global_mean_temperature_c":float(np.sum(annt*grid.cell_area_weights)),"land_mean_annual_precip_mm":float(np.average(annp[terrain.land],weights=grid.cell_area_weights[terrain.land])) if np.any(terrain.land) else 0.0,"precipitation_scaling":"spherical area-weighted target + power-tail shaping + tanh extreme soft-cap; no hard clipping","precipitation_extreme_softcap_mm_month":float(cap),"precipitation_softcap_alpha":float(precip_alpha),"classification":"Köppen-Geiger-like, monthly quantitative extension of transcript map workflow","circulation":"seasonally migrating ITCZ + explicit trade winds/westerlies/polar easterlies + pressure anomalies","orographic_precipitation":"iterative humidity advection with physical upwind elevation gain and lee-side moisture depletion","humidity_transport":"monthly semi-Lagrangian moisture reservoir with spherical pole-crossing transport and wind-carried flux proxies","seasonality":"eccentric-orbit inverse-square forcing + cyclic land/ocean thermal inertia + stationary planetary waves","orbital_flux_factors":[float(x) for x in orbital_flux],"noise_model":"shared hybrid multi-type multifractal climate/convective texture"}
-    return ClimateResult(temp,precip,pressure,wu,wv,gwu,gwv,humidity,hfu,hfv,annt.astype(np.float32),annp.astype(np.float32),koppen,cont_index.astype(np.float32),cont_class,snow,meta)
+    precip_alpha=.5*(lo+hi); precip=(cap*np.tanh(precip_alpha*shaped/cap)).astype(np.float32); annp=precip.sum(0); annt=temp.mean(0)
+    koppen=classify_koppen(temp,precip) if condensible == "H2O" else np.full((h,w),"EXO",dtype="<U3")
+    cont_index=temp.max(0)-temp.min(0); cont_class=np.full((h,w),"hyperoceanic",dtype="<U16"); cont_class[cont_index>=11.0]="oceanic"; cont_class[cont_index>=21.0]="subcontinental"; cont_class[cont_index>=28.0]="continental"; cont_class[cont_index>=46.0]="hypercontinental"
+    snow=np.mean((phase_monthly==2)&(precip>1.0),axis=0).astype(np.float32)
+    meta={"global_mean_temperature_c":float(np.sum(annt*grid.cell_area_weights)),"land_mean_annual_precip_mm":float(np.average(annp[terrain.land],weights=grid.cell_area_weights[terrain.land])) if np.any(terrain.land) else 0.0,
+          "active_condensible_species":condensible,"phase_codes":{"gas":0,"liquid":1,"solid":2,"supercritical":3},
+          "precipitation_units_semantics":f"{condensible} liquid-equivalent mm under configured precipitation scaling; not necessarily water",
+          "phase_coupled_evaporation":bool(cfg.phase_coupled_evaporation),
+          "precipitation_scaling":"spherical area-weighted target + power-tail shaping + tanh extreme soft-cap; no hard clipping","precipitation_extreme_softcap_mm_month":float(cap),"precipitation_softcap_alpha":float(precip_alpha),
+          "classification":"Köppen-Geiger-like only for H2O climates; EXO marker for non-water condensables",
+          "circulation":"seasonally migrating ITCZ + explicit trade winds/westerlies/polar easterlies + pressure anomalies","orographic_precipitation":"iterative humidity advection with physical upwind elevation gain and lee-side moisture depletion",
+          "humidity_transport":"monthly semi-Lagrangian condensable reservoir with spherical pole-crossing transport and wind-carried flux proxies","seasonality":"eccentric-orbit inverse-square forcing + cyclic land/ocean thermal inertia + stationary planetary waves",
+          "orbital_flux_factors":[float(x) for x in orbital_flux],"noise_model":"shared hybrid multi-type multifractal climate/convective texture"}
+    return ClimateResult(temp,precip,pressure,wu,wv,gwu,gwv,humidity,hfu,hfv,annt.astype(np.float32),annp.astype(np.float32),koppen,cont_index.astype(np.float32),cont_class,snow,phase_monthly,saturation_monthly,meta)
