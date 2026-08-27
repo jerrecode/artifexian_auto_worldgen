@@ -35,6 +35,17 @@ class SphericalTopologyTests(unittest.TestCase):
         self.assertEqual(n, 1)
         self.assertEqual(int(labels[13, 0]), int(labels[13, -1]))
 
+    def test_connected_components_merge_across_north_pole(self):
+        grid = SphereGrid(64, 32)
+        mask = np.zeros((32, 64), dtype=bool)
+        # These cells are direct spherical neighbors through the north-pole
+        # reflection even though they are half a raster apart in longitude.
+        mask[0, 3] = True
+        mask[0, 35] = True
+        labels, n = grid.ops.connected_components(mask)
+        self.assertEqual(n, 1)
+        self.assertEqual(int(labels[0, 3]), int(labels[0, 35]))
+
     def test_grey_dilation_wraps_longitude_seam(self):
         grid = SphereGrid(64, 32)
         field = np.zeros((32, 64), dtype=np.float32)
@@ -51,6 +62,21 @@ class SphericalTopologyTests(unittest.TestCase):
         # The north neighbor of top-row longitude 0 is the reflected top-row
         # cell at longitude +180 degrees (half a raster away).
         self.assertEqual(float(expanded[0, 0]), 9.0)
+
+    def test_binary_opening_preserves_feature_contiguous_through_pole(self):
+        grid = SphereGrid(64, 32)
+        mask = np.zeros((32, 64), dtype=bool)
+        # Build a compact spherical patch centered on a north-pole crossing. A
+        # planar opening would interpret the two antipodal raster fragments as
+        # unrelated edge features; spherical morphology sees one neighborhood.
+        seed = np.zeros_like(mask)
+        seed[0, 4] = True
+        patch = grid.ops.binary_dilation(seed, iterations=2)
+        opened = grid.ops.binary_opening(patch, iterations=1)
+        self.assertTrue(opened[0, 4])
+        self.assertTrue(opened[0, 36])
+        _, n = grid.ops.connected_components(opened)
+        self.assertEqual(n, 1)
 
     def test_large_land_mask_merges_seam_component_and_uses_spherical_area(self):
         grid = SphereGrid(64, 32)
