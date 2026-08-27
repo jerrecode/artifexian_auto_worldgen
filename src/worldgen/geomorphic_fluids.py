@@ -53,7 +53,7 @@ def _screening_fluid_properties(species: str) -> tuple[float, float, float]:
     """Return screening-grade liquid density, viscosity and surface tension.
 
     This fallback is used when a volatile is hydrologically active but the current
-    global surface-liquid equilibrium contains no mobile sea.  That is physically
+    global surface-liquid equilibrium contains no mobile sea. That is physically
     distinct from saying the world is a water world: episodic rain/runoff can still
     be methane-, ethane-, CO2-, etc. dominated even when standing liquid is absent.
     """
@@ -67,18 +67,41 @@ def _screening_fluid_properties(species: str) -> tuple[float, float, float]:
 
 
 def _volatile_cycle_reference_fluid(volatile_cycle: Any | None) -> str | None:
+    """Choose the bulk channel-forming condensate, not merely the strongest trace rain.
+
+    Photochemical nitriles and organics such as HCN may condense efficiently on a
+    Titan-like world, but they should not displace methane/ethane as the geomorphic
+    working fluid when a hydrocarbon surface reservoir/cycle exists. Preference is
+    therefore given to explicit surface-reservoir cycles and species whose chemistry
+    roles identify them as ocean/hydrology fluids; trace condensates remain deposits.
+    """
     if volatile_cycle is None:
         return None
     cycles = getattr(volatile_cycle, "species", {}) or {}
     if cycles:
-        def cycle_score(item):
+        def reservoir_bonus(cyc: Any) -> float:
+            meta = getattr(cyc, "metadata", {}) or {}
+            return max(float(meta.get("surface_reservoir_weight_bonus", 0.0)), 0.0)
+
+        def hydrologic(key: str, cyc: Any) -> bool:
+            roles = set(getattr(CHEMICALS.get(key), "roles", ()) or ())
+            return bool(roles.intersection({"hydrology", "ocean", "ocean_minor"})) or reservoir_bonus(cyc) > 0.0
+
+        hydrologic_cycles = [(key, cyc) for key, cyc in cycles.items() if hydrologic(key, cyc)]
+        pool = hydrologic_cycles if hydrologic_cycles else list(cycles.items())
+
+        def cycle_score(item: tuple[str, Any]) -> float:
             key, cyc = item
             precip = np.asarray(getattr(cyc, "annual_precipitation_mm_equivalent", 0.0), dtype=float)
             mean_precip = float(np.mean(precip)) if precip.size else 0.0
             frac = max(float(getattr(cyc, "atmospheric_fraction", 0.0)), 0.0)
             cond = max(float(getattr(cyc, "condensation_index", 0.0)), 0.0)
-            return mean_precip + 100.0 * frac * cond
-        return max(cycles.items(), key=cycle_score)[0]
+            reservoir = reservoir_bonus(cyc)
+            roles = set(getattr(CHEMICALS.get(key), "roles", ()) or ())
+            role_weight = 2.0 if roles.intersection({"hydrology", "ocean", "ocean_minor"}) else 1.0
+            return role_weight * (1.0 + 6.0 * reservoir) * (mean_precip + 100.0 * frac * cond + 1e-9)
+
+        return max(pool, key=cycle_score)[0]
 
     condensates = getattr(volatile_cycle, "condensates", {}) or {}
     candidates = [
@@ -88,8 +111,13 @@ def _volatile_cycle_reference_fluid(volatile_cycle: Any | None) -> str | None:
         and not bool(getattr(cand, "aerosol_only", False))
     ]
     if candidates:
+        hydrologic_candidates = [
+            (key, cand) for key, cand in candidates
+            if set(getattr(CHEMICALS.get(key), "roles", ()) or ()).intersection({"hydrology", "ocean", "ocean_minor"})
+        ]
+        pool = hydrologic_candidates if hydrologic_candidates else candidates
         return max(
-            candidates,
+            pool,
             key=lambda kv: max(float(getattr(kv[1], "atmospheric_fraction", 0.0)), 0.0)
             * max(float(getattr(kv[1], "condensation_index", 0.0)), 0.0),
         )[0]
@@ -116,18 +144,12 @@ def build_geomorphic_fluid_parameters(
         rho, mu, sigma = _screening_fluid_properties(active)
         selection_source = "active_precipitating_volatile" if active != "H2O" else "water_reference_fallback"
 
-    # Bed shear scales with rho*g and turbulent competence rises as viscosity falls.
-    # Exponents are intentionally sub-linear to avoid suppressing Titan-like fluvial
-    # geomorphology merely because a simulation iteration has no explicit duration.
     density_term = (rho / 997.0) ** 0.55
     gravity_term = (gravity / 9.80665) ** 0.45
     viscosity_term = (1.0 / mu) ** 0.16
     tension_term = (72.0 / sigma) ** 0.10
     stream = float(np.clip(density_term * gravity_term * viscosity_term * tension_term, 0.08, 3.0))
 
-    # Low-viscosity hydrocarbons infiltrate/evaporate readily but can still generate
-    # intense episodic runoff. Ammonia-water behaves closer to water while very
-    # viscous fluids reduce effective channel transport.
     runoff = float(np.clip((1.0 / mu) ** 0.10 * (rho / 997.0) ** 0.15, 0.45, 1.7))
     evap = float(np.clip((997.0 / rho) ** 0.25 * (1.0 / mu) ** 0.08, 0.55, 2.4))
     capacity = float(np.clip(stream * (1.0 / mu) ** 0.10, 0.08, 3.5))
@@ -139,8 +161,6 @@ def build_geomorphic_fluid_parameters(
     if cryogeology is not None:
         cryo = float(np.mean(np.asarray(cryogeology.cryovolcanism_index, dtype=float)))
         frost = float(np.mean(np.asarray(cryogeology.volatile_frost_deposition_index, dtype=float)))
-        # Fresh fractured ice and volatile-rich regolith are more readily reworked
-        # than competent silicate bedrock in this reduced-order parameterization.
         substrate *= 1.0 + 0.55 * cryo + 0.35 * frost
     if volatile_cycle is not None:
         tholin = getattr(volatile_cycle, "photochemical_deposition_by_species", {}).get("THOLIN")
@@ -214,9 +234,6 @@ def build_exotic_geomorphology(
         robust=True,
     ) * land
 
-    # Evaporites are favored where condensable precipitation/runoff reaches closed or
-    # low-gradient basins but evaporation potential is high.  They are compositional
-    # deposits, not necessarily terrestrial salts.
     evap = np.zeros(grid.shape, dtype=float)
     organic = np.zeros(grid.shape, dtype=float)
     if volatile_cycle is not None:
