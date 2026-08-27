@@ -1,7 +1,7 @@
 name: Maximal-detail showcase worlds
 
-# This workflow intentionally triggers only when its own definition changes; it is
-# a bounded showcase/validation run, not part of ordinary CI.
+# Bounded high-detail validation/showcase run. Changes to the fluid-selection kernel
+# retrigger it while this advanced branch is under active validation.
 on:
   workflow_dispatch:
   push:
@@ -9,6 +9,7 @@ on:
       - gpt56/exotic-planetary-physics-20260827
     paths:
       - .github/workflows/showcase-worlds.yml
+      - src/worldgen/geomorphic_fluids.py
 
 permissions:
   contents: read
@@ -73,7 +74,6 @@ jobs:
           cfg['resolution']['height'] = 1024
           cfg['resolution']['history_step_myr'] = 10
           cfg['resolution']['history_myr'] = max(850, int(cfg['resolution'].get('history_myr', 850)))
-
           cfg.setdefault('ocean', {})['backend'] = 'barotropic'
           cfg.setdefault('climate', {})['moisture_iterations'] = max(48, int(cfg['climate'].get('moisture_iterations', 48)))
           cfg['climate']['thermal_memory_spinup_years'] = max(8, int(cfg['climate'].get('thermal_memory_spinup_years', 8)))
@@ -86,7 +86,6 @@ jobs:
           cfg.setdefault('tectonics', {})['boundary_detail_octaves'] = max(9, int(cfg['tectonics'].get('boundary_detail_octaves', 9)))
           cfg['tectonics']['history_grid_height'] = max(192, int(cfg['tectonics'].get('history_grid_height', 192)))
           cfg['tectonics']['boundary_deformation_iterations'] = max(4, int(cfg['tectonics'].get('boundary_deformation_iterations', 4)))
-
           cfg.setdefault('output', {})['save_npz'] = True
           cfg['output']['save_png'] = True
           cfg['output']['save_json'] = True
