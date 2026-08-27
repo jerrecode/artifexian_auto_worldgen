@@ -1,0 +1,159 @@
+name: Maximal-detail showcase worlds
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - gpt56/exotic-planetary-physics-20260827
+    paths:
+      - .github/workflows/showcase-worlds.yml
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    name: Generate ${{ matrix.world }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - world: super-earth
+            preset: config/super_earth.yaml
+          - world: titan-like
+            preset: config/titan_like.yaml
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install maximum-fidelity runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[performance,jit,render,thermodynamics]'
+          python -m pip install pytest
+          python -m pip check
+
+      - name: Validate advanced planetary layer
+        run: pytest -q tests/test_exotic_planetary_physics.py
+
+      - name: Build merged maximal-detail configuration
+        env:
+          TARGET_PRESET: ${{ matrix.preset }}
+          WORLD_NAME: ${{ matrix.world }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import yaml
+
+          def merge(a, b):
+              out = dict(a)
+              for k, v in b.items():
+                  if isinstance(v, dict) and isinstance(out.get(k), dict):
+                      out[k] = merge(out[k], v)
+                  else:
+                      out[k] = v
+              return out
+
+          ultra = yaml.safe_load(Path('config/ultra_detail.yaml').read_text())
+          maximal = yaml.safe_load(Path('config/maximal_realism_safe.yaml').read_text())
+          target = yaml.safe_load(Path(os.environ['TARGET_PRESET']).read_text())
+          cfg = merge(merge(ultra, maximal), target)
+
+          # Use the highest native simulation grid already represented by repository
+          # presets, while keeping the maximal-realism physics/numerics.
+          cfg.setdefault('resolution', {})['width'] = 2048
+          cfg['resolution']['height'] = 1024
+          cfg['resolution']['history_step_myr'] = 10
+          cfg['resolution']['history_myr'] = max(850, int(cfg['resolution'].get('history_myr', 850)))
+
+          cfg.setdefault('ocean', {})['backend'] = 'barotropic'
+          cfg.setdefault('climate', {})['moisture_iterations'] = max(48, int(cfg['climate'].get('moisture_iterations', 48)))
+          cfg['climate']['thermal_memory_spinup_years'] = max(8, int(cfg['climate'].get('thermal_memory_spinup_years', 8)))
+          cfg.setdefault('hydrology', {})['surface_evolution_iterations'] = max(6, int(cfg['hydrology'].get('surface_evolution_iterations', 6)))
+          cfg['hydrology']['sediment_routing_passes'] = max(30, int(cfg['hydrology'].get('sediment_routing_passes', 30)))
+          cfg.setdefault('simulation', {})['earth_system_passes'] = max(4, int(cfg['simulation'].get('earth_system_passes', 4)))
+          cfg['simulation']['final_climate_ocean_passes'] = max(3, int(cfg['simulation'].get('final_climate_ocean_passes', 3)))
+          cfg.setdefault('noise', {})['octaves'] = max(9, int(cfg['noise'].get('octaves', 9)))
+          cfg['noise']['wave_count'] = max(7, int(cfg['noise'].get('wave_count', 7)))
+          cfg.setdefault('tectonics', {})['boundary_detail_octaves'] = max(9, int(cfg['tectonics'].get('boundary_detail_octaves', 9)))
+          cfg['tectonics']['history_grid_height'] = max(192, int(cfg['tectonics'].get('history_grid_height', 192)))
+          cfg['tectonics']['boundary_deformation_iterations'] = max(4, int(cfg['tectonics'].get('boundary_deformation_iterations', 4)))
+
+          # Physical showcase only: retain planet-specific choice to disable society.
+          cfg.setdefault('output', {})['save_npz'] = True
+          cfg['output']['save_png'] = True
+          cfg['output']['save_json'] = True
+          cfg['output']['save_report'] = True
+          cfg['output']['compress_npz'] = True
+          cfg['output']['map_dpi'] = max(160, int(cfg['output'].get('map_dpi', 135)))
+          cfg['output']['rgb_dpi'] = max(180, int(cfg['output'].get('rgb_dpi', 150)))
+
+          out = Path(f"showcase-{os.environ['WORLD_NAME']}.yaml")
+          out.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding='utf-8')
+          print(out.read_text())
+          PY
+
+      - name: Generate native 2048x1024 world and 2x renders
+        env:
+          WORLD_NAME: ${{ matrix.world }}
+        run: |
+          /usr/bin/time -v worldgen \
+            --config "showcase-${WORLD_NAME}.yaml" \
+            --out "showcase-${WORLD_NAME}" \
+            --workers 1 \
+            --threads-per-worker 2 \
+            --png-scale 2 \
+            --png-resample lanczos \
+            --max-png-megapixels 64 \
+            --compress-npz \
+            --diagnostics \
+            --manifest \
+            --timings-json "showcase-${WORLD_NAME}/timings.json" \
+            --progress -v \
+            2>&1 | tee "showcase-${WORLD_NAME}.log"
+
+      - name: Verify generated products
+        env:
+          WORLD_NAME: ${{ matrix.world }}
+        run: |
+          test -s "showcase-${WORLD_NAME}/world.json"
+          test -s "showcase-${WORLD_NAME}/world_arrays.npz"
+          test -s "showcase-${WORLD_NAME}/world_report.md"
+          test -s "showcase-${WORLD_NAME}/diagnostics.json"
+          test -s "showcase-${WORLD_NAME}/run_manifest.json"
+          test -d "showcase-${WORLD_NAME}/maps"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          from PIL import Image
+          root = Path(f"showcase-{os.environ['WORLD_NAME']}")
+          pngs = sorted((root/'maps').glob('*.png'))
+          if not pngs:
+              raise SystemExit('no rendered maps produced')
+          dims = {}
+          for p in pngs:
+              with Image.open(p) as im:
+                  dims[p.name] = list(im.size)
+          (root/'render_dimensions.json').write_text(json.dumps(dims, indent=2), encoding='utf-8')
+          print(json.dumps(dims, indent=2))
+          PY
+
+      - name: Upload complete world
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.world }}-maximal-2048x1024-upscaled-2x
+          path: |
+            showcase-${{ matrix.world }}/
+            showcase-${{ matrix.world }}.yaml
+            showcase-${{ matrix.world }}.log
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 14
