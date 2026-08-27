@@ -5,12 +5,12 @@ from __future__ import annotations
 The legacy climate solver still transports one reference moisture tracer for speed.
 This layer conservatively decomposes that transported condensate flux among every
 chemically/thermodynamically plausible condensate, while also tracking frost,
-evaporation/sublimation potential, and photochemical aerosol deposition.  It is
+evaporation/sublimation potential, and photochemical aerosol deposition. It is
 therefore immediately useful to methane/ethane, CO2, ammonia and mixed-condensable
 worlds without duplicating the expensive circulation solve.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import math
 from typing import Any, Mapping
 
@@ -83,8 +83,6 @@ def _surface_inventory_weights(surface_volatiles: Mapping[str, float] | None) ->
     for raw, value in surface_volatiles.items():
         key = str(raw).strip()
         if key not in CHEMICALS:
-            # Accept common case-insensitive formula spelling without requiring the
-            # thermodynamic registry to know every speculative trace constituent.
             match = next((k for k in CHEMICALS if k.lower() == key.lower()), None)
             if match is None:
                 continue
@@ -100,15 +98,12 @@ def _seasonal_species_propensity(
     monthly_temperature_c: np.ndarray,
     partial_pressure_bar: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return monthly condensation, liquid and solid phase propensity arrays."""
     sp = CHEMICALS[species]
     t_k = np.asarray(monthly_temperature_c, dtype=np.float64) + 273.15
     psat = _approx_saturation_bar(species, t_k)
     ratio = np.zeros_like(t_k)
     finite = np.isfinite(psat) & (psat > 0)
     ratio[finite] = max(float(partial_pressure_bar), 0.0) / np.maximum(psat[finite], 1e-30)
-    # Smooth around saturation because the upstream climate is monthly and
-    # reduced-order rather than resolving cloud-base supersaturation explicitly.
     cond = np.clip((np.log10(np.maximum(ratio, 1e-12)) + 0.70) / 1.10, 0.0, 1.0)
     if sp.triple_or_melting_k is None:
         solid = np.zeros_like(cond)
@@ -143,9 +138,6 @@ def build_volatile_cycle(
     radiation = stellar_radiation_indices(astronomy)
     inventory = _surface_inventory_weights(surface_volatiles)
 
-    # Surface reservoirs increase the persistence of a cycle but cannot manufacture
-    # atmospheric partial pressure from nothing.  We therefore use them as a bounded
-    # weighting bonus after thermodynamic atmospheric eligibility has been checked.
     reservoir_bonus: dict[str, float] = {}
     for key, amount in inventory.items():
         reservoir_bonus[key] = min(2.0, 0.35 * math.log1p(amount * 1e5))
@@ -157,9 +149,12 @@ def build_volatile_cycle(
     monthly_temp = np.asarray(climate.temperature_c, dtype=np.float64)
     monthly_base_precip = np.maximum(np.asarray(climate.precipitation_mm, dtype=np.float64), 0.0)
     annual_base = np.maximum(np.asarray(climate.annual_precipitation_mm, dtype=np.float64), 0.0)
-    humidity = np.clip(np.asarray(climate.humidity_proxy, dtype=np.float64), 0.0, 4.0)
+    humidity_monthly = np.clip(np.asarray(climate.humidity_proxy, dtype=np.float64), 0.0, 4.0)
     if monthly_temp.ndim != 3 or monthly_temp.shape[1:] != grid.shape:
         raise ValueError("climate.temperature_c must have shape [month,height,width]")
+    if humidity_monthly.shape != monthly_temp.shape:
+        raise ValueError("climate.humidity_proxy must match monthly temperature shape")
+    humidity_annual = np.mean(humidity_monthly, axis=0)
 
     eligible = [k for k, v in condensates.items() if v.precipitation_capable and not v.aerosol_only]
     monthly_weights: dict[str, np.ndarray] = {}
@@ -177,10 +172,12 @@ def build_volatile_cycle(
     if monthly_weights:
         stack = np.stack([monthly_weights[k] for k in eligible], axis=0)
         denom = np.sum(stack, axis=0)
-        # Where nothing is locally condensable, no species receives the legacy
-        # transported moisture flux.  This prevents warm methane/CO2 worlds from
-        # inheriting fictitious Earth-like rainfall merely from the base solver.
-        shares = np.divide(stack, denom[None, ...], out=np.zeros_like(stack), where=denom[None, ...] > 1e-12)
+        shares = np.divide(
+            stack,
+            denom[None, ...],
+            out=np.zeros_like(stack),
+            where=denom[None, ...] > 1e-12,
+        )
     else:
         shares = np.zeros((0, *monthly_temp.shape), dtype=np.float64)
 
@@ -194,12 +191,16 @@ def build_volatile_cycle(
         sol_w = phase_solid[key]
         precip_sum = np.sum(monthly_species, axis=0)
         liquid_frac = np.divide(
-            np.sum(monthly_species * liq_w, axis=0), precip_sum,
-            out=np.zeros(grid.shape, dtype=np.float64), where=precip_sum > 1e-12,
+            np.sum(monthly_species * liq_w, axis=0),
+            precip_sum,
+            out=np.zeros(grid.shape, dtype=np.float64),
+            where=precip_sum > 1e-12,
         )
         solid_frac = np.divide(
-            np.sum(monthly_species * sol_w, axis=0), precip_sum,
-            out=np.zeros(grid.shape, dtype=np.float64), where=precip_sum > 1e-12,
+            np.sum(monthly_species * sol_w, axis=0),
+            precip_sum,
+            out=np.zeros(grid.shape, dtype=np.float64),
+            where=precip_sum > 1e-12,
         )
         sp = CHEMICALS[key]
         mean_t_k = np.asarray(climate.annual_temperature_c, dtype=np.float64) + 273.15
@@ -208,14 +209,19 @@ def build_volatile_cycle(
         undersat = np.clip(1.0 - partial / np.maximum(psat, 1e-30), 0.0, 1.0)
         if sp.critical_k is not None:
             undersat *= mean_t_k < sp.critical_k
-        # Evaporation requires a mobile reservoir or at least a configured surface
-        # inventory. Sublimation is favored below the melting/triple temperature.
         reservoir = float(np.clip(reservoir_bonus.get(key, 0.0), 0.0, 2.0))
-        warm = 1.0 if sp.triple_or_melting_k is None else 1.0 / (1.0 + np.exp(-(mean_t_k - sp.triple_or_melting_k) / 3.0))
-        evap = normalize01(undersat * humidity * warm, robust=True) * min(1.0, 0.3 + reservoir)
-        sub = normalize01(undersat * humidity * (1.0 - warm), robust=True) * min(1.0, 0.2 + reservoir)
+        warm = (
+            1.0
+            if sp.triple_or_melting_k is None
+            else 1.0 / (1.0 + np.exp(-(mean_t_k - sp.triple_or_melting_k) / 3.0))
+        )
+        evap = normalize01(undersat * humidity_annual * warm, robust=True) * min(1.0, 0.3 + reservoir)
+        sub = normalize01(undersat * humidity_annual * (1.0 - warm), robust=True) * min(1.0, 0.2 + reservoir)
         frost = normalize01((1.0 - warm) * np.clip(1.0 - undersat, 0.0, 1.0), robust=True)
-        exchange = normalize01(annual_species / np.maximum(annual_base + 1.0, 1.0) + evap + sub, robust=True)
+        exchange = normalize01(
+            annual_species / np.maximum(annual_base + 1.0, 1.0) + evap + sub,
+            robust=True,
+        )
         cycles[key] = SpeciesCycle(
             species=key,
             atmospheric_fraction=float(condensates[key].atmospheric_fraction),
@@ -229,15 +235,19 @@ def build_volatile_cycle(
             sublimation_potential=np.asarray(sub, dtype=np.float32),
             reservoir_exchange_index=exchange.astype(np.float32),
             metadata={
-                "mean_annual_precipitation_mm_equivalent": float(np.sum(annual_species * grid.cell_area_weights)),
-                "global_liquid_precipitation_fraction": float(np.sum(liquid_frac * grid.cell_area_weights)),
-                "global_solid_precipitation_fraction": float(np.sum(solid_frac * grid.cell_area_weights)),
+                "mean_annual_precipitation_mm_equivalent": float(
+                    np.sum(annual_species * grid.cell_area_weights)
+                ),
+                "global_liquid_precipitation_fraction": float(
+                    np.sum(liquid_frac * grid.cell_area_weights)
+                ),
+                "global_solid_precipitation_fraction": float(
+                    np.sum(solid_frac * grid.cell_area_weights)
+                ),
                 "surface_reservoir_weight_bonus": float(reservoir_bonus.get(key, 0.0)),
             },
         )
 
-    # Aerosol formation/deposition uses humidity/precipitation scavenging and a weak
-    # latitude-insolation modulation.  Refractory tholins can also dry-deposit.
     aerosol_products = {k: p for k, p in photochem.items() if p.aerosol or p.deposited}
     aerosol_optical = np.zeros(grid.shape, dtype=np.float64)
     aerosol_dep = np.zeros(grid.shape, dtype=np.float64)
@@ -248,7 +258,10 @@ def build_volatile_cycle(
         production = float(product.production_index)
         source = production * insolation_shape
         if product.aerosol:
-            haze = smooth_periodic(source * (0.55 + 0.45 * humidity), (2.0, 3.5))
+            haze = smooth_periodic(
+                source * (0.55 + 0.45 * humidity_annual),
+                (2.0, 3.5),
+            )
             aerosol_optical += haze
         dry = 0.25 + (0.35 if key == "THOLIN" else 0.10)
         dep = source * (dry + (1.0 - dry) * scavenging)
@@ -262,8 +275,12 @@ def build_volatile_cycle(
         "model": "multicomponent diagnostic volatile cycle decomposed from transported reference-moisture flux",
         "active_precipitating_species": eligible,
         "active_aerosol_or_deposit_species": sorted(aerosol_products),
-        "base_transport_precipitation_global_mean_mm": float(np.sum(annual_base * grid.cell_area_weights)),
-        "resolved_condensate_precipitation_global_mean_mm": float(np.sum(total_precip * grid.cell_area_weights)),
+        "base_transport_precipitation_global_mean_mm": float(
+            np.sum(annual_base * grid.cell_area_weights)
+        ),
+        "resolved_condensate_precipitation_global_mean_mm": float(
+            np.sum(total_precip * grid.cell_area_weights)
+        ),
         "precipitation_partition_conservative": True,
         "limitations": (
             "Species share one precomputed circulation/moisture transport field; latent heats do not yet feed back "
