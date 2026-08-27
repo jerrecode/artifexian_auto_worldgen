@@ -7,6 +7,7 @@ from .grid import SphereGrid, distance_to, normalize01, smooth_periodic
 from .tectonics import TectonicResult
 from .terrain import TerrainResult
 from .noise import hybrid_multifractal, noise_kwargs, OCEAN_BLEND, StaticNoiseFields
+from .ocean_barotropic import build_barotropic_currents
 from .topology import prepare_spherical_bilinear_sampler, apply_bilinear_sampler
 
 
@@ -147,21 +148,37 @@ def build_ocean(grid: SphereGrid, tect: TectonicResult, terrain: TerrainResult, 
             raise ValueError("atmospheric wind arrays must have shape [12,height,width]")
     awu, awv = _normalize_monthly_vectors(awu, awv, ocean)
     fsign = np.sign(np.sin(latr)); fsign[np.abs(grid.lat) < 3.0] = 0.0
-    cu = np.empty_like(awu, dtype=np.float32); cv = np.empty_like(awv, dtype=np.float32); sst_month = np.empty_like(awu, dtype=np.float32)
+    sst_month = np.empty_like(awu, dtype=np.float32)
     base_sst = np.clip(28.5 - 0.32 * np.abs(grid.lat) - 0.0017 * grid.lat ** 2, -2.0, 30.5)
-    smooth_reps = max(1, int(ocfg.current_iterations) // 18)
-    for m in range(12):
-        wu, wv = awu[m], awv[m]; ek_u = -wv * fsign; ek_v = wu * fsign
-        wind_u = 0.55 * wu + ocfg.ekman_strength * ek_u; wind_v = 0.55 * wv + ocfg.ekman_strength * ek_v
-        seasonal = float(np.clip(ocfg.seasonal_current_strength, 0.0, 1.0))
-        u = ((1.0 - 0.55 * seasonal) * base_u + seasonal * ocfg.wind_coupling * wind_u) * ocean
-        v = ((1.0 - 0.55 * seasonal) * base_v + seasonal * ocfg.wind_coupling * wind_v) * ocean
-        for _ in range(smooth_reps):
-            u = smooth_periodic(u, (1.0, 1.45)) * ocean; v = smooth_periodic(v, (1.0, 1.45)) * ocean
-        sp = np.hypot(u, v); ref = float(np.percentile(sp[ocean], 95)) if np.any(ocean) else 1.0
-        u /= max(ref, 1e-9); v /= max(ref, 1e-9)
-        cu[m] = u.astype(np.float32); cv[m] = v.astype(np.float32)
-        sst_month[m] = np.clip(_advect_ocean_heat(grid, base_sst, u, v, ocean, ocfg) * float(ocfg.sst_transport_gain), -7.0, 7.0).astype(np.float32)
+    backend = str(getattr(ocfg, "backend", "fast"))
+    barotropic_diag = None
+
+    if backend == "barotropic":
+        cu, cv, barotropic_diag = build_barotropic_currents(
+            grid, ocean, depth, coast_dist, awu, awv, ocfg
+        )
+        for m in range(12):
+            sst_month[m] = np.clip(
+                _advect_ocean_heat(grid, base_sst, cu[m], cv[m], ocean, ocfg)
+                * float(ocfg.sst_transport_gain),
+                -7.0,
+                7.0,
+            ).astype(np.float32)
+    else:
+        cu = np.empty_like(awu, dtype=np.float32); cv = np.empty_like(awv, dtype=np.float32)
+        smooth_reps = max(1, int(ocfg.current_iterations) // 18)
+        for m in range(12):
+            wu, wv = awu[m], awv[m]; ek_u = -wv * fsign; ek_v = wu * fsign
+            wind_u = 0.55 * wu + ocfg.ekman_strength * ek_u; wind_v = 0.55 * wv + ocfg.ekman_strength * ek_v
+            seasonal = float(np.clip(ocfg.seasonal_current_strength, 0.0, 1.0))
+            u = ((1.0 - 0.55 * seasonal) * base_u + seasonal * ocfg.wind_coupling * wind_u) * ocean
+            v = ((1.0 - 0.55 * seasonal) * base_v + seasonal * ocfg.wind_coupling * wind_v) * ocean
+            for _ in range(smooth_reps):
+                u = smooth_periodic(u, (1.0, 1.45)) * ocean; v = smooth_periodic(v, (1.0, 1.45)) * ocean
+            sp = np.hypot(u, v); ref = float(np.percentile(sp[ocean], 95)) if np.any(ocean) else 1.0
+            u /= max(ref, 1e-9); v /= max(ref, 1e-9)
+            cu[m] = u.astype(np.float32); cv[m] = v.astype(np.float32)
+            sst_month[m] = np.clip(_advect_ocean_heat(grid, base_sst, u, v, ocean, ocfg) * float(ocfg.sst_transport_gain), -7.0, 7.0).astype(np.float32)
 
     u_ann = cu.mean(0); v_ann = cv.mean(0); speed = np.hypot(u_ann, v_ann); sst_anom = sst_month.mean(0)
     heat_transport = normalize01(np.mean(np.hypot(cu, cv) * (np.abs(sst_month) + 0.35), axis=0)) * ocean
@@ -170,15 +187,33 @@ def build_ocean(grid: SphereGrid, tect: TectonicResult, terrain: TerrainResult, 
     up = coast_factor * (0.55 * cold + 0.45 * divergence)
     up += 0.62 * np.exp(-(grid.lat / 5.0) ** 2) * ocean
     up = normalize01(smooth_periodic(up, (1.1, 1.4))).astype(np.float32)
+    if backend == "barotropic":
+        circulation_note = (
+            "12-month reduced-order Sverdrup/Stommel-inspired barotropic streamfunction; "
+            "wind-curl forcing + beta structure + basin boundary envelope + western/eastern "
+            "boundary shaping + bathymetric steering; velocities are rotated spherical "
+            "streamfunction gradients and are non-divergent in the wet interior up to "
+            "discrete coast/pole error"
+        )
+    else:
+        circulation_note = "12-month wind-coupled gyres + Ekman proxy + western/eastern boundary currents + bathymetric steering + iterative mixed-layer heat advection/diffusion"
     meta = {
+        "backend": backend,
         "mean_ocean_depth_m": float(np.average(depth[ocean], weights=grid.cell_area_weights[ocean])) if np.any(ocean) else 0.0,
         "max_ocean_depth_m": float(depth.max()),
         "bathymetry_relation": "depth = young_crust_depth + coefficient*sqrt(age), modified by shelves/trenches/plumes",
-        "circulation": "12-month wind-coupled gyres + Ekman proxy + western/eastern boundary currents + bathymetric steering + iterative mixed-layer heat advection/diffusion",
+        "circulation": circulation_note,
         "noise_model": "shared hybrid multi-type multifractal abyssal/fracture relief",
         "january_current_mean_speed": float(np.average(np.hypot(cu[0], cv[0])[ocean], weights=grid.cell_area_weights[ocean])) if np.any(ocean) else 0.0,
         "july_current_mean_speed": float(np.average(np.hypot(cu[6], cv[6])[ocean], weights=grid.cell_area_weights[ocean])) if np.any(ocean) else 0.0,
     }
+    if barotropic_diag is not None:
+        meta.update({
+            "barotropic_divergence_rms_per_km": float(barotropic_diag.divergence_rms_per_km),
+            "barotropic_interior_divergence_rms_per_km": float(barotropic_diag.interior_divergence_rms_per_km),
+            "barotropic_kinetic_energy_index": float(barotropic_diag.kinetic_energy_index),
+            "barotropic_limitations": "Reduced-order depth-integrated streamfunction model; not a primitive-equation ocean GCM, no explicit vertical momentum or thermohaline overturning solve yet.",
+        })
     return OceanResult(elev.astype(np.float32), depth.astype(np.float32), u_ann.astype(np.float32), v_ann.astype(np.float32),
                        speed.astype(np.float32), sst_anom.astype(np.float32), up, cu, cv, sst_month,
                        heat_transport.astype(np.float32), meta)
