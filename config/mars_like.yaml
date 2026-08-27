@@ -16,9 +16,12 @@ astronomy:
     CO2: 0.953
     N2: 0.027
     Ar: 0.020
+  # Earth-ocean-mass units. The H2O amount is an order-of-magnitude present
+  # exchangeable/polar-ice inventory, so the cold climate should sequester it as ice
+  # instead of constructing an Earth-sized liquid ocean.
   surface_volatiles:
-    H2O: 0.98
-    CO2: 0.02
+    H2O: 0.0037
+    CO2: 1.0e-5
   surface_condensible: H2O
   radiogenic_heat_flux_w_m2: 0.018
   moons:
