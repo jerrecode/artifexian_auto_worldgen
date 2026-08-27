@@ -3,11 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import numpy as np
-from scipy import ndimage
 
 from .config import ResolutionConfig, TectonicsConfig, NoiseConfig
 from .grid import SphereGrid, normalize01, smooth_periodic, distance_to
 from .noise import hybrid_multifractal, noise_kwargs, TECTONIC_BLEND, NoiseBlend
+from .topology import (
+    _map_spherical_lattice_indices,
+    apply_bilinear_sampler,
+    prepare_spherical_bilinear_sampler,
+)
 
 
 @dataclass(slots=True)
@@ -451,18 +455,19 @@ def _deform_plate_ownership(
     )
     rough_static = np.asarray(base_rough if base_rough is not None else _boundary_roughness(sid.shape,rng,noise_cfg,cfg.boundary_detail_octaves),np.float32)
     for it in range(max(0, int(cfg.boundary_deformation_iterations))):
-        sb, intra, cv, dv, tr, cs, ds, ts = _classify_subplate_boundaries(sid, parent, pair_type, pair_strength)
+        sb, intra, cv, dv, tr, cs, ds, ts = _classify_subplate_boundaries(grid, sid, parent, pair_type, pair_strength)
         activity = smooth_periodic(cs + ds + 0.85 * ts + 0.22 * intra.astype(float), (1.15, 1.55))
         # Influence fades into plate interiors over a few hundred km.
         dist = distance_to(sb, grid)
         envelope = np.exp(-dist / (240.0 + 80.0 * it))
-        gy, gx = np.gradient(activity)
+        gy, gx = grid.ops.metric_gradient(activity)
         gn = np.hypot(gx, gy) + 1e-8
         ny, nx = gy / gn, gx / gn
         ty, tx = -nx, ny
-        # Slight iteration-dependent translation decorrelates successive relaxations at negligible cost.
-        wrinkle_y = np.roll(wrinkle_y_base, shift=(2*it,3*it), axis=(0,1))
-        wrinkle_x = np.roll(wrinkle_x_base, shift=(-3*it,2*it), axis=(0,1))
+        # Translate the stationary structural texture through the same spherical
+        # topology used by every other geographic neighborhood operation.
+        wrinkle_y = grid.ops.shift(wrinkle_y_base, -2 * it, -3 * it)
+        wrinkle_x = grid.ops.shift(wrinkle_x_base, 3 * it, -2 * it)
         normal_drive = np.clip(ds - cs, -1.0, 1.0)
         shear_sign = np.tanh(wrinkle_x)
         dy = envelope * (0.42 * wrinkle_y + 0.70 * normal_drive * ny + 0.60 * ts * shear_sign * ty)
@@ -533,19 +538,20 @@ def _pair_motion_matrices(centers: np.ndarray, omega: np.ndarray) -> tuple[np.nd
     return typ, strength
 
 def _classify_subplate_boundaries(
+    grid: SphereGrid,
     sub: np.ndarray,
     parent: np.ndarray,
     pair_type: np.ndarray,
     pair_strength: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Classify 8-neighbor subplate boundaries on the canonical sphere topology."""
     h, w = sub.shape
+    if (h, w) != (grid.height, grid.width):
+        raise ValueError("subplate raster shape must match grid")
     conv = np.zeros((h,w), bool); div = np.zeros_like(conv); trans = np.zeros_like(conv)
     intra = np.zeros_like(conv); allb = np.zeros_like(conv)
     cs = np.zeros((h,w), np.float32); ds = np.zeros_like(cs); ts = np.zeros_like(cs)
-    nbs = [np.roll(sub,1,1), np.roll(sub,-1,1),
-           np.vstack((sub[:1],sub[:-1])), np.vstack((sub[1:],sub[-1:])),
-           np.roll(np.vstack((sub[:1],sub[:-1])),1,1), np.roll(np.vstack((sub[:1],sub[:-1])),-1,1),
-           np.roll(np.vstack((sub[1:],sub[-1:])),1,1), np.roll(np.vstack((sub[1:],sub[-1:])),-1,1)]
+    nbs = [grid.ops.shift(sub, dy, dx) for dy, dx in grid.ops.neighbors8()]
     for nb in nbs:
         diff = sub != nb
         allb |= diff
@@ -561,9 +567,35 @@ def _classify_subplate_boundaries(
 
 
 def _resize(a: np.ndarray, shape: tuple[int,int], order: int = 1) -> np.ndarray:
-    if a.shape == shape: return a
-    z = ndimage.zoom(a, (shape[0]/a.shape[0], shape[1]/a.shape[1]), order=order, mode='nearest', prefilter=False)
-    return z[:shape[0], :shape[1]]
+    """Resize a cell-centered global raster with spherical seam/pole semantics.
+
+    ``order=1`` uses bilinear interpolation whose corner indices are mapped through
+    longitude periodicity and antipodal pole reflection. ``order=0`` uses the same
+    spherical lattice mapping for nearest-neighbor categorical fields.
+    """
+    src = np.asarray(a)
+    if src.ndim != 2:
+        raise ValueError("tectonic raster resize expects a two-dimensional field")
+    target = (int(shape[0]), int(shape[1]))
+    if src.shape == target:
+        return src
+    if target[0] <= 0 or target[1] <= 0:
+        raise ValueError("target shape dimensions must be positive")
+    if int(order) not in (0, 1):
+        raise ValueError("spherical tectonic resize supports only order 0 or 1")
+
+    sh, sw = src.shape
+    th, tw = target
+    sy1 = (np.arange(th, dtype=np.float64) + 0.5) * (sh / th) - 0.5
+    sx1 = (np.arange(tw, dtype=np.float64) + 0.5) * (sw / tw) - 0.5
+    sy, sx = np.broadcast_arrays(sy1[:, None], sx1[None, :])
+    if int(order) == 0:
+        iy = np.floor(sy + 0.5).astype(np.int64)
+        ix = np.floor(sx + 0.5).astype(np.int64)
+        my, mx = _map_spherical_lattice_indices(iy, ix, src.shape)
+        return src[my, mx]
+    sampler = prepare_spherical_bilinear_sampler(sy, sx, src.shape)
+    return apply_bilinear_sampler(src, sampler)
 
 
 def _blob_field(grid: SphereGrid, centers_xyz: np.ndarray, sigmas_deg: np.ndarray, weights: np.ndarray) -> np.ndarray:
@@ -603,7 +635,7 @@ def generate_tectonics(grid: SphereGrid, cfg: TectonicsConfig, res: ResolutionCo
         control_id = _rough_nearest_ids(final_xyz, control_xyz, boundary_rough, rough_amp * 0.82).reshape(grid.height, grid.width)
         sub_id = control_owner[control_id].astype(np.int16)
     plate_id = parent[sub_id]
-    sub_bnd, intra, conv, div, trans, conv_s, div_s, trans_s = _classify_subplate_boundaries(sub_id, parent, pair_type, pair_strength)
+    sub_bnd, intra, conv, div, trans, conv_s, div_s, trans_s = _classify_subplate_boundaries(grid, sub_id, parent, pair_type, pair_strength)
     macro_bnd = conv | div | trans
 
     # Historical deformation is accumulated on a smaller grid then smoothly upsampled. This retains
@@ -622,10 +654,10 @@ def generate_tectonics(grid: SphereGrid, cfg: TectonicsConfig, res: ResolutionCo
     for elapsed, c, par, om in used:
         sid = _rough_nearest_ids(hwxyz, c, hrough, rough_amp).reshape(hh,hw)
         typ, strength = _pair_motion_matrices(c, om)
-        _, intr, cv, dv, tr, cs, ds, ts = _classify_subplate_boundaries(sid, par, typ, strength)
+        _, intr, cv, dv, tr, cs, ds, ts = _classify_subplate_boundaries(hgrid, sid, par, typ, strength)
         age = float(res.history_myr - elapsed)
-        cvz = ndimage.binary_dilation(cv, iterations=2)
-        dvz = ndimage.binary_dilation(dv, iterations=1)
+        cvz = hgrid.ops.binary_dilation(cv, iterations=2)
+        dvz = hgrid.ops.binary_dilation(dv, iterations=1)
         wt = math.exp(-age/420.0)
         pconv += smooth_periodic(cs + 0.18*cvz, (1.0,1.25)).astype(np.float32) * wt
         pdiv += smooth_periodic(ds + 0.18*dvz, (1.0,1.25)).astype(np.float32) * wt
