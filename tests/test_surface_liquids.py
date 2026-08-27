@@ -57,7 +57,11 @@ def test_integrated_volume_matches_solver_for_irregular_spherical_bed():
 
 def test_hot_water_inventory_moves_to_vapor_instead_of_liquid():
     grid = SphereGrid(24, 12)
-    mass = 5e16
+    # The cool 288 K atmosphere can hold about 6.1e16 kg at 65% RH on this
+    # Earth-radius grid, so the inventory must exceed that capacity for a liquid
+    # reservoir to coexist with vapor. At 500 K a one-bar atmosphere can hold much
+    # more vapor, exercising the intended temperature-dependent repartitioning.
+    mass = 5e18
     cool = np.full(grid.shape, 288.0 - 273.15)
     hot = np.full(grid.shape, 500.0 - 273.15)
     p_cool = partition_volatile_inventory(
