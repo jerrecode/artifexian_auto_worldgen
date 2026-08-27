@@ -300,7 +300,7 @@ class WorldPipeline(_base.WorldPipeline):
                 "max_pass_delta_aggradation_m": float(surf.delta_deposition_m.max()),
                 "max_pass_uplift_m": float(surf.tectonic_uplift_m.max()),
                 "flow_refresh_count": int(
-                    surf.metadata.get("flow_refresh_count", cfg.hydrology.surface_evolution_iterations)
+                    surf.metadata.get("flow_refresh_count", c.hydrology.surface_evolution_iterations)
                 ),
             }
             temperature_change = None
