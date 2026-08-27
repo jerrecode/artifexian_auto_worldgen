@@ -20,7 +20,6 @@ from .planetary_physics import (
 G = 6.67430e-11
 M_SUN = 1.98847e30
 R_SUN = 6.957e8
-L_SUN = 3.828e26
 M_EARTH = 5.9722e24
 R_EARTH = 6.371e6
 AU = 1.495978707e11
@@ -72,8 +71,8 @@ def _satellite_hill_radius_km(orbit_km: float, e: float, satellite_mass_earth: f
     return orbit_km * (1 - e) * (satellite_mass_earth / (3.0 * primary_mass_earth)) ** (1 / 3)
 
 
-def _roche_limit_km(radius_earth: float, rho_planet: float, rho_moon: float = 3.34) -> float:
-    return 2.44 * radius_earth * R_EARTH / 1000 * (rho_planet / rho_moon) ** (1 / 3)
+def _roche_limit_km(radius_earth: float, rho_body: float, rho_satellite: float = 3.34) -> float:
+    return 2.44 * radius_earth * R_EARTH / 1000 * (rho_body / max(rho_satellite, 1e-9)) ** (1 / 3)
 
 
 def _spectral_class_from_temp(t: float) -> str:
@@ -125,7 +124,8 @@ def _generate_planetary_system(cfg: AstronomyConfig, home_a: float, star_mass: f
         flux = lum / a**2
         result.append({"index": i, "kind": kind, "semimajor_axis_au": float(a), "mass_earth": float(mass),
                        "radius_earth_approx": float(radius), "orbital_period_earth_years": float(_kepler_years(a, star_mass)),
-                       "stellar_flux_earth": float(flux), "equilibrium_temperature_k_approx": float(278.5 * flux**0.25 * ((1-cfg.albedo)/0.7)**0.25),
+                       "stellar_flux_earth": float(flux),
+                       "equilibrium_temperature_k_approx": float(278.5 * flux**0.25 * ((1-cfg.albedo)/0.7)**0.25),
                        "inside_frost_line": bool(a < frost), "is_home_or_parent_orbit": bool(abs(a-home_a)<1e-9)})
     for i in range(len(result)-1):
         p1,p2=result[i],result[i+1]; a1,a2=p1["semimajor_axis_au"],p2["semimajor_axis_au"]
@@ -152,17 +152,24 @@ def _generate_stellar_neighborhood(cfg: AstronomyConfig, rng: np.random.Generato
 
 def _moon_records(cfg: AstronomyConfig, *, home_radius_earth: float, home_density: float, home_hill_km: float,
                   star_angular_diameter_deg: float, year_local_days: float) -> list[dict]:
-    source = cfg.moons if cfg.moons else [{"name":"Moon","mass_earth":cfg.moon_mass_earth,"orbit_km":cfg.moon_orbit_km}]
-    roche = _roche_limit_km(home_radius_earth, home_density)
-    result=[]
+    # Backward compatibility: old/default legacy planet configs still get the old
+    # single moon. New composition-driven worlds must explicitly list moons; an
+    # empty list therefore genuinely means moonless. Generated moons do not acquire
+    # an accidental legacy submoon.
+    if cfg.moons:
+        source = cfg.moons
+    elif cfg.body_role == "planet" and cfg.greenhouse_model == "legacy":
+        source = [{"name":"Moon","mass_earth":cfg.moon_mass_earth,"orbit_km":cfg.moon_orbit_km}]
+    else:
+        return []
+    roche = _roche_limit_km(home_radius_earth, home_density); result=[]
     for i, raw in enumerate(source):
         mass=float(raw["mass_earth"]); density=float(raw.get("density_g_cm3",3.34)); requested=float(raw["orbit_km"])
         orbit=float(np.clip(requested, roche*1.05, max(roche*1.06,home_hill_km*0.45)))
         mu=G*(cfg.planet_mass_earth+mass)*M_EARTH; sidereal_s=2*math.pi*math.sqrt((orbit*1000)**3/mu)
         sidereal_local=sidereal_s/(cfg.rotation_hours*3600); syn=1.0/max(1e-12,1.0/sidereal_local-1.0/year_local_days)
         radius_earth=(mass*5.514/density)**(1/3); radius_km=radius_earth*R_EARTH/1000
-        angular=math.degrees(2*math.atan2(radius_km,orbit)); ecc=float(raw.get("eccentricity",0.0))
-        k2=float(raw.get("love_number_k2",0.10)); q=float(raw.get("quality_factor_q",100.0))
+        angular=math.degrees(2*math.atan2(radius_km,orbit)); ecc=float(raw.get("eccentricity",0.0)); k2=float(raw.get("love_number_k2",0.10)); q=float(raw.get("quality_factor_q",100.0))
         heat=tidal_heating_flux_w_m2(satellite_radius_earth=radius_earth,primary_mass_earth=cfg.planet_mass_earth,
                                      orbit_km=orbit,eccentricity=ecc,love_number_k2=k2,quality_factor_q=q)
         result.append({"index":i,"name":str(raw.get("name",f"Moon {i+1}")),"mass_earth":mass,"density_g_cm3":density,
@@ -177,9 +184,6 @@ def _moon_records(cfg: AstronomyConfig, *, home_radius_earth: float, home_densit
 def build_astronomy(cfg: AstronomyConfig, rng: np.random.Generator) -> AstronomyResult:
     m=cfg.star_mass_solar; lum=_mass_luminosity(m); rstar=_mass_radius_star(m); temp=5772.0*(lum/rstar**2)**0.25; lifespan_gyr=10.0*m/max(lum,1e-9)
     hz_inner=math.sqrt(lum/1.10); hz_outer=math.sqrt(lum/0.53)
-
-    # For composition greenhouse worlds solve the target-orbit relation through the
-    # grey optical-depth factor rather than subtracting a fixed Kelvin offset.
     if cfg.semimajor_axis_au is None:
         target_k=max(cfg.target_mean_surface_c+273.15,100.0)
         if cfg.greenhouse_model == "composition":
@@ -187,8 +191,7 @@ def build_astronomy(cfg: AstronomyConfig, rng: np.random.Generator) -> Astronomy
             target_teq=target_k/max(surface_unit,1e-6)
         else:
             target_teq=max(target_k-cfg.greenhouse_k,100.0)
-        a=math.sqrt(lum*(1-cfg.albedo)/0.7)*(278.5/target_teq)**2
-        a=float(np.clip(a,hz_inner*1.01,hz_outer*0.99))
+        a=math.sqrt(lum*(1-cfg.albedo)/0.7)*(278.5/target_teq)**2; a=float(np.clip(a,hz_inner*1.01,hz_outer*0.99))
     else:
         a=float(cfg.semimajor_axis_au)
 
@@ -197,11 +200,25 @@ def build_astronomy(cfg: AstronomyConfig, rng: np.random.Generator) -> Astronomy
     rp=_rocky_radius_earth(cfg.planet_mass_earth,cfg.planet_density_g_cm3); gravity_g=cfg.planet_mass_earth/rp**2; gravity=gravity_g*G0
     escape_kms=math.sqrt(2*G*cfg.planet_mass_earth*M_EARTH/(rp*R_EARTH))/1000
 
+    # Pressure/composition determine the hydrostatic atmosphere. A user-specified
+    # geometric thickness is interpreted as an optical path-length modifier rather
+    # than replacing hydrostatic column mass.
+    provisional_atm = atmosphere_diagnostics(composition=cfg.atmosphere,pressure_bar=cfg.atmosphere_pressure_bar,
+                                             temperature_k=max(teq,50.0),gravity_m_s2=gravity)
+    provisional_hydro_thickness = float(provisional_atm["scale_height_km_approx"]) * math.log(
+        cfg.atmosphere_pressure_bar / cfg.atmosphere_top_pressure_bar
+    )
+    if cfg.atmosphere_thickness_km is None:
+        greenhouse_path_factor = 1.0
+    else:
+        greenhouse_path_factor = float(np.clip(cfg.atmosphere_thickness_km / max(provisional_hydro_thickness,1e-6),0.1,10.0))
+
     if cfg.greenhouse_model == "composition":
-        surface_k, greenhouse_terms = composition_greenhouse_temperature_k(teq,cfg.atmosphere,cfg.atmosphere_pressure_bar)
+        surface_k,greenhouse_terms=composition_greenhouse_temperature_k(teq,cfg.atmosphere,cfg.atmosphere_pressure_bar,
+                                                                        path_length_factor=greenhouse_path_factor)
         greenhouse_k=surface_k-teq
     else:
-        surface_k=teq+cfg.greenhouse_k; greenhouse_k=cfg.greenhouse_k; greenhouse_terms={"model":"legacy_fixed_offset","total":None}
+        surface_k=teq+cfg.greenhouse_k; greenhouse_k=cfg.greenhouse_k; greenhouse_terms={"model":"legacy_fixed_offset","total":None,"path_length_factor":1.0}
     mean_t_c=surface_k-273.15
 
     if cfg.body_role == "moon":
@@ -211,7 +228,9 @@ def build_astronomy(cfg: AstronomyConfig, rng: np.random.Generator) -> Astronomy
                  "home_orbit_eccentricity":float(cfg.parent_orbit_eccentricity),"stellar_semimajor_axis_au":a}
         home_tidal=tidal_heating_flux_w_m2(satellite_radius_earth=rp,primary_mass_earth=parent_mass,orbit_km=parent_orbit,
                                            eccentricity=cfg.parent_orbit_eccentricity,love_number_k2=cfg.tidal_love_number_k2,quality_factor_q=cfg.tidal_quality_factor_q)
-        hill=home_hill; roche=_roche_limit_km(rp,cfg.planet_density_g_cm3,float(cfg.parent_body_mass_earth)/max(float(cfg.parent_body_radius_earth)**3,1e-9)*5.514)
+        hill=home_hill
+        parent_density=float(cfg.parent_body_mass_earth)/max(float(cfg.parent_body_radius_earth)**3,1e-9)*5.514
+        roche=_roche_limit_km(rp,cfg.planet_density_g_cm3,parent_density)
     else:
         hill=_hill_radius_km(a,e,cfg.planet_mass_earth,m); roche=_roche_limit_km(rp,cfg.planet_density_g_cm3); home_tidal=0.0
         primary={"type":"star","mass_solar":m,"stellar_semimajor_axis_au":a}
@@ -219,17 +238,16 @@ def build_astronomy(cfg: AstronomyConfig, rng: np.random.Generator) -> Astronomy
     year_local_days=year_earth*365.256*24/cfg.rotation_hours
     star_ang_deg=math.degrees(2*math.atan2(rstar*R_SUN/1000,a*AU/1000))
     moons=_moon_records(cfg,home_radius_earth=rp,home_density=cfg.planet_density_g_cm3,home_hill_km=hill,
-                        star_angular_diameter_deg=star_ang_deg,year_local_days=year_local_days)
-    moon=moons[0] if moons else {}
+                        star_angular_diameter_deg=star_ang_deg,year_local_days=year_local_days); moon=moons[0] if moons else {}
 
     atmosphere=atmosphere_diagnostics(composition=cfg.atmosphere,pressure_bar=cfg.atmosphere_pressure_bar,temperature_k=surface_k,gravity_m_s2=gravity)
-    scale=float(atmosphere["scale_height_km_approx"]); thickness=cfg.atmosphere_thickness_km
-    if thickness is None:
-        thickness=scale*math.log(cfg.atmosphere_pressure_bar/cfg.atmosphere_top_pressure_bar)
-        thickness_source="hydrostatic_scale_height"
+    scale=float(atmosphere["scale_height_km_approx"]); hydro_thickness=scale*math.log(cfg.atmosphere_pressure_bar/cfg.atmosphere_top_pressure_bar)
+    if cfg.atmosphere_thickness_km is None:
+        thickness=hydro_thickness; thickness_source="hydrostatic_scale_height"
     else:
-        thickness_source="configured_override"
-    atmosphere.update({"effective_thickness_km_approx":float(thickness),"thickness_source":thickness_source,
+        thickness=float(cfg.atmosphere_thickness_km); thickness_source="configured_optical_path_override"
+    atmosphere.update({"effective_thickness_km_approx":float(thickness),"hydrostatic_thickness_km_approx":float(hydro_thickness),
+                       "thickness_source":thickness_source,"greenhouse_path_length_factor":float(greenhouse_path_factor),
                        "top_pressure_bar":float(cfg.atmosphere_top_pressure_bar),"greenhouse_model":cfg.greenhouse_model,
                        "greenhouse_temperature_increment_k_approx":float(greenhouse_k),"greenhouse_optical_depth_terms":greenhouse_terms,
                        "thermodynamics_backend":cfg.thermodynamics_backend})
@@ -237,10 +255,12 @@ def build_astronomy(cfg: AstronomyConfig, rng: np.random.Generator) -> Astronomy
     active=select_active_condensible(atmosphere["fractions"],cfg.surface_volatiles,surface_k,cfg.atmosphere_pressure_bar,requested=cfg.surface_condensible)
     phases={}
     for name,inventory in cfg.surface_volatiles.items():
-        key=canonical_species(name); phases[key]={"inventory_weight":float(inventory),"surface_phase_at_global_mean":phase_at(key,surface_k,cfg.atmosphere_pressure_bar,backend=cfg.thermodynamics_backend)}
+        key=canonical_species(name); phases[key]={"inventory_weight":float(inventory),
+            "surface_phase_at_global_mean":phase_at(key,surface_k,cfg.atmosphere_pressure_bar,backend=cfg.thermodynamics_backend)}
     for key,partial in atmosphere["partial_pressures_bar"].items():
         if key in SPECIES:
-            phases.setdefault(key,{})["atmospheric_phase_at_global_mean_partial_pressure"] = phase_at(key,surface_k,float(partial),backend=cfg.thermodynamics_backend)
+            phases.setdefault(key,{})["atmospheric_phase_at_global_mean_partial_pressure"] = phase_at(
+                key,surface_k,float(partial),backend=cfg.thermodynamics_backend)
 
     total_heat=float(cfg.radiogenic_heat_flux_w_m2)+home_tidal
     interior={"radiogenic_heat_flux_w_m2":float(cfg.radiogenic_heat_flux_w_m2),"tidal_heating_flux_w_m2":float(home_tidal),
