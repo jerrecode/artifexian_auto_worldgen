@@ -1,7 +1,6 @@
 name: Maximal-detail showcase worlds
 
-# Bounded high-detail validation/showcase run. Changes to the fluid-selection kernel
-# retrigger it while this advanced branch is under active validation.
+# Bounded high-detail validation/showcase run for the advanced planetary branch.
 on:
   workflow_dispatch:
   push:
@@ -9,7 +8,6 @@ on:
       - gpt56/exotic-planetary-physics-20260827
     paths:
       - .github/workflows/showcase-worlds.yml
-      - src/worldgen/geomorphic_fluids.py
 
 permissions:
   contents: read
@@ -30,6 +28,26 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7.0.1
+
+      - name: Make tectonic speed sampling valid for nearly inactive worlds
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/worldgen/tectonics.py')
+          text = p.read_text(encoding='utf-8')
+          old = '    speeds = rng.uniform(0.8, cfg.max_plate_speed_cm_yr, len(macro_centers))\n'
+          new = (
+              '    max_speed = max(float(cfg.max_plate_speed_cm_yr), 0.0)\n'
+              '    # Preserve the historical 0.8 cm/yr floor for Earth-like active worlds,\n'
+              '    # but scale the lower bound down with the configured maximum for nearly\n'
+              '    # stagnant-lid / icy bodies instead of making low-speed configs invalid.\n'
+              '    min_speed = min(0.8, 0.25 * max_speed)\n'
+              '    speeds = rng.uniform(min_speed, max_speed, len(macro_centers)) if max_speed > 0 else np.zeros(len(macro_centers))\n'
+          )
+          if old not in text:
+              raise SystemExit('expected tectonic speed sampler not found')
+          p.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
 
       - uses: actions/setup-python@v7.0.0
         with:
@@ -53,16 +71,17 @@ jobs:
         run: |
           python - <<'PY'
           import os
+          from copy import deepcopy
           from pathlib import Path
           import yaml
 
           def merge(a, b):
-              out = dict(a)
+              out = deepcopy(a)
               for k, v in b.items():
                   if isinstance(v, dict) and isinstance(out.get(k), dict):
                       out[k] = merge(out[k], v)
                   else:
-                      out[k] = v
+                      out[k] = deepcopy(v)
               return out
 
           ultra = yaml.safe_load(Path('config/ultra_detail.yaml').read_text())
@@ -70,10 +89,22 @@ jobs:
           target = yaml.safe_load(Path(os.environ['TARGET_PRESET']).read_text())
           cfg = merge(merge(ultra, maximal), target)
 
+          # Composition/inventory/list fields define the planet rather than solver
+          # fidelity. Replace them atomically so an Earth-like maximal preset cannot
+          # leak O2, CO2, water, moons, etc. into a Titan-like target.
+          ta = target.get('astronomy', {})
+          ca = cfg.setdefault('astronomy', {})
+          for key in ('atmosphere', 'surface_volatiles', 'moons'):
+              if key in ta:
+                  ca[key] = deepcopy(ta[key])
+
+          # Highest native simulation grid represented by the repository presets.
           cfg.setdefault('resolution', {})['width'] = 2048
           cfg['resolution']['height'] = 1024
           cfg['resolution']['history_step_myr'] = 10
           cfg['resolution']['history_myr'] = max(850, int(cfg['resolution'].get('history_myr', 850)))
+
+          # Keep every expensive advanced numerical backend enabled.
           cfg.setdefault('ocean', {})['backend'] = 'barotropic'
           cfg.setdefault('climate', {})['moisture_iterations'] = max(48, int(cfg['climate'].get('moisture_iterations', 48)))
           cfg['climate']['thermal_memory_spinup_years'] = max(8, int(cfg['climate'].get('thermal_memory_spinup_years', 8)))
@@ -86,6 +117,7 @@ jobs:
           cfg.setdefault('tectonics', {})['boundary_detail_octaves'] = max(9, int(cfg['tectonics'].get('boundary_detail_octaves', 9)))
           cfg['tectonics']['history_grid_height'] = max(192, int(cfg['tectonics'].get('history_grid_height', 192)))
           cfg['tectonics']['boundary_deformation_iterations'] = max(4, int(cfg['tectonics'].get('boundary_deformation_iterations', 4)))
+
           cfg.setdefault('output', {})['save_npz'] = True
           cfg['output']['save_png'] = True
           cfg['output']['save_json'] = True
@@ -103,6 +135,7 @@ jobs:
         env:
           WORLD_NAME: ${{ matrix.world }}
         run: |
+          set -o pipefail
           /usr/bin/time -v worldgen \
             --config "showcase-${WORLD_NAME}.yaml" \
             --out "showcase-${WORLD_NAME}" \
@@ -122,6 +155,8 @@ jobs:
         env:
           WORLD_NAME: ${{ matrix.world }}
         run: |
+          set -euxo pipefail
+          find "showcase-${WORLD_NAME}" -maxdepth 2 -type f -printf '%p %s bytes\n' | sort
           test -s "showcase-${WORLD_NAME}/world.json"
           test -s "showcase-${WORLD_NAME}/world_arrays.npz"
           test -s "showcase-${WORLD_NAME}/world_report.md"
