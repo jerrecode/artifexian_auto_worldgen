@@ -4,6 +4,9 @@ import numpy as np
 
 from worldgen.diagnostics import array_digest, receiver_graph_is_acyclic
 from worldgen.grid import SphereGrid, distance_to
+from worldgen.society import _land_components
+from worldgen.tectonics import _classify_subplate_boundaries
+from worldgen.topology import spherical_resize
 from worldgen.weather import _large_land_mask
 
 
@@ -34,6 +37,15 @@ class SphericalTopologyTests(unittest.TestCase):
         labels, n = grid.ops.connected_components(mask)
         self.assertEqual(n, 1)
         self.assertEqual(int(labels[13, 0]), int(labels[13, -1]))
+
+    def test_connected_components_merge_across_pole(self):
+        grid = SphereGrid(64, 32)
+        mask = np.zeros((32, 64), dtype=bool)
+        mask[0, 3] = True
+        mask[0, 35] = True
+        labels = _land_components(mask, grid)
+        self.assertNotEqual(int(labels[0, 3]), 0)
+        self.assertEqual(int(labels[0, 3]), int(labels[0, 35]))
 
     def test_grey_dilation_wraps_longitude_seam(self):
         grid = SphereGrid(64, 32)
@@ -69,6 +81,28 @@ class SphericalTopologyTests(unittest.TestCase):
         gy, gx = grid.ops.metric_gradient(field)
         self.assertTrue(np.isfinite(gy).all())
         self.assertTrue(np.isfinite(gx).all())
+
+    def test_spherical_resize_tracks_latitude_field_near_poles(self):
+        coarse = SphereGrid(32, 16)
+        fine = SphereGrid(128, 64)
+        field = np.sin(np.deg2rad(coarse.lat))
+        resized = spherical_resize(field, (64, 128), order=1)
+        expected = np.sin(np.deg2rad(fine.lat))
+        self.assertLess(float(np.max(np.abs(resized - expected))), 0.02)
+        self.assertTrue(np.isfinite(resized).all())
+
+    def test_tectonic_boundary_classification_crosses_pole(self):
+        grid = SphereGrid(8, 4)
+        sub = np.zeros((4, 8), dtype=np.int16)
+        sub[0, 4] = 1
+        parent = np.array([0, 1], dtype=np.int16)
+        pair_type = np.zeros((2, 2), dtype=np.int8)
+        pair_strength = np.ones((2, 2), dtype=np.float32)
+        boundary, _, _, _, transform, *_ = _classify_subplate_boundaries(
+            grid, sub, parent, pair_type, pair_strength
+        )
+        self.assertTrue(boundary[0, 0])
+        self.assertTrue(transform[0, 0])
 
     def test_receiver_cycle_detection(self):
         self.assertTrue(receiver_graph_is_acyclic(np.array([-1, 0, 1, 2], dtype=np.int32)))

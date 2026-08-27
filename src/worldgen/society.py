@@ -2,7 +2,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import numpy as np
-from scipy import ndimage
 
 from .config import SocietyConfig
 from .grid import SphereGrid, distance_to, normalize01
@@ -51,31 +50,10 @@ def _weighted_pick_separated(
 
 
 
-def _land_components_wrap(land: np.ndarray) -> np.ndarray:
-    """8-connected land components with explicit longitude-seam merging."""
-    labels, n = ndimage.label(land, structure=np.ones((3, 3), dtype=np.int8))
-    if n <= 1:
-        return labels.astype(np.int32)
-    parent = np.arange(n + 1, dtype=np.int32)
-    def find(a: int) -> int:
-        while parent[a] != a:
-            parent[a] = parent[parent[a]]; a = int(parent[a])
-        return a
-    def union(a: int, b: int) -> None:
-        if a == 0 or b == 0: return
-        ra, rb = find(a), find(b)
-        if ra != rb: parent[rb] = ra
-    h, w = land.shape
-    for y in range(h):
-        for yy in (max(0, y-1), y, min(h-1, y+1)):
-            if land[y, 0] and land[yy, w-1]: union(int(labels[y,0]), int(labels[yy,w-1]))
-    roots = np.array([find(i) for i in range(n+1)], dtype=np.int32)
-    rel = roots[labels]
-    vals = sorted(v for v in np.unique(rel) if v != 0)
-    mp = {v:i+1 for i,v in enumerate(vals)}
-    out = np.zeros_like(rel, dtype=np.int32)
-    for old,new in mp.items(): out[rel==old] = new
-    return out
+def _land_components(land: np.ndarray, grid: SphereGrid) -> np.ndarray:
+    """Return canonical spherical 8-connected land-component labels."""
+    labels, _ = grid.ops.connected_components(land)
+    return labels
 
 
 def _causal_settlement_sites(
@@ -95,7 +73,7 @@ def _causal_settlement_sites(
     seen=set(); candidates=[p for p in candidates if not (p in seen or seen.add(p))]
     if len(candidates) <= count:
         selected = candidates
-        comp = _land_components_wrap(terrain.land)
+        comp = _land_components(terrain.land, grid)
         effort=np.arange(len(selected),dtype=float)
         lm=np.array([int(comp[y,x]) for y,x in selected],dtype=np.int32)
         return selected,effort,lm
@@ -103,7 +81,7 @@ def _causal_settlement_sites(
     ys=np.array([p[0] for p in candidates],dtype=np.int32)
     xs=np.array([p[1] for p in candidates],dtype=np.int32)
     n=len(candidates)
-    comp_map=_land_components_wrap(terrain.land)
+    comp_map=_land_components(terrain.land, grid)
     comps=comp_map[ys,xs]
     river_dist=distance_to(hydro.rivers | hydro.lakes, grid)
     coast_dist=distance_to(terrain.ocean, grid)

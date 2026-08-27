@@ -1,7 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
-from scipy import ndimage
 
 from .grid import SphereGrid, distance_to, normalize01, smooth_periodic
 from .tectonics import TectonicResult
@@ -65,7 +64,7 @@ def build_geology(
         )
     stable = (tect.paleo_convergence < 0.18) & (tect.paleo_divergence < 0.18) & tect.continental_crust
     # Large connected stable interiors are cratonic nuclei.
-    craton = ndimage.binary_opening(stable, iterations=2)
+    craton = grid.ops.binary_opening(stable, iterations=2)
     old_low = tect.orogen_age_myr > 450
     shield = craton & old_low & (terrain.elevation_km > 0.25)
     platform = craton & ~shield

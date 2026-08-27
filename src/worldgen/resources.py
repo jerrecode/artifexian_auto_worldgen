@@ -1,7 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
-from scipy import ndimage
 
 from .config import ResourcesConfig
 from .grid import SphereGrid, distance_to, normalize01, smooth_periodic
@@ -202,7 +201,7 @@ def build_resources(
                              (0.35 + 0.30 * normalize01(climate.annual_precipitation_mm) + 0.75 * depositional))
 
     # Salt.
-    coast_land = terrain.land & ndimage.binary_dilation(terrain.ocean, iterations=2)
+    coast_land = terrain.land & grid.ops.binary_dilation(terrain.ocean, iterations=2)
     fuel = wood | peat | (coal > .22)
     sea_salt = coast_land & (arid | fuel)
     depression = hydro.lakes | ((terrain.lowland_strength > 0) & (hydro.filled_elevation_km - ocean.elevation_km > .005))

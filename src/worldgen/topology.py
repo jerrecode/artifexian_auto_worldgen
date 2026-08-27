@@ -246,11 +246,49 @@ def geodesic_distance_to(
     return out
 
 
+def spherical_resize(
+    values: np.ndarray,
+    shape: tuple[int, int],
+    *,
+    order: Literal[0, 1] = 1,
+) -> np.ndarray:
+    """Resize a global equirectangular field with spherical boundary semantics.
+
+    Source and destination locations are pixel centres spanning the same sphere.
+    Longitude is periodic and interpolation corners crossing a pole receive the
+    required reflection and half-world longitude rotation.
+    """
+    a = np.asarray(values)
+    if a.ndim != 2:
+        raise ValueError("spherical_resize currently requires a 2-D field")
+    dst_h, dst_w = map(int, shape)
+    if dst_h <= 0 or dst_w <= 0:
+        raise ValueError("destination shape dimensions must be positive")
+    if a.shape == (dst_h, dst_w):
+        return a.copy()
+    if order not in (0, 1):
+        raise ValueError("spherical_resize order must be 0 or 1")
+
+    src_h, src_w = a.shape
+    src_y = (np.arange(dst_h, dtype=np.float64) + 0.5) * src_h / dst_h - 0.5
+    src_x = (np.arange(dst_w, dtype=np.float64) + 0.5) * src_w / dst_w - 0.5
+    sy, sx = np.meshgrid(src_y, src_x, indexing="ij")
+    if order == 0:
+        yy = np.floor(sy + 0.5).astype(np.int64)
+        xx = np.floor(sx + 0.5).astype(np.int64)
+        yy, xx = _map_spherical_lattice_indices(yy, xx, a.shape)
+        return a[yy, xx]
+    return apply_bilinear_sampler(
+        a, prepare_spherical_bilinear_sampler(sy, sx, a.shape)
+    )
+
+
 __all__ = [
     "SphericalRasterOps",
     "prepare_spherical_bilinear_sampler",
     "apply_bilinear_sampler",
     "spherical_gaussian_filter",
     "geodesic_distance_to",
+    "spherical_resize",
     "_map_spherical_lattice_indices",
 ]
