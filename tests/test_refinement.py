@@ -10,7 +10,7 @@ from worldgen.refinement import RefinementEngine, RefinementSpec
 from worldgen.topology import spherical_resize
 
 
-def _write_base_world(root, *, seed: int = 12345):
+def _write_base_world(root, *, seed: int = 12345, elevation_offset: float = 0.0):
     h, w = 8, 16
     lat = 90.0 - (np.arange(h) + 0.5) * 180.0 / h
     lon = -180.0 + (np.arange(w) + 0.5) * 360.0 / w
@@ -19,6 +19,7 @@ def _write_base_world(root, *, seed: int = 12345):
         1.4 * np.sin(2.0 * np.pi * xx / w)
         + 0.7 * np.cos(np.pi * (yy + 0.5) / h)
         - 0.2
+        + elevation_offset
     ).astype(np.float32)
     temp = (24.0 - 0.45 * np.abs(lat)[:, None] + 0.2 * np.cos(2.0 * np.pi * xx / w)).astype(np.float32)
     plate = ((xx // 4 + yy // 3) % 5).astype(np.int16)
@@ -129,6 +130,62 @@ def test_interrupted_refinement_reuses_completed_atomic_node_fields(tmp_path):
     result = RefinementEngine(tmp_path, spec=spec, resume=True).refine(1)
     assert result["deepest_complete_level"] == 1
     assert completed.stat().st_mtime_ns == before
+
+
+def test_interrupted_depth_rejects_changed_refinement_spec_on_resume(tmp_path):
+    _write_base_world(tmp_path)
+    original = RefinementSpec(
+        scale=2,
+        sections_y=2,
+        sections_x=2,
+        halo_cells=2,
+        elevation_detail_strength=0.0,
+        keep_sections=True,
+    )
+    interrupted = False
+
+    def stop_after_first(event):
+        nonlocal interrupted
+        if event.get("event") == "field_done" and not interrupted:
+            interrupted = True
+            raise RuntimeError("stop")
+
+    with pytest.raises(RuntimeError, match="stop"):
+        RefinementEngine(tmp_path, spec=original, progress=stop_after_first).refine(1)
+
+    changed = RefinementSpec(
+        scale=3,
+        sections_y=2,
+        sections_x=2,
+        halo_cells=4,
+        elevation_detail_strength=0.0,
+        keep_sections=True,
+    )
+    with pytest.raises(RuntimeError, match="different parent/specification"):
+        RefinementEngine(tmp_path, spec=changed, resume=True).refine(1)
+
+    rebuilt = RefinementEngine(tmp_path, spec=changed, resume=False).refine(1)
+    assert rebuilt["deepest_complete_level"] == 1
+    assert rebuilt["levels"]["1"]["resolution"] == [48, 24]
+
+
+def test_changed_base_world_invalidates_existing_refinement_provenance(tmp_path):
+    _write_base_world(tmp_path, seed=99)
+    spec = RefinementSpec(scale=2, sections_y=2, sections_x=2, elevation_detail_strength=0.0)
+    first = RefinementEngine(tmp_path, spec=spec).refine(1)
+    assert first["deepest_complete_level"] == 1
+
+    time.sleep(0.01)
+    _write_base_world(tmp_path, seed=99, elevation_offset=0.125)
+    with pytest.raises(RuntimeError, match="world_arrays.npz changed"):
+        RefinementEngine(tmp_path, spec=spec, resume=True).refine(1)
+
+    rebuilt = RefinementEngine(tmp_path, spec=spec, resume=False).refine(1)
+    assert rebuilt["deepest_complete_level"] == 1
+    level0 = json.loads(
+        (tmp_path / "refinement" / "levels" / "level_0000" / "index.json").read_text(encoding="utf-8")
+    )
+    assert level0["source_fingerprint"]["sha256"]
 
 
 def test_deterministic_spherical_detail_is_independent_of_section_partition(tmp_path):
