@@ -50,13 +50,7 @@ class ExoticGeomorphologyResult:
 
 
 def _screening_fluid_properties(species: str) -> tuple[float, float, float]:
-    """Return screening-grade liquid density, viscosity and surface tension.
-
-    This fallback is used when a volatile is hydrologically active but the current
-    global surface-liquid equilibrium contains no mobile sea. That is physically
-    distinct from saying the world is a water world: episodic rain/runoff can still
-    be methane-, ethane-, CO2-, etc. dominated even when standing liquid is absent.
-    """
+    """Return screening-grade liquid density, viscosity and surface tension."""
     sp = CHEMICALS.get(species)
     if sp is None:
         return 997.0, 1.0, 72.0
@@ -66,15 +60,34 @@ def _screening_fluid_properties(species: str) -> tuple[float, float, float]:
     return max(rho, 30.0), max(mu, 0.01), max(sigma, 1.0)
 
 
-def _volatile_cycle_reference_fluid(volatile_cycle: Any | None) -> str | None:
-    """Choose the bulk channel-forming condensate, not merely the strongest trace rain.
+def _bulk_surface_inventory_reference_fluid(astronomy: Any) -> str | None:
+    """Return the dominant configured hydrologic surface volatile, if any.
 
-    Photochemical nitriles and organics such as HCN may condense efficiently on a
-    Titan-like world, but they should not displace methane/ethane as the geomorphic
-    working fluid when a hydrocarbon surface reservoir/cycle exists. Preference is
-    therefore given to explicit surface-reservoir cycles and species whose chemistry
-    roles identify them as ocean/hydrology fluids; trace condensates remain deposits.
+    Astronomy records configured surface-volatiles in volatile_chemistry even when
+    the current equilibrium temporarily puts all of that inventory into frost/vapor
+    or when a monthly climate sample has no precipitation.  This makes it the right
+    source for long-term geomorphic fluid identity on episodic worlds like Titan.
     """
+    volatile = getattr(astronomy, "volatile_chemistry", {}) or {}
+    phases = volatile.get("surface_and_atmospheric_phases", {}) or {}
+    candidates: list[tuple[float, str]] = []
+    for key, record in phases.items():
+        if key not in CHEMICALS or not isinstance(record, dict):
+            continue
+        amount = max(float(record.get("inventory_weight", 0.0) or 0.0), 0.0)
+        if amount <= 0.0:
+            continue
+        roles = set(CHEMICALS[key].roles)
+        # A configured bulk condensable can shape terrain even if the registry does
+        # not use the literal "hydrology" role (e.g. CO2/NH3 cryogenic cases), but
+        # strongly prefer known ocean/hydrology fluids when several are configured.
+        role_factor = 4.0 if roles.intersection({"hydrology", "ocean", "ocean_minor"}) else 1.0
+        candidates.append((role_factor * amount, key))
+    return max(candidates)[1] if candidates else None
+
+
+def _volatile_cycle_reference_fluid(volatile_cycle: Any | None) -> str | None:
+    """Choose the bulk channel-forming condensate, not merely the strongest trace rain."""
     if volatile_cycle is None:
         return None
     cycles = getattr(volatile_cycle, "species", {}) or {}
@@ -140,9 +153,15 @@ def build_geomorphic_fluid_parameters(
         sigma = max(float(exotic_ocean.surface_tension_mn_m), 1.0)
         selection_source = "mobile_surface_liquid_mixture"
     else:
-        active = _volatile_cycle_reference_fluid(volatile_cycle) or "H2O"
+        inventory_active = _bulk_surface_inventory_reference_fluid(astronomy)
+        active = inventory_active or _volatile_cycle_reference_fluid(volatile_cycle) or "H2O"
         rho, mu, sigma = _screening_fluid_properties(active)
-        selection_source = "active_precipitating_volatile" if active != "H2O" else "water_reference_fallback"
+        if inventory_active is not None:
+            selection_source = "configured_bulk_surface_volatile"
+        elif active != "H2O":
+            selection_source = "active_precipitating_volatile"
+        else:
+            selection_source = "water_reference_fallback"
 
     density_term = (rho / 997.0) ** 0.55
     gravity_term = (gravity / 9.80665) ** 0.45
