@@ -20,9 +20,11 @@ astronomy:
   atmosphere:
     N2: 0.95
     CH4: 0.05
+  # Dynamic surface-liquid inventory in modern-Earth ocean masses.  The total
+  # corresponds to order 10^4 km3 of exposed hydrocarbons, not a global ocean.
   surface_volatiles:
-    CH4: 0.70
-    C2H6: 0.30
+    CH4: 8.0e-6
+    C2H6: 4.0e-6
   surface_condensible: CH4
   tidal_love_number_k2: 0.6
   tidal_quality_factor_q: 100.0
