@@ -1,0 +1,51 @@
+name: Extract showcase maps
+
+on:
+  push:
+    branches:
+      - gpt56/exotic-planetary-physics-20260827
+    paths:
+      - .github/workflows/extract-showcase-maps.yml
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download original showcase artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euxo pipefail
+          gh api -H 'Accept: application/vnd.github+json' \
+            "/repos/${REPO}/actions/artifacts/9660536973/zip" > /tmp/super-earth.zip
+          gh api -H 'Accept: application/vnd.github+json' \
+            "/repos/${REPO}/actions/artifacts/9660371405/zip" > /tmp/titan-like.zip
+
+      - name: Extract only heightmaps and true-color maps
+        run: |
+          set -euxo pipefail
+          mkdir -p selected-maps/super-earth selected-maps/titan-like
+          unzip -j /tmp/super-earth.zip \
+            'showcase-super-earth/maps/02b_height_grayscale_16bit.png' \
+            'showcase-super-earth/maps/15_true_color.png' \
+            -d selected-maps/super-earth
+          unzip -j /tmp/titan-like.zip \
+            'showcase-titan-like/maps/02b_height_grayscale_16bit.png' \
+            'showcase-titan-like/maps/15_true_color.png' \
+            -d selected-maps/titan-like
+          find selected-maps -type f -printf '%p %s bytes\n' | sort
+
+      - name: Upload four selected maps
+        uses: actions/upload-artifact@v4
+        with:
+          name: super-earth-and-titan-selected-maps
+          path: selected-maps/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

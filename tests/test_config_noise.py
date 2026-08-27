@@ -12,7 +12,14 @@ from worldgen.noise import (
 
 class ConfigAndNoiseTests(unittest.TestCase):
     def test_default_config_validates(self):
-        self.assertIsInstance(WorldConfig().validate(), WorldConfig)
+        cfg = WorldConfig().validate()
+        self.assertIsInstance(cfg, WorldConfig)
+        self.assertEqual(cfg.ocean.backend, "fast")
+
+    def test_barotropic_ocean_backend_validates(self):
+        cfg = WorldConfig()
+        cfg.ocean.backend = "barotropic"
+        self.assertEqual(cfg.validate().ocean.backend, "barotropic")
 
     def test_invalid_config_is_rejected(self):
         cfg = WorldConfig()
@@ -27,6 +34,11 @@ class ConfigAndNoiseTests(unittest.TestCase):
 
         cfg = WorldConfig()
         cfg.hydrology.flow_refresh_interval = 0
+        with self.assertRaises(ValueError):
+            cfg.validate()
+
+        cfg = WorldConfig()
+        cfg.ocean.backend = "primitive_equations_magic"
         with self.assertRaises(ValueError):
             cfg.validate()
 

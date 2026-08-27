@@ -1,0 +1,41 @@
+seed: 20260830
+astronomy:
+  star_mass_solar: 1.0
+  body_role: moon
+  parent_body_mass_earth: 317.8
+  parent_body_radius_earth: 11.21
+  parent_orbit_km: 421700.0
+  parent_orbit_eccentricity: 0.0041
+  planet_mass_earth: 0.0150
+  planet_density_g_cm3: 3.53
+  semimajor_axis_au: 5.20
+  eccentricity: 0.0489
+  axial_tilt_deg: 0.1
+  rotation_hours: 42.46
+  albedo: 0.63
+  greenhouse_model: composition
+  thermodynamics_backend: auto
+  atmosphere_pressure_bar: 1.0e-7
+  atmosphere_top_pressure_bar: 1.0e-12
+  atmosphere:
+    SO2: 1.0
+  surface_volatiles:
+    SO2: 1.0
+  surface_condensible: SO2
+  tidal_love_number_k2: 0.30
+  tidal_quality_factor_q: 100.0
+  radiogenic_heat_flux_w_m2: 0.010
+  moons: []
+tectonics:
+  continental_fraction_target: 0.999
+  geological_activity_mode: tidal
+  activity_strength: 2.5
+  max_plate_speed_cm_yr: 12.0
+  hotspot_count: 80
+  ice_geology_mode: inactive
+climate:
+  condensible_species: SO2
+  precip_scale_mm_year: 10.0
+  phase_coupled_evaporation: true
+society:
+  enabled: false

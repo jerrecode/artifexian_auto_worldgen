@@ -70,6 +70,7 @@ terrain:
   coastal_reworking_band_km: 0.22
   min_island_area_km2: 1100.0
 ocean:
+  backend: barotropic
   young_crust_depth_m: 2600.0
   subsidence_sqrt_m_per_sqrt_myr: 350.0
   max_abyss_depth_m: 6200.0

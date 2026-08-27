@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "artifexian-auto-worldgen"
-version = "0.4.0"
-description = "Hierarchical tectonic, climate, fluvial landscape-evolution and worldbuilding generator reconstructed from Artifexian Worldbuilder's Log workflows."
+version = "0.5.0"
+description = "Hierarchical tectonic, climate, volatile-cycle, cryogeology, fluvial landscape-evolution and worldbuilding generator reconstructed from Artifexian Worldbuilder's Log workflows."
 license = "MIT"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -31,6 +31,9 @@ storage = [
   "zarr>=3.0",
   "numcodecs>=0.16",
   "h5py>=3.11",
+]
+thermodynamics = [
+  "CoolProp>=7.0",
 ]
 render = [
   "Pillow>=10.4",

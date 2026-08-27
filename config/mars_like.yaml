@@ -1,0 +1,48 @@
+seed: 20260827
+astronomy:
+  star_mass_solar: 1.0
+  planet_mass_earth: 0.1074
+  planet_density_g_cm3: 3.93
+  semimajor_axis_au: 1.524
+  eccentricity: 0.0934
+  axial_tilt_deg: 25.19
+  rotation_hours: 24.62
+  albedo: 0.25
+  greenhouse_model: composition
+  thermodynamics_backend: auto
+  atmosphere_pressure_bar: 0.00636
+  atmosphere_top_pressure_bar: 1.0e-8
+  atmosphere:
+    CO2: 0.953
+    N2: 0.027
+    Ar: 0.020
+  # Earth-ocean-mass units. The H2O amount is an order-of-magnitude present
+  # exchangeable/polar-ice inventory, so the cold climate should sequester it as ice
+  # instead of constructing an Earth-sized liquid ocean.
+  surface_volatiles:
+    H2O: 0.0037
+    CO2: 1.0e-5
+  surface_condensible: H2O
+  radiogenic_heat_flux_w_m2: 0.018
+  moons:
+    - name: Phobos-like
+      mass_earth: 1.8e-9
+      orbit_km: 9376
+    - name: Deimos-like
+      mass_earth: 2.5e-10
+      orbit_km: 23463
+tectonics:
+  continental_fraction_target: 0.99
+  geological_activity_mode: stagnant_lid
+  activity_strength: 0.08
+  max_plate_speed_cm_yr: 0.08
+  hotspot_count: 3
+  ice_geology_mode: inactive
+climate:
+  condensible_species: H2O
+  precip_scale_mm_year: 45.0
+  phase_coupled_evaporation: true
+ocean:
+  fluid_species: H2O
+society:
+  enabled: false

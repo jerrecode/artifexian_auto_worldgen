@@ -13,9 +13,10 @@ pip install 'artifexian-auto-worldgen[performance]'
 pip install 'artifexian-auto-worldgen[jit]'
 pip install 'artifexian-auto-worldgen[storage]'
 pip install 'artifexian-auto-worldgen[render]'
+pip install 'artifexian-auto-worldgen[thermodynamics]'
 ```
 
-`performance` provides NumExpr, Bottleneck, psutil, threadpoolctl and joblib. `jit` adds Numba. `storage` provides Zarr/HDF5 dependencies for optional storage work while the built-in random-access store requires only NumPy and SQLite. `render` adds Pillow for post-render resampling.
+`performance` provides NumExpr, Bottleneck, psutil, threadpoolctl and joblib. `jit` adds Numba. `storage` provides Zarr/HDF5 dependencies for optional storage work while the built-in random-access store requires only NumPy and SQLite. `render` adds Pillow for post-render resampling. `thermodynamics` adds CoolProp for higher-quality scalar pure-fluid properties used by the composition/surface-liquid path when available.
 
 Priority-Flood and sequential drainage-graph kernels have dedicated Numba-capable implementations. The reference Priority-Flood backend remains available for semantic regression testing.
 
@@ -32,6 +33,25 @@ python -m worldgen.benchmarks --profile high --skip-world --output kernels-high.
 Profiles are `micro` (128x64), `quick` (256x128), `normal` (768x384), and `high` (1536x768). The JSON records environment/backend availability, wall and CPU time, peak/current RSS when available, Priority-Flood reference/accelerated equivalence and speedup, drainage-graph construction/accumulation timings, and optional complete-world stage timings/cache statistics.
 
 Absolute timing thresholds are intentionally not hard-coded into ordinary CI because shared runners are noisy. Correctness tests verify benchmark contracts and numerical equivalence; benchmark JSON is intended for before/after comparisons and dedicated regression analysis.
+
+### Fidelity-tier cost model
+
+The selectable model hierarchy is intentionally asymmetric:
+
+| Layer/backend | Default cost character | Main scaling term |
+|---|---:|---|
+| `ocean.backend: fast` | low/moderate | monthly local/vectorized current fields + heat iterations |
+| `ocean.backend: barotropic` | moderate/high | 12 reduced-order basin streamfunction/current solves |
+| conserved surface-liquid equilibrium | moderate | one `O(N log N)` bed sort per volatile-level solve plus short climate/ocean fixed point |
+| multicomponent volatile-cycle diagnostics | low/moderate | `O(SMN)` for `S` eligible species, `M=12` months and `N` cells |
+| exotic-ocean state | low | vectorized `O(N)` diagnostics after liquid partition |
+| automatic geodynamics | negligible | global scalar diagnostics |
+| cryogeology | low/moderate | vectorized/smoothed `O(N)` fields |
+| exotic geomorphic diagnostics | low | vectorized `O(N)` fields |
+
+The advanced chemistry modules do not run for legacy greenhouse configurations. Composition-aware worlds pay only for the relevant extra layers. This keeps the existing fast/reproducible path usable while allowing higher scientific detail to be selected deliberately.
+
+`config/maximal_realism_safe.yaml` explicitly selects `ocean.backend: barotropic`. `default.yaml` and `fast.yaml` do not, so upgrading the maximal-realism preset does not silently increase the cost of normal runs.
 
 ## Runtime caps
 
@@ -100,6 +120,14 @@ simulation:
 
 Predictor passes cannot terminate adaptive convergence: the solver reaches full configured climate/ocean fidelity by the minimum pass count and only then counts consecutive converged passes. Coupling history stores normalized residuals and the explicit stop reason. This is a numerical stopping criterion for the reduced-order model, not a claim of first-principles Earth-system convergence.
 
+Composition-aware worlds add a second short fixed-point correction for volatile partition -> conserved liquid volume -> coastline/ocean -> climate. The liquid-level solver sorts the global solid-bed elevation once per solve and analytically advances through elevation breakpoints, avoiding repeated full-map binary-search scans.
+
+## Barotropic ocean backend
+
+`ocean.backend: barotropic` replaces the inexpensive analytic/wind-blend current construction with the repository's reduced-order depth-integrated streamfunction solver. It remains much cheaper than a primitive-equation ocean, but it is expected to cost materially more than `fast`, especially at high resolution because all 12 monthly current fields are reconstructed and then coupled through heat transport.
+
+Use the fast backend for iteration and parameter exploration, and the barotropic backend for final/high-fidelity worlds. The generated ocean metadata reports its discrete divergence diagnostics and a kinetic-energy index so backend quality can be checked independently of wall time.
+
 ## Random-access array store
 
 ```bash
@@ -131,8 +159,10 @@ worldgen --timings-json timings.json
 worldgen --profile world.prof
 ```
 
-The progress reporter consumes pipeline stage events and shows stage count, percentage, elapsed time and an adaptive ETA. `--profile` writes raw cProfile data plus a human-readable cumulative-time report. `--timings-json` records stage timings and the resolved runtime plan.
+The progress reporter consumes pipeline stage events and shows stage count, percentage, elapsed time and an adaptive ETA. `--profile` writes raw cProfile data plus a human-readable cumulative-time report. `--timings-json` records stage timings and the resolved runtime plan. Advanced composition-aware stages emit ordinary named pipeline events (`surface_liquid_equilibrium_*`, `volatile_cycle_multicomponent`, `exotic_ocean_state`, `automatic_geodynamic_regime`, `cryogeology`, `exotic_geomorphology`) and therefore automatically participate in the same timing/logging infrastructure.
 
 ## CI validation
 
-Every push to `main` runs compilation, CLI smoke checks, the complete pytest suite, Python-version compatibility jobs, optional-backend coverage and an end-to-end generation/resume path. Performance work is landed incrementally so numerical or storage regressions can be localized to a specific commit.
+Every pull request to `main` and every push to `main` runs compilation, CLI smoke checks, the complete pytest suite, Python-version compatibility jobs, optional-backend coverage and an end-to-end generation/resume path. Performance work is landed incrementally so numerical or storage regressions can be localized to a specific commit.
+
+Dedicated benchmark measurements should always record the commit SHA, Python version, backend selection, resolution, optional dependencies and whether rendering/world output was enabled. Shared-runner timings are useful for order-of-magnitude comparisons, not as stable hardware baselines.
