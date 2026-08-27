@@ -106,6 +106,7 @@ class TerrainConfig:
 
 @dataclass(slots=True)
 class OceanConfig:
+    backend: str = "fast"
     young_crust_depth_m: float = 2600.0
     subsidence_sqrt_m_per_sqrt_myr: float = 350.0
     max_abyss_depth_m: float = 6200.0
@@ -445,6 +446,8 @@ class WorldConfig:
         _fraction("terrain.coastal_reworking_strength", tr.coastal_reworking_strength)
 
         o = self.ocean
+        if o.backend not in {"fast", "barotropic"}:
+            raise ValueError("ocean.backend must be fast or barotropic")
         _integer("ocean.current_iterations", o.current_iterations, minimum=1)
         _integer("ocean.heat_transport_iterations", o.heat_transport_iterations, minimum=1)
         for name in (
