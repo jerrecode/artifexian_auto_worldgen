@@ -44,6 +44,11 @@ class SphereGrid:
         )
 
     @property
+    def shape(self) -> tuple[int, int]:
+        """Canonical raster shape in NumPy order: ``(height, width)``."""
+        return self.height, self.width
+
+    @property
     def ops(self):
         from .topology import SphericalRasterOps
         return SphericalRasterOps(self)
