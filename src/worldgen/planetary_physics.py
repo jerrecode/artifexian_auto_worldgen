@@ -37,6 +37,9 @@ class SpeciesThermo:
     liquid_density_kg_m3: float
 
 
+# Screening-grade pure-component constants. CoolProp, when installed and when a
+# fluid is available there, is preferred for scalar liquid properties. The built-in
+# curves deliberately trade precision for vectorizable phase screening.
 SPECIES: dict[str, SpeciesThermo] = {
     "H2O": SpeciesThermo("H2O", "Water", 18.01528, 273.16, 0.00611657, 647.096, 220.64, 373.124, 40.65, 51.0, 997.0),
     "CO2": SpeciesThermo("CO2", "CarbonDioxide", 44.0095, 216.592, 5.185, 304.1282, 73.773, None, 15.3, 25.2, 1100.0),
@@ -49,6 +52,15 @@ SPECIES: dict[str, SpeciesThermo] = {
     "Ar": SpeciesThermo("Ar", "Argon", 39.948, 83.806, 0.6889, 150.687, 48.63, 87.302, 6.43, 7.8, 1395.0),
     "H2": SpeciesThermo("H2", "Hydrogen", 2.01588, 13.957, 0.0720, 33.145, 12.964, 20.369, 0.90, 1.0, 71.0),
     "He": SpeciesThermo("He", "Helium", 4.002602, 2.1768, 0.0504, 5.1953, 2.2746, 4.222, 0.083, 0.10, 125.0),
+    "CO": SpeciesThermo("CO", "CarbonMonoxide", 28.0101, 68.16, 0.153, 132.86, 34.94, 81.64, 6.04, 7.6, 789.0),
+    "H2S": SpeciesThermo("H2S", "HydrogenSulfide", 34.0809, 187.67, 0.23, 373.10, 89.63, 212.87, 18.7, 24.0, 900.0),
+    "C3H8": SpeciesThermo("C3H8", "Propane", 44.0956, 85.53, 1.7e-8, 369.89, 42.51, 231.04, 19.0, 22.0, 493.0),
+    "C2H4": SpeciesThermo("C2H4", "Ethylene", 28.0532, 103.99, 0.0012, 282.35, 50.42, 169.38, 13.5, 16.0, 570.0),
+    # Acetylene's triple pressure lies above one atmosphere, so there is no ordinary
+    # 1-atm liquid boiling point; use the triple point as the vapor-pressure anchor.
+    "C2H2": SpeciesThermo("C2H2", None, 26.0373, 192.4, 1.28, 308.3, 61.4, None, 16.7, 20.0, 620.0),
+    "CH3OH": SpeciesThermo("CH3OH", "Methanol", 32.0419, 175.61, 1.9e-6, 512.6, 80.9, 337.63, 35.3, 40.0, 792.0),
+    "HCN": SpeciesThermo("HCN", None, 27.0253, 259.86, 0.19, 456.7, 53.9, 299.2, 25.0, 31.0, 690.0),
 }
 
 ALIASES = {
@@ -56,6 +68,11 @@ ALIASES = {
     "methane": "CH4", "ch4": "CH4", "ethane": "C2H6", "c2h6": "C2H6", "ammonia": "NH3", "nh3": "NH3",
     "nitrogen": "N2", "n2": "N2", "oxygen": "O2", "o2": "O2", "sulfur dioxide": "SO2", "sulphur dioxide": "SO2", "so2": "SO2",
     "argon": "Ar", "ar": "Ar", "hydrogen": "H2", "h2": "H2", "helium": "He", "he": "He",
+    "carbon monoxide": "CO", "carbonmonoxide": "CO", "co": "CO",
+    "hydrogen sulfide": "H2S", "hydrogen sulphide": "H2S", "h2s": "H2S",
+    "propane": "C3H8", "c3h8": "C3H8", "ethylene": "C2H4", "ethene": "C2H4", "c2h4": "C2H4",
+    "acetylene": "C2H2", "ethyne": "C2H2", "c2h2": "C2H2", "methanol": "CH3OH", "ch3oh": "CH3OH",
+    "hydrogen cyanide": "HCN", "hcn": "HCN",
 }
 
 
@@ -159,9 +176,10 @@ def greenhouse_optical_depth(composition: Mapping[str, float], pressure_bar: flo
         "CH4": 0.0050 * math.sqrt(partial.get("CH4", 0.0) / 1.8e-6) * pressure_gate,
         "NH3": 0.012 * math.sqrt(partial.get("NH3", 0.0) / 1.0e-6) * pressure_gate,
         "SO2": 0.006 * math.sqrt(partial.get("SO2", 0.0) / 1.0e-7) * pressure_gate,
+        "H2S": 0.0025 * math.sqrt(partial.get("H2S", 0.0) / 1.0e-7) * pressure_gate,
         "H2_CIA": 0.12 * partial.get("H2", 0.0)**2,
     }
-    for key in ("CO2", "H2O", "CH4", "NH3", "SO2"): terms[key] *= broadening
+    for key in ("CO2", "H2O", "CH4", "NH3", "SO2", "H2S"): terms[key] *= broadening
     for key in tuple(terms): terms[key] *= path
     terms["total"] = max(0.0, sum(terms.values())); terms["path_length_factor"] = float(path_length_factor)
     return terms
@@ -175,12 +193,12 @@ def composition_greenhouse_temperature_k(equilibrium_temperature_k: float, compo
 
 def select_active_condensible(composition: Mapping[str, float], surface_volatiles: Mapping[str, float], temperature_k: float,
                               pressure_bar: float, *, requested: str = "auto") -> str | None:
-    """Select the working climate condensable, strongly preferring surface reservoirs.
+    """Select the reference climate condensable, strongly preferring surface reservoirs.
 
-    A surface ocean/ice inventory must outrank an abundant atmospheric background
-    gas such as N2. Only when no surface volatile is configured do atmospheric
-    candidates compete, and supercritical species at the reference temperature are
-    excluded from automatic condensation-cycle selection.
+    This function chooses one *transport reference* for the legacy climate moisture
+    solver. The advanced volatile-cycle layer can subsequently activate multiple
+    simultaneous condensates. Surface ocean/ice inventory outranks atmospheric
+    background gases; supercritical species are excluded from automatic selection.
     """
     if requested != "auto": return canonical_species(requested)
     comp = normalize_composition(composition); surface: dict[str, float] = {}
@@ -198,9 +216,13 @@ def select_active_condensible(composition: Mapping[str, float], surface_volatile
             if best is None or score < best[0]: best = (score, key)
         return None if best is None else best[1]
 
+    condensable_candidates = {
+        "H2O", "CO2", "CH4", "C2H6", "NH3", "N2", "SO2", "CO", "H2S",
+        "C3H8", "C2H4", "C2H2", "CH3OH", "HCN",
+    }
     best = None
     for key, frac in comp.items():
-        if key not in {"H2O", "CO2", "CH4", "C2H6", "NH3", "N2", "SO2"} or frac <= 1e-6: continue
+        if key not in condensable_candidates or frac <= 1e-6: continue
         sp = SPECIES[key]
         if temperature_k >= sp.critical_temperature_k: continue
         psat = float(saturation_pressure_bar(key, temperature_k, backend="builtin")); partial = max(frac * pressure_bar, 1e-12)
