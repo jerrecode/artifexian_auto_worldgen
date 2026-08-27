@@ -3,16 +3,22 @@ from __future__ import annotations
 """Public recursive-refinement API and hot-path optimizations.
 
 The durable implementation lives in :mod:`worldgen.refinement_core`. This module
-adds two invariants that are important enough to keep explicit at the public API:
+adds invariants that are important enough to keep explicit at the public API:
 
 * sub-grid detail is normalized globally-by-construction and cannot depend on how
   the sphere happened to be partitioned into child sections;
 * spherical interpolation geometry is prepared once per child and reused by every
-  field in that child instead of rebuilding the same large index/weight arrays for
-  dozens of climate/ocean/geology/resource layers.
+  field in that child instead of rebuilding the same large index/weight arrays;
+* resumability is provenance-safe: incomplete child payloads are never reused under
+  a different refinement specification, and a changed base NPZ cannot silently
+  inherit an older refinement tree.
 """
 
+from dataclasses import asdict
+import hashlib
+import json
 from pathlib import Path
+import shutil
 from typing import Any
 
 import numpy as np
@@ -51,6 +57,28 @@ def _partition_invariant_spherical_detail(
 _core._spherical_detail = _partition_invariant_spherical_detail
 
 
+def _file_sha256(path: Path, *, chunk_bytes: int = 4 * 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(chunk_bytes)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _source_fingerprint(path: Path, *, include_hash: bool = True) -> dict[str, Any]:
+    st = path.stat()
+    out: dict[str, Any] = {
+        "size_bytes": int(st.st_size),
+        "mtime_ns": int(st.st_mtime_ns),
+    }
+    if include_hash:
+        out["sha256"] = _file_sha256(path)
+    return out
+
+
 def _sample_with_context(
     values: np.ndarray,
     axes: tuple[int, int],
@@ -69,8 +97,6 @@ def _sample_with_context(
         if mode == "nearest":
             return part[context["nearest_y"], context["nearest_x"]]
         if signed_vector:
-            # Pole-reflected tangent vectors need corner-specific sign parity, so
-            # they retain the specialized sampler rather than the scalar plan.
             return _core._signed_bilinear_sample(part, sy, sx)
         return _core.apply_bilinear_sampler(part, context["linear_sampler"])
 
@@ -86,12 +112,63 @@ def _sample_with_context(
 
 
 class RefinementEngine(_core.RefinementEngine):
-    """Refinement engine with bounded one-node spherical sampling-plan reuse."""
+    """Refinement engine with bounded sampler reuse and provenance-safe resume."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._sampling_context_key: tuple[Any, ...] | None = None
         self._sampling_context: dict[str, Any] | None = None
+
+    def _reset_sampling_context(self) -> None:
+        self._sampling_context_key = None
+        self._sampling_context = None
+
+    def _reset_refinement_levels(self, manifest: dict[str, Any]) -> None:
+        shutil.rmtree(self.levels_root, ignore_errors=True)
+        self.levels_root.mkdir(parents=True, exist_ok=True)
+        manifest["deepest_complete_level"] = -1
+        manifest["levels"] = {}
+        self._reset_sampling_context()
+        self._save_manifest(manifest)
+
+    def _prepare_base_level(self, manifest: dict[str, Any]) -> None:
+        source = self.world_root / "world_arrays.npz"
+        index_path = self._level_index_path(0)
+        if index_path.exists() and source.exists():
+            index = self._load_index(0)
+            stored = index.get("source_fingerprint")
+            if isinstance(stored, dict) and stored.get("sha256"):
+                st = source.stat()
+                stat_same = (
+                    int(stored.get("size_bytes", -1)) == int(st.st_size)
+                    and int(stored.get("mtime_ns", -1)) == int(st.st_mtime_ns)
+                )
+                if not stat_same:
+                    current_hash = _file_sha256(source)
+                    if current_hash != str(stored["sha256"]):
+                        if self.resume:
+                            raise RuntimeError(
+                                "world_arrays.npz changed after refinement level 0 was materialized; "
+                                "rerun with --no-resume to rebuild the refinement hierarchy from the new base world"
+                            )
+                        self._reset_refinement_levels(manifest)
+                    else:
+                        stored["size_bytes"] = int(st.st_size)
+                        stored["mtime_ns"] = int(st.st_mtime_ns)
+                        index["source_fingerprint"] = stored
+                        _core._atomic_write_json(index_path, index)
+
+        super()._prepare_base_level(manifest)
+
+        # Record a strong fingerprint after first materialization. The fast stat
+        # fields avoid rehashing a multi-GB NPZ on ordinary resume; SHA-256 is
+        # recomputed only when size/mtime indicates that the source may have changed.
+        source = self.world_root / "world_arrays.npz"
+        if source.exists():
+            index = self._load_index(0)
+            if not isinstance(index.get("source_fingerprint"), dict) or not index["source_fingerprint"].get("sha256"):
+                index["source_fingerprint"] = _source_fingerprint(source, include_hash=True)
+                _core._atomic_write_json(index_path, index)
 
     def _node_sampling_context(
         self,
@@ -137,12 +214,53 @@ class RefinementEngine(_core.RefinementEngine):
                 sy, sx, parent_shape
             ),
         }
-        # Keep exactly one child plan resident. This captures the dominant reuse
-        # pattern (many fields per node) without letting a deep refinement tree turn
-        # interpolation caches into an unbounded RAM consumer.
         self._sampling_context_key = key
         self._sampling_context = context
         return context
+
+    def _process_level(
+        self,
+        manifest: dict[str, Any],
+        parent_level: int,
+        target_level: int,
+    ) -> None:
+        parent_index = self._load_index(parent_level)
+        parent_width, parent_height = map(int, parent_index["resolution"])
+        expected_resolution = [
+            parent_width * int(self.spec.scale),
+            parent_height * int(self.spec.scale),
+        ]
+        target_dir = self._level_dir(target_level)
+        state_path = target_dir / "level_state.json"
+
+        if target_dir.exists():
+            if not self.resume:
+                shutil.rmtree(target_dir, ignore_errors=True)
+                self._reset_sampling_context()
+            elif state_path.exists():
+                try:
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"incomplete refinement state is unreadable: {state_path}; use --no-resume to rebuild it"
+                    ) from exc
+                compatible = (
+                    int(state.get("parent_level", -1)) == int(parent_level)
+                    and list(state.get("resolution", [])) == expected_resolution
+                    and state.get("spec") == asdict(self.spec)
+                )
+                if not compatible:
+                    raise RuntimeError(
+                        "incomplete refinement payloads were created with a different parent/specification; "
+                        "use --no-resume to discard that incomplete depth before changing --refine-scale, "
+                        "--refine-sections, --refine-halo-cells, or detail settings"
+                    )
+            elif any(target_dir.iterdir()):
+                raise RuntimeError(
+                    f"refinement target {target_dir} contains untracked partial data; use --no-resume to rebuild it"
+                )
+
+        super()._process_level(manifest, parent_level, target_level)
 
     def _process_node_field(
         self,
@@ -206,6 +324,4 @@ class RefinementEngine(_core.RefinementEngine):
         return out_path
 
 
-# Preserve the public names of the core module while replacing its engine with the
-# optimized subclass above.
 __all__ = _core.__all__
