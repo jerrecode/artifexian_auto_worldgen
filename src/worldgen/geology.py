@@ -1,7 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
-from scipy import ndimage
 
 from .grid import SphereGrid, distance_to, normalize01, smooth_periodic
 from .tectonics import TectonicResult
@@ -64,8 +63,10 @@ def build_geology(
             **noise_kwargs(noise_cfg, profile=NoiseBlend(0.34,0.28,0.12,0.26), octaves=max(4, min(7, getattr(noise_cfg, "octaves", 6)))),
         )
     stable = (tect.paleo_convergence < 0.18) & (tect.paleo_divergence < 0.18) & tect.continental_crust
-    # Large connected stable interiors are cratonic nuclei.
-    craton = ndimage.binary_opening(stable, iterations=2)
+    # Large connected stable interiors are cratonic nuclei. This is a geographic
+    # morphology operation, so it must respect longitude wrapping and antipodal
+    # pole crossing instead of applying planar scipy.ndimage boundary semantics.
+    craton = grid.ops.binary_opening(stable, iterations=2)
     old_low = tect.orogen_age_myr > 450
     shield = craton & old_low & (terrain.elevation_km > 0.25)
     platform = craton & ~shield
