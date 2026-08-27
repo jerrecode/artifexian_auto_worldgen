@@ -12,7 +12,7 @@ import yaml
 
 from .config import load_config
 from .logging_utils import configure_logging
-from .progress import StageProgress, expected_pipeline_stages
+from .progress import RecursiveProgress, StageProgress, expected_pipeline_stages
 from .runtime import (
     ManagedExecutor,
     configure_numeric_threads,
@@ -31,6 +31,18 @@ def _resolution(value: str) -> tuple[int, int]:
     if width < 64 or height < 32 or width != 2 * height:
         raise argparse.ArgumentTypeError("resolution must be a 2:1 equirectangular grid and at least 64x32")
     return width, height
+
+
+def _sections(value: str) -> tuple[int, int]:
+    text = value.lower().replace("×", "x")
+    try:
+        x_s, y_s = text.split("x", 1)
+        sx, sy = int(x_s), int(y_s)
+    except (ValueError, TypeError) as exc:
+        raise argparse.ArgumentTypeError("sections must be COLUMNSxROWS, e.g. 2x2") from exc
+    if sx < 1 or sy < 1:
+        raise argparse.ArgumentTypeError("section counts must both be >= 1")
+    return sx, sy
 
 
 def _set_config_value(cfg: Any, expression: str) -> None:
@@ -84,7 +96,7 @@ def _parser() -> argparse.ArgumentParser:
 
     io = p.add_argument_group("configuration and output")
     io.add_argument("--config", type=Path, default=None, help="YAML configuration file")
-    io.add_argument("--out", type=Path, default=Path("world-out"), help="Output directory")
+    io.add_argument("--out", type=Path, default=Path("world-out"), help="Output directory; with --refine this is the existing world directory")
     io.add_argument("--seed", type=int, default=None, help="Override root seed")
     io.add_argument("--set", dest="overrides", action="append", default=[], metavar="SECTION.KEY=VALUE",
                     help="Override any dataclass configuration value; may be repeated")
@@ -98,6 +110,8 @@ def _parser() -> argparse.ArgumentParser:
     io.add_argument("--no-report", action="store_true", help="Skip Markdown report export")
     io.add_argument("--compress-npz", action=argparse.BooleanOptionalAction, default=None,
                     help="Enable/disable DEFLATE compression for world_arrays.npz")
+    io.add_argument("--heightmap", action=argparse.BooleanOptionalAction, default=True,
+                    help="Write a 16-bit grayscale full-relief height map from deepest ocean to highest peak")
     io.add_argument("--diagnostics", action=argparse.BooleanOptionalAction, default=True,
                     help="Write diagnostics.json with numerical/scientific invariants")
     io.add_argument("--manifest", action=argparse.BooleanOptionalAction, default=True,
@@ -117,6 +131,22 @@ def _parser() -> argparse.ArgumentParser:
     res.add_argument("--max-png-megapixels", type=float, default=120.0,
                      help="Safety cap applied to each post-upscaled PNG")
 
+    refine = p.add_argument_group("recursive spherical refinement")
+    refine.add_argument("--refine", action="store_true",
+                        help="Refine the already generated dataset under --out instead of generating a new base world")
+    refine.add_argument("--refine-levels", type=int, default=1,
+                        help="Number of additional recursive refinement depths to complete in this invocation")
+    refine.add_argument("--refine-scale", type=int, default=2,
+                        help="Linear data-resolution multiplier at every new refinement depth")
+    refine.add_argument("--refine-sections", type=_sections, default=(2, 2), metavar="COLUMNSxROWS",
+                        help="Split every parent section into this many child sections")
+    refine.add_argument("--refine-halo-cells", type=int, default=8,
+                        help="Fine-grid halo around every child before crop/composition")
+    refine.add_argument("--refine-elevation-detail-strength", type=float, default=0.20,
+                        help="Amplitude of deterministic spherical sub-grid elevation synthesis")
+    refine.add_argument("--refine-keep-sections", action=argparse.BooleanOptionalAction, default=False,
+                        help="Retain per-section arrays after a level has been composed; metadata is always retained")
+
     perf = p.add_argument_group("runtime, resumability and performance")
     perf.add_argument("--workers", type=int, default=0, help="Requested worker count; 0 selects automatically")
     perf.add_argument("--worker-cap", type=int, default=8, help="Hard upper bound on managed workers")
@@ -134,7 +164,7 @@ def _parser() -> argparse.ArgumentParser:
     perf.add_argument("--checkpoint-max-gb", type=float, default=64.0,
                       help="LRU disk cap for --checkpoint-dir")
     perf.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
-                      help="Reuse valid stage checkpoints when --checkpoint-dir is configured")
+                      help="Reuse valid stage checkpoints and completed refinement fields")
     perf.add_argument("--clear-checkpoints", action="store_true",
                       help="Clear --checkpoint-dir before starting the run")
     perf.add_argument("--profile", type=Path, default=None, help="Write cProfile statistics to this file")
@@ -142,7 +172,9 @@ def _parser() -> argparse.ArgumentParser:
 
     obs = p.add_argument_group("progress and logging")
     obs.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True,
-                     help="Show stage progress, elapsed time and ETA")
+                     help="Show stage/refinement progress, elapsed time and ETA")
+    obs.add_argument("--progress-detail", action=argparse.BooleanOptionalAction, default=False,
+                     help="Show start clock, current action runtime, moving averages and estimated finish time")
     obs.add_argument("-v", "--verbose", action="count", default=0, help="Increase logging verbosity; repeat for debug")
     obs.add_argument("--quiet", action="store_true", help="Only emit errors")
     obs.add_argument("--log-file", type=Path, default=None, help="Write detailed logs to a file")
@@ -190,14 +222,70 @@ def _apply_cli_config(args, cfg, parser: argparse.ArgumentParser):
     if args.compress_npz is not None:
         cfg.output.compress_npz = bool(args.compress_npz)
 
-    # Critical: load_config() validates the YAML, but every mutation above occurs
-    # afterward. Revalidate the fully resolved configuration so --set/--quick and
-    # command-line resolution changes cannot bypass physical/algorithmic guards.
     try:
         cfg.validate()
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
     return cfg
+
+
+def _run_refinement(args, logger) -> int:
+    from .refinement import RefinementEngine, RefinementSpec
+
+    sx, sy = args.refine_sections
+    try:
+        spec = RefinementSpec(
+            scale=args.refine_scale,
+            sections_y=sy,
+            sections_x=sx,
+            halo_cells=args.refine_halo_cells,
+            elevation_detail_strength=args.refine_elevation_detail_strength,
+            keep_sections=args.refine_keep_sections,
+        ).validate()
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+    progress = RecursiveProgress(
+        planned_levels=args.refine_levels,
+        branching_factor=sx * sy,
+        enabled=bool(args.progress and not args.quiet),
+        log=logger.info if args.verbose or args.log_file else None,
+        detailed=bool(args.progress_detail or args.verbose >= 2),
+    )
+    engine = RefinementEngine(args.out, spec=spec, resume=args.resume, progress=progress)
+    try:
+        if args.profile is None:
+            manifest = engine.refine(args.refine_levels)
+        else:
+            args.profile.parent.mkdir(parents=True, exist_ok=True)
+            profiler = cProfile.Profile()
+            profiler.enable()
+            try:
+                manifest = engine.refine(args.refine_levels)
+            finally:
+                profiler.disable()
+                profiler.dump_stats(args.profile)
+                summary = args.profile.with_suffix(args.profile.suffix + ".txt")
+                with summary.open("w", encoding="utf-8") as f:
+                    pstats.Stats(profiler, stream=f).sort_stats("cumtime").print_stats(80)
+        progress.finish()
+    except (OSError, ValueError, KeyError, RuntimeError) as exc:
+        progress.finish()
+        logger.error("refinement failed: %s", exc)
+        return 2
+
+    deepest = int(manifest["deepest_complete_level"])
+    info = manifest["levels"][str(deepest)]
+    logger.info(
+        "refinement complete depth=%s resolution=%sx%s nodes=%s",
+        deepest,
+        info["resolution"][0],
+        info["resolution"][1],
+        info["node_count"],
+    )
+    print(f"Refined world written under: {(args.out / 'refinement').resolve()}")
+    print(f"Deepest complete refinement level: {deepest} ({info['resolution'][0]}x{info['resolution'][1]})")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -216,6 +304,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--checkpoint-max-gb must be > 0")
     if args.clear_checkpoints and args.checkpoint_dir is None:
         parser.error("--clear-checkpoints requires --checkpoint-dir")
+    if args.refine_levels < 1:
+        parser.error("--refine-levels must be >= 1")
+    if args.refine_scale < 2:
+        parser.error("--refine-scale must be >= 2")
+    if args.refine_halo_cells < 0:
+        parser.error("--refine-halo-cells must be >= 0")
+    if not 0.0 <= args.refine_elevation_detail_strength <= 2.0:
+        parser.error("--refine-elevation-detail-strength must be in [0, 2]")
 
     try:
         cfg = load_config(args.config)
@@ -262,6 +358,13 @@ def main(argv: list[str] | None = None) -> int:
         args.write_config.write_text(yaml.safe_dump(cfg.to_dict(), sort_keys=False), encoding="utf-8")
         logger.info("resolved configuration written to %s", args.write_config)
 
+    if args.refine:
+        if args.dry_run:
+            if not (args.out / "world_arrays.npz").exists() and not (args.out / "refinement" / "levels" / "level_0000" / "index.json").exists():
+                parser.error("--refine requires an existing generated world with world_arrays.npz")
+            return 0
+        return _run_refinement(args, logger)
+
     if args.clear_checkpoints:
         from .checkpoint import CheckpointStore
         store = CheckpointStore(args.checkpoint_dir, max_bytes=int(args.checkpoint_max_gb * 1024**3))
@@ -281,6 +384,7 @@ def main(argv: list[str] | None = None) -> int:
         total_stages,
         enabled=bool(args.progress and not args.quiet),
         log=logger.info if args.verbose or args.log_file else None,
+        detailed=bool(args.progress_detail or args.verbose >= 2),
     )
     if args.checkpoint_dir is None:
         pipeline = WorldPipeline(cfg, progress=progress)
@@ -312,6 +416,19 @@ def main(argv: list[str] | None = None) -> int:
                     pstats.Stats(profiler, stream=f).sort_stats("cumtime").print_stats(80)
                 logger.info("profile written to %s and %s", args.profile, summary)
         progress.finish()
+
+        if cfg.output.save_png and args.heightmap:
+            from .heightmap import write_heightmap_png16
+            maps = args.out / "maps"
+            meta = write_heightmap_png16(
+                maps / "02b_height_grayscale_16bit.png",
+                world["ocean"].elevation_km,
+                metadata_path=maps / "02b_height_grayscale_16bit.json",
+            )
+            logger.info(
+                "full-relief 16-bit heightmap written: min=%.4f km max=%.4f km",
+                meta["minimum_elevation_km"], meta["maximum_elevation_km"],
+            )
 
         if cfg.output.save_png and args.png_scale != 1.0:
             from .imageops import upscale_png_tree
