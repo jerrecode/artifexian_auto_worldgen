@@ -32,7 +32,6 @@ def test_fill_starts_in_deepest_cells_before_spilling_upward():
     bed = np.full(grid.shape, 1.0, dtype=np.float64)
     bed[1, 2] = -2.0
     bed[2, 5] = -1.0
-    # Fill only partway from -2 km toward the next basin floor at -1 km.
     omega = grid.cell_area_weights[1, 2] * 4.0 * math.pi
     r0 = grid.radius_km * 1000.0 - 2000.0
     target = omega * (r0 * r0 * 400.0 + r0 * 400.0**2 + 400.0**3 / 3.0)
@@ -90,6 +89,29 @@ def test_frozen_world_sequesters_condensed_inventory_as_solid():
     )
     assert part.solid_mass_kg > 0.99 * (part.total_mass_kg - part.vapor_mass_kg)
     assert part.liquid_mass_kg == 0.0
+
+
+def test_supercritical_gas_only_state_never_creates_fake_surface_liquid():
+    grid = SphereGrid(24, 12, 6052.0)
+    # Venus-like SO2 conditions are far above SO2's critical temperature. Even if
+    # the configured volatile mass exceeds the fixed atmospheric-column capacity,
+    # the remainder is a diagnosed pressure inconsistency, not a liquid ocean.
+    temp = np.full(grid.shape, 735.0 - 273.15)
+    part = partition_volatile_inventory(
+        grid, "SO2", 2e22, temp,
+        surface_pressure_bar=92.0, gravity_m_s2=8.87,
+        relative_humidity=1.0, thermodynamics_backend="builtin",
+    )
+    assert part.liquid_mass_kg == 0.0
+    assert part.solid_mass_kg == 0.0
+    assert part.noncondensed_excess_mass_kg > 0.0
+    closure = (
+        part.vapor_mass_kg
+        + part.solid_mass_kg
+        + part.liquid_mass_kg
+        + part.noncondensed_excess_mass_kg
+    )
+    assert abs(closure - part.total_mass_kg) / part.total_mass_kg < 1e-12
 
 
 def test_lower_density_liquid_produces_larger_filled_volume_for_same_mass():
