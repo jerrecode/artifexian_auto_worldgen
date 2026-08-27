@@ -1,0 +1,37 @@
+seed: 20260828
+astronomy:
+  star_mass_solar: 1.0
+  planet_mass_earth: 0.815
+  planet_density_g_cm3: 5.24
+  semimajor_axis_au: 0.723
+  eccentricity: 0.0067
+  axial_tilt_deg: 177.4
+  rotation_hours: 5832.0
+  albedo: 0.75
+  greenhouse_model: composition
+  thermodynamics_backend: auto
+  atmosphere_pressure_bar: 92.0
+  atmosphere_top_pressure_bar: 1.0e-5
+  atmosphere:
+    CO2: 0.965
+    N2: 0.035
+  surface_volatiles:
+    SO2: 1.0
+  surface_condensible: SO2
+  radiogenic_heat_flux_w_m2: 0.080
+  moons: []
+tectonics:
+  continental_fraction_target: 0.995
+  geological_activity_mode: stagnant_lid
+  activity_strength: 0.55
+  max_plate_speed_cm_yr: 0.35
+  hotspot_count: 35
+  ice_geology_mode: inactive
+climate:
+  condensible_species: SO2
+  precip_scale_mm_year: 25.0
+  phase_coupled_evaporation: true
+ocean:
+  fluid_species: SO2
+society:
+  enabled: false
