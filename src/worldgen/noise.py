@@ -13,10 +13,15 @@ random-generation/filter memory traffic at high world resolutions.
 from dataclasses import dataclass
 import math
 import numpy as np
-from scipy import ndimage
 
 from .grid import smooth_periodic
 from .mathops import auto_chunk_shape, iter_tiles_2d
+from .topology import (
+    apply_bilinear_sampler,
+    prepare_spherical_bilinear_sampler,
+    spherical_resize,
+    spherical_shift,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,35 +57,16 @@ def _standardize(a: np.ndarray) -> np.ndarray:
     return ((a - m) / s).astype(np.float32, copy=False)
 
 
-def _fit_shape(a: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
-    """Crop/pad interpolation roundoff to an exact requested shape."""
-    h, w = shape
-    out = np.asarray(a, dtype=np.float32)
-    if out.shape[0] < h:
-        out = np.pad(out, ((0, h - out.shape[0]), (0, 0)), mode="edge")
-    elif out.shape[0] > h:
-        out = out[:h]
-    if out.shape[1] < w:
-        need = w - out.shape[1]
-        out = np.concatenate((out, out[:, :need]), axis=1)
-    elif out.shape[1] > w:
-        out = out[:, :w]
-    return out.astype(np.float32, copy=False)
-
-
 def _resample_to_shape(a: np.ndarray, shape: tuple[int, int], *, order: int = 3) -> np.ndarray:
-    """Latitude-clamped, longitude-periodic two-pass resize."""
+    """Pole-aware global resize used by natural-resolution noise octaves.
+
+    Cubic Cartesian interpolation previously clamped latitude at both poles. The
+    spherical bilinear sampler avoids that topological discontinuity; ``order`` is
+    retained as an internal compatibility argument but all continuous noise fields
+    now use the canonical bilinear method.
+    """
     a = np.asarray(a, dtype=np.float32)
-    h, w = shape
-    if a.shape == (h, w):
-        return a
-    # Resample dimensions separately so each axis can use the correct boundary mode.
-    yzoom = h / max(a.shape[0], 1)
-    temp = ndimage.zoom(a, (yzoom, 1.0), order=order, mode="nearest", prefilter=order > 1)
-    temp = _fit_shape(temp, (h, a.shape[1]))
-    xzoom = w / max(temp.shape[1], 1)
-    out = ndimage.zoom(temp, (1.0, xzoom), order=order, mode="wrap", prefilter=order > 1)
-    return _fit_shape(out, (h, w))
+    return np.asarray(spherical_resize(a, shape, order=1), dtype=np.float32)
 
 
 def _natural_octave_geometry(shape: tuple[int, int], sigma_px: float) -> tuple[tuple[int, int], float, float]:
@@ -149,7 +135,7 @@ def _octave_field(
 
     shift_y = max(1, int(round(0.73 * sigma_local)))
     shift_x = max(1, int(round(1.17 * sigma_local)))
-    aux_raw = np.roll(raw, shift=(shift_y, shift_x), axis=(0, 1))
+    aux_raw = spherical_shift(raw, shift_y, shift_x)
     aux_sigma = max(minimum_sigma_px, sigma_local * 0.76)
     aux = smooth_periodic(aux_raw, (aux_sigma, max(minimum_sigma_px, sigma_local * 1.04))).astype(np.float32, copy=False)
     aux = _standardize(aux)
@@ -184,20 +170,10 @@ def _bilinear_warp_tiled(
         x0, x1 = xs.start or 0, xs.stop or w
         yy = np.arange(y0, y1, dtype=np.float32)[:, None]
         xx = np.arange(x0, x1, dtype=np.float32)[None, :]
-        sy = np.clip(yy + dy[ys, xs], 0.0, h - 1.00001)
-        sx = np.mod(xx + dx[ys, xs], w)
-        iy0 = np.floor(sy).astype(np.int32)
-        ix0 = np.floor(sx).astype(np.int32) % w
-        iy1 = np.minimum(iy0 + 1, h - 1)
-        ix1 = (ix0 + 1) % w
-        fy = sy - iy0
-        fx = sx - ix0
-        out[ys, xs] = (
-            a[iy0, ix0] * (1.0 - fy) * (1.0 - fx)
-            + a[iy0, ix1] * (1.0 - fy) * fx
-            + a[iy1, ix0] * fy * (1.0 - fx)
-            + a[iy1, ix1] * fy * fx
-        )
+        sy = yy + dy[ys, xs]
+        sx = xx + dx[ys, xs]
+        sampler = prepare_spherical_bilinear_sampler(sy, sx, (h, w))
+        out[ys, xs] = apply_bilinear_sampler(a, sampler)
     return out
 
 

@@ -283,6 +283,16 @@ def spherical_resize(
     )
 
 
+def spherical_shift(values: np.ndarray, dy: int, dx: int) -> np.ndarray:
+    """Shift a 2-D global field through the canonical seam/pole topology."""
+    a = np.asarray(values)
+    if a.ndim != 2:
+        raise ValueError("spherical_shift currently requires a 2-D field")
+    yy, xx = np.indices(a.shape, dtype=np.int64)
+    yy, xx = _map_spherical_lattice_indices(yy - int(dy), xx - int(dx), a.shape)
+    return a[yy, xx]
+
+
 __all__ = [
     "SphericalRasterOps",
     "prepare_spherical_bilinear_sampler",
@@ -290,5 +300,6 @@ __all__ = [
     "spherical_gaussian_filter",
     "geodesic_distance_to",
     "spherical_resize",
+    "spherical_shift",
     "_map_spherical_lattice_indices",
 ]

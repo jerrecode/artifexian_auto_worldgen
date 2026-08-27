@@ -54,6 +54,15 @@ class ConfigAndNoiseTests(unittest.TestCase):
         self.assertEqual(float(warped[20, w - 1]), 1.0)
         self.assertEqual(float(warped[20, 0]), 2.0)
 
+    def test_tiled_warp_crosses_pole_with_antipodal_shift(self):
+        h, w = 16, 32
+        field = np.arange(h * w, dtype=np.float32).reshape(h, w)
+        dy = np.zeros((h, w), np.float32)
+        dx = np.zeros((h, w), np.float32)
+        dy[0] = -1.0
+        warped = _bilinear_warp_tiled(field, dy, dx, target_scratch_mb=0.25)
+        self.assertEqual(float(warped[0, 0]), float(field[0, w // 2]))
+
 
 if __name__ == "__main__":
     unittest.main()
