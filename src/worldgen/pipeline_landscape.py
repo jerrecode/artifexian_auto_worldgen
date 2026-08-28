@@ -12,6 +12,7 @@ from .geomorphic_fluids import scaled_hydrology_config
 from .landscape_longterm import evolve_landscape_longterm
 from .appearance_advanced import attenuate_deep_bathymetry
 from .render import _save_power_field
+from .condensate_pipeline import install_multicondensate_hydrology
 
 
 class WorldPipeline(_ExoticWorldPipeline):
@@ -27,6 +28,12 @@ class WorldPipeline(_ExoticWorldPipeline):
     def _apply_longterm_landscape(self, world: dict[str, Any]) -> dict[str, Any]:
         c = self.cfg
         grid = world["grid"]
+        # The geologic solver must see the same multicomponent condensate forcing as
+        # the final exported drainage graph.  This makes methane/ethane/ammonia/etc.
+        # runoff affect actual incision instead of being a post-hoc diagnostic.
+        world = install_multicondensate_hydrology(
+            self, world, suffix="pre_geologic_time", rebuild_dependents=False
+        )
         terrain = world["terrain"]
         previous_surface = world["surface_evolution"]
         params = world["geomorphic_fluid_parameters"]
@@ -84,10 +91,17 @@ class WorldPipeline(_ExoticWorldPipeline):
         world["longterm_landscape"] = result
 
         # Any large geologic incision changes basin capacity and coastline. Re-close
-        # volatile volume, ocean, climate, groundwater and short-timescale sediment on
-        # the new bed, using the same fluid-specific coefficients.
+        # volatile volume, ocean and climate on the changed bed, then reinstall the
+        # species-aware hydrology before dependent outputs are accepted as canonical.
         world = self._equilibrate_surface_liquids(world, hydrology_cfg=scaled_cfg)
         world = self._build_exotic_layers(world, suffix="post_geologic_time")
+        world = install_multicondensate_hydrology(
+            self,
+            world,
+            hydrology_cfg=scaled_cfg,
+            suffix="post_geologic_time",
+            rebuild_dependents=True,
+        )
         world["appearance"] = attenuate_deep_bathymetry(
             world["appearance"], world["terrain"], world["ocean"], world["weather"], c.appearance
         )
@@ -115,6 +129,16 @@ class WorldPipeline(_ExoticWorldPipeline):
                 "longterm_delta_deposition_m": np.asarray(lt.delta_deposition_m, np.float32),
                 "longterm_valley_widening_m": np.asarray(lt.valley_widening_m, np.float32),
             })
+        forcing = world.get("condensate_hydrology")
+        if forcing is not None:
+            arrays.update({
+                "condensate_precipitation_depth_mm_monthly": np.asarray(forcing.monthly_total_precipitation_depth_mm, np.float32),
+                "condensate_liquid_input_mm_monthly": np.asarray(forcing.monthly_liquid_input_mm, np.float32),
+                "condensate_solid_input_mm_monthly": np.asarray(forcing.monthly_solid_input_mm, np.float32),
+                "condensate_thaw_fraction_monthly": np.asarray(forcing.monthly_thaw_fraction, np.float32),
+            })
+            for key, value in forcing.species_monthly_mass_kg_m2.items():
+                arrays[f"condensate_mass_{key}_kg_m2_monthly"] = np.asarray(value, np.float32)
         return arrays
 
     def _json_export(self, world: dict[str, Any]) -> dict[str, Any]:
@@ -122,6 +146,9 @@ class WorldPipeline(_ExoticWorldPipeline):
         lt = world.get("longterm_landscape")
         if lt is not None:
             payload["longterm_landscape"] = dict(lt.metadata)
+        forcing = world.get("condensate_hydrology")
+        if forcing is not None:
+            payload["condensate_hydrology"] = forcing.to_dict()
         return payload
 
     def save(self, world: dict[str, Any], out: Path) -> None:
@@ -142,9 +169,14 @@ class WorldPipeline(_ExoticWorldPipeline):
         if lt is None:
             return report + "\n"
         m = lt.metadata
+        forcing = world.get("condensate_hydrology")
+        species = ""
+        if forcing is not None:
+            species = ", ".join(forcing.metadata.get("active_hydrologic_species", []))
         return report + "\n\n## Geologic-time landscape evolution\n\n" + (
             f"- Implicit fluvial profile relaxation elapsed time: {m['elapsed_myr']:.1f} Myr.\n"
             f"- Mean land channel incision: {m['mean_land_channel_incision_m']:.2f} m; maximum {m['max_channel_incision_m']:.2f} m.\n"
+            f"- Hydrologically active condensates driving the mature drainage network: {species or 'reference condensable only'}.\n"
             f"- The long-term solve routes generated sediment conservatively across complete outlet paths, then the volatile-volume/ocean/climate/hydrology system is re-equilibrated on the changed bed.\n"
             f"- This is a stable reduced-order geologic backend; transient knickpoint PDEs, flexural isostasy and grain-resolved abrasion remain separate higher-fidelity extensions.\n"
         )
