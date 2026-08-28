@@ -9,6 +9,7 @@ Priority-Flood and spherical receiver implementation.
 """
 
 from . import hydrology_base as _base
+from . import hydrology_advanced as _advanced
 from .priority_flood import (
     priority_flood,
     priority_flood_reference,
@@ -20,6 +21,24 @@ from .hydrology_advanced import (
     runoff_mm_advanced,
     transport_sediment_topological,
 )
+from .multicondensate_water_balance import build_multicondensate_water_balance
+
+
+# Keep the legacy/ordinary conservative bucket as the default, but let a hydrologic
+# climate view activate the mass-conservative multicomponent bucket.  The cached
+# water-balance function in hydrology_advanced resolves ``build_water_balance`` from
+# its module globals at call time, so this dispatch automatically reaches runoff,
+# surface evolution and final hydrology without duplicating those algorithms.
+_original_build_water_balance = _advanced.build_water_balance
+
+
+def _build_water_balance_dispatch(climate, land, geology, cfg):
+    if getattr(climate, "hydrologic_forcing", None) is not None:
+        return build_multicondensate_water_balance(climate, land, geology, cfg)
+    return _original_build_water_balance(climate, land, geology, cfg)
+
+
+_advanced.build_water_balance = _build_water_balance_dispatch
 
 # Install deterministic optimized/conservative backends into the shared equations.
 # Both the interval and adaptive surface-evolution policies resolve these names from
