@@ -179,16 +179,50 @@ The runtime disk LRU excludes precompute control manifests from payload accounti
 
 If the pinned prefix itself is larger than the configured runtime disk quota, preservation wins: cache statistics report an over-budget cache rather than deleting data the user explicitly requested to keep. Deeper unpinned tiles can still be evicted normally. Use `--precompute-no-pin` when that archival guarantee is not desired.
 
+## Static files and dynamic RAM residency
+
+Precomputed tiles are **not kept permanently in RAM**. Their files remain the authoritative stored representation, while the runtime maintains a separate byte-bounded in-process LRU for only the tiles currently useful to the viewer or another client.
+
+The intended hierarchy is:
+
+```text
+static/pinned tile files on disk
+        |
+        v
+persistent disk-cache policy
+        |
+        v
+byte-bounded decoded RAM LRU
+        |
+        v
+active renderer/simulation references
+```
+
+Scientific `.npy` fields are decoded into ordinary read-only NumPy arrays when requested. Repeated requests reuse the resident array until the RAM LRU evicts it. PNGs, meshes, vector files and other static products can be loaded through the same resident cache as bytes. Evicting any of these resident objects only drops the cache's process-memory reference; it does not remove or modify the static file.
+
+`PlanetTileRuntime` defaults to a 256 MiB resident-memory budget and accepts a different `memory_cache_max_bytes` value. The runtime exposes:
+
+- `load_field(...)` for decoded scientific arrays;
+- `load_product_bytes(...)` for static binary/viewer products;
+- `release_field(...)` and `release_product(...)` for explicit unloading;
+- `release_tile(...)` to drop all cached products associated with one tile;
+- `clear_memory_cache()` to unload the complete resident working set;
+- `memory_cache_stats()` for bytes, hits, misses, evictions and oversize rejections.
+
+The RAM cache is deliberately independent of disk pinning. A z0-z6 precomputed tile may be evicted from RAM immediately when it leaves the working set while its disk file remains permanently available. The next camera visit reloads it from disk without regeneration. Conversely, a deeper lazy tile can be evicted from RAM and later also evicted from the unpinned persistent disk cache if storage pressure requires it.
+
+Pinned static files are not `touch`ed on reads for disk-LRU bookkeeping, so ordinary runtime access does not mutate their timestamps merely to represent cache recency.
+
 ## Viewer behavior after precomputation
 
-Nothing changes in the viewer address space. If the camera requests a tile at or above the precomputed depth it is already a cache hit. If it requests a deeper tile, that tile is generated lazily as before.
+Nothing changes in the viewer address space. If the camera requests a tile at or above the precomputed depth its static file already exists; it is loaded into RAM only when needed. If it requests a deeper tile, that tile is generated lazily as before and then enters the same RAM residency layer.
 
 A common deployment pattern is therefore:
 
 ```text
-z0-z5   precomputed, pinned and immediately available
+z0-z5   precomputed/pinned on disk; loaded into RAM only when visible
 z6-z10  optionally precomputed for important worlds/regions
 z11+    generated on demand and cached/evicted normally
 ```
 
-This preserves instant coarse/medium zoom while retaining effectively arbitrary deep logical resolution without requiring the entire planet to be prebuilt at metre scale.
+This preserves instant coarse/medium zoom while retaining effectively arbitrary deep logical resolution without requiring either the full planet or the full precomputed prefix to remain resident in process memory.
