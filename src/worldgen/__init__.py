@@ -7,6 +7,14 @@ __all__ = ["WorldConfig", "load_config", "WorldPipeline"]
 __version__ = "0.5.0"
 
 
+# Install numerical compatibility patches before the pipeline imports modules that
+# call the canonical kernels.  Active terrestrial worlds retain their historical RNG
+# path exactly; only stagnant/inactive worlds below the legacy 0.8 cm/yr floor use the
+# regime-safe low-speed motion sampler.
+from .tectonics_regimes import install_regime_safe_tectonic_initializer as _install_tectonic_regimes  # noqa: E402
+_install_tectonic_regimes()
+
+
 # Install the complete advanced pipeline hierarchy onto the canonical pipeline module.
 # Import order is deliberate: each layer subclasses the preceding public behavior,
 # ending with drainage-rerouted secondary geomorphology. Existing imports from
