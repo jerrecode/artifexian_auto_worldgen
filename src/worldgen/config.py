@@ -49,7 +49,7 @@ class AstronomyConfig:
     target_mean_surface_c: float = 15.0
     thermodynamics_backend: str = "auto"  # auto | builtin | coolprop
 
-    # Atmosphere is a mole-fraction mapping.  Pressure plus composition and gravity
+    # Atmosphere is a mole-fraction mapping. Pressure plus composition and gravity
     # determine scale height/column mass; thickness may optionally override the
     # diagnostic top-of-atmosphere thickness for speculative worlds.
     atmosphere_pressure_bar: float = 1.0
@@ -61,7 +61,7 @@ class AstronomyConfig:
     surface_volatiles: dict[str, float] = field(default_factory=lambda: {"H2O": 1.0})
     surface_condensible: str = "auto"
 
-    # Body hierarchy.  role=moon means the generated world orbits a parent planet
+    # Body hierarchy. role=moon means the generated world orbits a parent planet
     # which itself follows semimajor_axis_au around the star.
     body_role: str = "planet"  # planet | moon
     parent_body_mass_earth: float | None = None
@@ -72,7 +72,7 @@ class AstronomyConfig:
     tidal_quality_factor_q: float = 100.0
     radiogenic_heat_flux_w_m2: float = 0.087
 
-    # General moon list.  An empty list preserves the historical single-moon fields.
+    # General moon list. An empty list preserves the historical single-moon fields.
     moon_mass_earth: float = 0.0123
     moon_orbit_km: float = 385000.0
     moons: list[dict[str, Any]] = field(default_factory=list)
@@ -91,10 +91,21 @@ class AtmogenConfig:
     chemistry_mode: str = "fixed_species"  # fixed_species | equilibrium
     vertical_layers: int = 24
     radiation_mode: str = "semi_gray_spectral_shortwave"
+
+    # Vertical thermal structure. In auto mode atmogen maps FAST->isothermal,
+    # STANDARD->dry radiative-convective, and HIGH/REFERENCE->attempt the bounded
+    # single-condensable dilute-saturated profile with explicit dry fallback.
+    temperature_profile_mode: str = "auto"  # auto | isothermal | dry_radiative_convective | dilute_saturated
+    gray_optical_depth_pressure_exponent: float = 2.0
+    moist_condensible: str = "auto"
+    moist_saturation_threshold: float = 0.90
+    moist_max_saturation_mixing_ratio: float = 0.25
+    moist_allow_estimated_saturation: bool = False
+
     activity_model: str = "auto"  # auto | ideal | nrtl
     liquid_phase_split: bool = True
 
-    # atmogen-enabled worlds use the resolved vertical path by default.  Legacy
+    # atmogen-enabled worlds use the resolved vertical path by default. Legacy
     # worlds are unaffected because the complete backend remains opt-in.
     vertical_transport_mode: str = "eddy_diffusion"  # none | eddy_diffusion
     eddy_diffusivity_m2_s: float = 50.0
@@ -156,7 +167,6 @@ class TectonicsConfig:
     shape_control_spread_deg: float = 5.0
     history_grid_height: int = 96
 
-    # Geological regime controls.  auto is resolved from radiogenic + tidal heat.
     geological_activity_mode: str = "auto"  # auto | active | stagnant_lid | inactive | tidal
     activity_strength: float = 1.0
     ice_geology_mode: str = "auto"  # auto | active | inactive
@@ -491,6 +501,12 @@ class WorldConfig:
         _boolean("atmogen.enabled", ag.enabled)
         if ag.fidelity not in {"FAST", "STANDARD", "HIGH", "REFERENCE"}: raise ValueError("atmogen.fidelity must be FAST, STANDARD, HIGH, or REFERENCE")
         if ag.chemistry_mode not in {"fixed_species", "equilibrium"}: raise ValueError("atmogen.chemistry_mode must be fixed_species or equilibrium")
+        if ag.temperature_profile_mode not in {"auto", "isothermal", "dry_radiative_convective", "dilute_saturated"}: raise ValueError("atmogen.temperature_profile_mode must be auto, isothermal, dry_radiative_convective, or dilute_saturated")
+        if not isinstance(ag.moist_condensible, str) or not ag.moist_condensible: raise TypeError("atmogen.moist_condensible must be a non-empty string")
+        _number("atmogen.gray_optical_depth_pressure_exponent", ag.gray_optical_depth_pressure_exponent, minimum=0.0, min_inclusive=False)
+        _number("atmogen.moist_saturation_threshold", ag.moist_saturation_threshold, minimum=0.0, maximum=1.0, min_inclusive=False)
+        _number("atmogen.moist_max_saturation_mixing_ratio", ag.moist_max_saturation_mixing_ratio, minimum=0.0, maximum=1.0, min_inclusive=False)
+        _boolean("atmogen.moist_allow_estimated_saturation", ag.moist_allow_estimated_saturation)
         if ag.activity_model not in {"auto", "ideal", "nrtl"}: raise ValueError("atmogen.activity_model must be auto, ideal, or nrtl")
         _boolean("atmogen.liquid_phase_split", ag.liquid_phase_split)
         if ag.vertical_transport_mode not in {"none", "eddy_diffusion"}: raise ValueError("atmogen.vertical_transport_mode must be none or eddy_diffusion")
