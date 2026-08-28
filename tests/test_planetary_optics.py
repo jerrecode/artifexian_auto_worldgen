@@ -42,7 +42,7 @@ def test_hydrocarbon_liquid_is_not_rendered_as_terrestrial_blue_water():
     assert water_blue_excess > methane_blue_excess + 0.08
 
 
-def test_titan_like_tholin_haze_tints_top_of_atmosphere_orange_and_absorbs_red_gas_band():
+def test_titan_like_tholin_haze_tints_top_of_atmosphere_and_separates_absorption_from_rayleigh():
     astro = SimpleNamespace(
         atmosphere={
             "fractions": {"N2": 0.95, "CH4": 0.05},
@@ -62,7 +62,17 @@ def test_titan_like_tholin_haze_tints_top_of_atmosphere_orange_and_absorbs_red_g
     )
     optics = atmosphere_visible_optics(astro, volatile, shape=(3, 4))
     assert optics.haze_rgb[0] > optics.haze_rgb[1] > optics.haze_rgb[2]
-    assert optics.gas_transmittance_rgb[0] < optics.gas_transmittance_rgb[2]
+
+    absorption = np.asarray(optics.metadata["molecular_absorption_tau_rgb"], dtype=float)
+    rayleigh = np.asarray(optics.metadata["rayleigh_tau_rgb"], dtype=float)
+    # CH4's broadband visible absorption is red-dominant in this screening model,
+    # while Titan's enormous molecular column preferentially removes blue from the
+    # direct beam through lambda^-4 Rayleigh scattering. Test those mechanisms
+    # separately rather than incorrectly requiring the combined transmission to have
+    # the methane-only ordering.
+    assert absorption[0] > absorption[2]
+    assert rayleigh[2] > rayleigh[0]
+    assert optics.gas_transmittance_rgb[2] < optics.gas_transmittance_rgb[0]
     assert np.min(optics.haze_optical_depth) > 0.5
 
     surface = np.full((3, 4, 3), 0.25, dtype=np.float32)
