@@ -7,6 +7,11 @@ module adds execution policy needed by interactive clients: per-tile request
 coalescing, persistent byte quotas, LRU eviction, and cache statistics. Keeping these
 concerns separate prevents viewer/service concurrency policy from leaking into the
 physical tile-generation contract.
+
+A deliberately precomputed complete prefix can be pinned. The persistent LRU then
+protects every generated product at or below that z-level while deeper opportunistic
+content remains evictable. An explicit precompute request therefore cannot be
+silently undone by later interactive navigation.
 """
 
 from contextlib import contextmanager
@@ -17,6 +22,7 @@ from threading import Lock, RLock
 from typing import Hashable, Iterator, Sequence
 
 from .planet_tiles import PlanetTilePyramid, TileKey, TileResult
+from .tile_pins import PinnedPrefix, path_is_pinned, read_pinned_prefix
 
 
 @dataclass(slots=True, frozen=True)
@@ -25,6 +31,9 @@ class PersistentTileCacheStats:
     bytes_used: int
     max_bytes: int | None
     evictions: int
+    pinned_files: int = 0
+    pinned_bytes: int = 0
+    pinned_maximum_level: int | None = None
 
 
 @dataclass(slots=True)
@@ -71,12 +80,17 @@ class KeyedRequestCoalescer:
 
 
 class PersistentTileFileLRU:
-    """Simple filesystem LRU quota for generated tile products.
+    """Filesystem LRU quota for generated tile products.
 
     File modification time is the access clock. Runtime reads/generation call
-    :meth:`touch` for returned products. `tileset.json` is immutable provenance and
-    is never counted or evicted. Temporary dot-files are ignored so an interrupted
-    atomic write cannot become a cache candidate.
+    :meth:`touch` for returned products. `tileset.json` and `precompute/` control
+    metadata are never managed as payload. Temporary dot-files are ignored so an
+    interrupted atomic write cannot become a cache candidate.
+
+    If a complete prefix is pinned, any managed product whose path contains a z-level
+    at or below the pinned maximum is non-evictable. When the pinned prefix alone is
+    larger than the configured byte quota, the cache intentionally remains over
+    budget instead of violating the archival pin.
     """
 
     def __init__(self, root: str | Path, *, max_bytes: int | None) -> None:
@@ -88,11 +102,14 @@ class PersistentTileFileLRU:
     def _managed_files(self) -> list[Path]:
         if not self.root.exists():
             return []
+        control_root = self.root / "precompute"
         files: list[Path] = []
         for path in self.root.rglob("*"):
             if not path.is_file():
                 continue
             if path == self.root / "tileset.json":
+                continue
+            if control_root == path or control_root in path.parents:
                 continue
             if path.name.startswith("."):
                 continue
@@ -105,6 +122,9 @@ class PersistentTileFileLRU:
             return max(0, int(path.stat().st_size))
         except FileNotFoundError:
             return 0
+
+    def _pin(self) -> PinnedPrefix | None:
+        return read_pinned_prefix(self.root)
 
     def touch(self, paths: Sequence[str | Path]) -> None:
         with self._lock:
@@ -125,19 +145,22 @@ class PersistentTileFileLRU:
             parent = parent.parent
 
     def prune(self, *, protected: Sequence[str | Path] = ()) -> tuple[Path, ...]:
-        """Evict least-recently-used files until the byte budget is satisfied.
+        """Evict least-recently-used unpinned files until the byte budget is met.
 
         `protected` files are never deleted during the call. This lets a request
         generate/touch its response and then enforce the quota without deleting the
-        exact files being returned. If the protected response itself is larger than
-        the whole quota, the cache may temporarily remain over budget until a later
-        request makes those files evictable.
+        exact files being returned. Pinned prefix products are also permanently
+        protected until the pin is removed or changed.
+
+        If protected/pinned data alone exceed the whole quota, the cache may remain
+        over budget; preservation takes precedence over the soft runtime quota.
         """
         if self.max_bytes is None:
             return ()
         protected_set = {Path(p).resolve() for p in protected}
         with self._lock:
-            entries: list[tuple[int, str, int, Path]] = []
+            pin = self._pin()
+            entries: list[tuple[int, str, int, Path, bool]] = []
             total = 0
             for path in self._managed_files():
                 try:
@@ -146,14 +169,17 @@ class PersistentTileFileLRU:
                     continue
                 size = max(0, int(stat.st_size))
                 total += size
-                entries.append((int(stat.st_mtime_ns), str(path), size, path))
+                pinned = path_is_pinned(self.root, path, pin) if pin is not None else False
+                entries.append((int(stat.st_mtime_ns), str(path), size, path, pinned))
             if total <= self.max_bytes:
                 return ()
             entries.sort(key=lambda item: (item[0], item[1]))
             removed: list[Path] = []
-            for _mtime, _name, size, path in entries:
+            for _mtime, _name, size, path, pinned in entries:
                 if total <= self.max_bytes:
                     break
+                if pinned:
+                    continue
                 try:
                     resolved = path.resolve()
                 except FileNotFoundError:
@@ -172,12 +198,25 @@ class PersistentTileFileLRU:
 
     def stats(self) -> PersistentTileCacheStats:
         with self._lock:
+            pin = self._pin()
             files = self._managed_files()
+            pinned_files = 0
+            pinned_bytes = 0
+            total_bytes = 0
+            for path in files:
+                size = self._size(path)
+                total_bytes += size
+                if pin is not None and path_is_pinned(self.root, path, pin):
+                    pinned_files += 1
+                    pinned_bytes += size
             return PersistentTileCacheStats(
                 files=len(files),
-                bytes_used=sum(self._size(path) for path in files),
+                bytes_used=total_bytes,
                 max_bytes=self.max_bytes,
                 evictions=self._evictions,
+                pinned_files=pinned_files,
+                pinned_bytes=pinned_bytes,
+                pinned_maximum_level=(pin.maximum_level if pin is not None else None),
             )
 
 
