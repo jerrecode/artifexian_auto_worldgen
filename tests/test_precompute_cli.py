@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from worldgen.tile_cli import main
+from worldgen.tile_pins import read_pinned_prefix
 
 
 def _write_world(root):
@@ -34,12 +35,14 @@ def test_cli_can_plan_complete_prefix_without_generating_tiles(tmp_path, capsys)
     payload = json.loads(capsys.readouterr().out)
     assert payload["precompute_plan"]["tile_count"] == 126
     assert payload["precompute_plan"]["maximum_level"] == 2
+    assert payload["precompute_plan"]["pin_on_success"] is True
     assert payload["tiles"] == []
     fields_root = tmp_path / "tiles" / "cubesphere_v1" / "fields"
     assert not fields_root.exists()
+    assert not (tmp_path / "tiles" / "cubesphere_v1" / "precompute" / "pinned_prefix.json").exists()
 
 
-def test_cli_precomputes_all_root_faces_and_resumes(tmp_path, capsys):
+def test_cli_precomputes_all_root_faces_resumes_and_pins(tmp_path, capsys):
     _write_world(tmp_path)
     argv = [
         "--world", str(tmp_path),
@@ -56,12 +59,34 @@ def test_cli_precomputes_all_root_faces_and_resumes(tmp_path, capsys):
     first = json.loads(first_io.out)
     assert first["precompute"]["total_tiles"] == 6
     assert first["precompute"]["base_generated_tiles"] == 6
+    assert first["pinned_prefix"]["maximum_level"] == 0
     assert "precompute 6/6" in first_io.err
+    pin = read_pinned_prefix(tmp_path / "tiles" / "cubesphere_v1")
+    assert pin is not None and pin.maximum_level == 0
 
     assert main(argv) == 0
     second = json.loads(capsys.readouterr().out)
     assert second["precompute"]["base_cache_hits"] == 6
     assert second["precompute"]["base_generated_tiles"] == 0
+    assert second["pinned_prefix"]["maximum_level"] == 0
+
+
+def test_cli_can_precompute_without_persistent_pin(tmp_path, capsys):
+    _write_world(tmp_path)
+    assert main([
+        "--world", str(tmp_path),
+        "--tile-size", "16",
+        "--maximum-level", "5",
+        "--precompute-depth", "0",
+        "--precompute-no-pin",
+        "--precompute-max-tiles", "20",
+        "--precompute-max-gib", "1",
+        "--json",
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["precompute_plan"]["pin_on_success"] is False
+    assert "pinned_prefix" not in payload
+    assert read_pinned_prefix(tmp_path / "tiles" / "cubesphere_v1") is None
 
 
 def test_cli_requires_explicit_override_for_large_prefix(tmp_path):
