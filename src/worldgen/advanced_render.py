@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import numpy as np
 
-from .render import _save_field, _save_power_field
+from .render import _save_field, _save_power_field, _save_rgb
 
 
 def _categorical(labels: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
@@ -26,6 +26,7 @@ def render_advanced_physical_maps(out: Path, world: dict, *, dpi: int = 120) -> 
     terrain = world["terrain"]
     hydro = world["hydrology"]
     land = np.asarray(terrain.land, bool)
+    exotic_hydrology = world.get("condensate_hydrology") is not None
 
     if hasattr(hydro, "basin_id"):
         _save_field(maps / "40_watershed_outlet_basins.png", _categorical(hydro.basin_id, land),
@@ -44,10 +45,12 @@ def render_advanced_physical_maps(out: Path, world: dict, *, dpi: int = 120) -> 
         _save_power_field(maps / "46_bankfull_discharge.png", hydro.bankfull_discharge_index,
                           "Bankfull / Channel-forming Discharge Index", "Blues", gamma=0.45, dpi=dpi)
     if hasattr(hydro, "baseflow_mm_year"):
+        base_title = "Subsurface Liquid Baseflow (liquid-equivalent mm/year)" if exotic_hydrology else "Groundwater Baseflow (mm/year)"
+        recharge_title = "Subsurface Liquid Recharge (liquid-equivalent mm/year)" if exotic_hydrology else "Groundwater Recharge (mm/year)"
         _save_power_field(maps / "47_groundwater_baseflow.png", hydro.baseflow_mm_year,
-                          "Groundwater Baseflow (mm/year)", "Blues", gamma=0.6, dpi=dpi)
+                          base_title, "Blues", gamma=0.6, dpi=dpi)
         _save_power_field(maps / "48_groundwater_recharge.png", hydro.groundwater_recharge_mm_year,
-                          "Groundwater Recharge (mm/year)", "YlGnBu", gamma=0.6, dpi=dpi)
+                          recharge_title, "YlGnBu", gamma=0.6, dpi=dpi)
     if hasattr(hydro, "topographic_wetness_index"):
         _save_field(maps / "49_topographic_wetness.png", np.where(land, hydro.topographic_wetness_index, np.nan),
                     "Topographic Wetness Index", "YlGnBu", dpi=dpi)
@@ -69,6 +72,35 @@ def render_advanced_physical_maps(out: Path, world: dict, *, dpi: int = 120) -> 
                           "Tidal Current / Reworking Index", "viridis", gamma=0.55, dpi=dpi)
         _save_power_field(maps / "55_intertidal_potential.png", tides.intertidal_potential,
                           "Intertidal Wetting Potential", "YlGnBu", gamma=0.55, dpi=dpi)
+
+    planetary = world.get("planetary_appearance")
+    if planetary is not None:
+        liquids = world.get("surface_liquids")
+        if liquids is not None:
+            wet = np.asarray(liquids.liquid_mask, dtype=bool)
+            liquid_rgb = np.asarray(planetary.surface_liquid_rgb, dtype=np.float32).copy()
+            # Neutral land background makes the composition-derived lake/sea color
+            # readable without falsely coloring dry cells as liquid.
+            liquid_rgb[~wet] = np.asarray([0.16, 0.16, 0.16], dtype=np.float32)
+            _save_rgb(maps / "55b_surface_liquid_optical_color.png", liquid_rgb, dpi=dpi)
+        _save_field(
+            maps / "56_ground_liquid_humidity.png",
+            np.where(land, planetary.ground_liquid_humidity_index, np.nan),
+            "Ground / Pore-liquid Humidity Index (active condensate)",
+            "YlGnBu", vmin=0, vmax=1, dpi=dpi,
+        )
+        _save_power_field(
+            maps / "57_atmospheric_haze_optical_depth.png",
+            planetary.atmospheric_haze_optical_depth,
+            "Visible Atmospheric Haze Optical-depth Proxy",
+            "magma", gamma=0.7, dpi=dpi,
+        )
+        _save_field(
+            maps / "58_solid_condensate_persistence.png",
+            np.where(land, planetary.solid_condensate_persistence, np.nan),
+            "Persistent Solid Condensate (species-generic)",
+            "Blues", vmin=0, vmax=1, dpi=dpi,
+        )
 
 
 __all__ = ["render_advanced_physical_maps"]
