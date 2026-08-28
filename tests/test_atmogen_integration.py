@@ -41,10 +41,11 @@ def test_adapter_replaces_old_greenhouse_authority_and_records_revision():
     assert result.convergence.converged
     assert abs(result.energy_budget.imbalance_w_m2) < 1e-9
     assert result.surface.mass_closure_relative < 1e-12
-    assert (
-        atmogen_runtime_metadata()["compatible_git_revision"]
-        == ATMOGEN_COMPATIBLE_REVISION
-    )
+    metadata = atmogen_runtime_metadata()
+    assert metadata["compatible_git_revision"] == ATMOGEN_COMPATIBLE_REVISION
+    assert metadata["package_version"] == "0.10.0"
+    assert metadata["api_schema_version"] == 9
+    assert metadata["data_schema_version"] == 4
 
 
 def test_standard_fidelity_exposes_nonisothermal_vertical_profile():
@@ -70,7 +71,39 @@ def test_standard_fidelity_exposes_nonisothermal_vertical_profile():
     assert temperature[0] > temperature[-1]
     assert np.all(np.diff(pressure) < 0.0)
     assert profile["hydrostatic_relative_residual"] < 2e-12
-    assert atmogen_runtime_metadata()["package_version"] == "0.9.0"
+    assert atmogen_runtime_metadata()["package_version"] == "0.10.0"
+
+
+def test_high_fidelity_worldgen_adapter_uses_water_saturated_profile():
+    cfg = configured_world()
+    cfg.astronomy.star_mass_solar = 1.0
+    cfg.astronomy.planet_mass_earth = 1.0
+    cfg.astronomy.planet_density_g_cm3 = 5.51
+    cfg.astronomy.atmosphere_pressure_bar = 1.01325
+    cfg.astronomy.atmosphere = {
+        "N2": 0.7808,
+        "O2": 0.2095,
+        "Ar": 0.0093,
+        "CO2": 0.0004,
+    }
+    cfg.astronomy.surface_volatiles = {"H2O": 1.05}
+    cfg.atmogen.fidelity = "HIGH"
+    cfg.atmogen.vertical_layers = 20
+    cfg.atmogen.temperature_profile_mode = "auto"
+    cfg.atmogen.moist_condensible = "H2O"
+    cfg.validate()
+
+    astro = build_astronomy(cfg.astronomy, RngPool(cfg.seed)("astronomy"))
+    result = AtmogenAdapter(cfg).solve(astro)
+
+    assert result.convergence.converged
+    assert result.diagnostics["temperature_profile_model"] == (
+        "dilute_saturated_gray_radiative_convective"
+    )
+    assert result.diagnostics["moist_condensible"] == "H2O"
+    assert result.diagnostics["saturated_convective_constraint_layers"] > 0
+    assert result.atmosphere.temperature_k[0] > result.atmosphere.temperature_k[-1]
+    assert result.atmosphere.hydrostatic_relative_residual < 2e-12
 
 
 def test_atmogen_phase_volume_uses_worldgen_spherical_geometry():
