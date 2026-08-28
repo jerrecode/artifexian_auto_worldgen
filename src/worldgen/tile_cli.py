@@ -6,13 +6,13 @@ from pathlib import Path
 from typing import Sequence
 
 from .planet_tiles import (
-    CUBE_FACES,
     PlanetTilePyramid,
     TileKey,
     TilePyramidSpec,
     approximate_meters_per_sample,
     latlon_to_tile,
 )
+from .terrain_mesh import write_terrain_mesh
 
 
 def _tile_address(value: str) -> TileKey:
@@ -50,7 +50,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--maximum-level", type=int, default=24, help="Largest permitted quadtree zoom")
     p.add_argument("--detail-strength", type=float, default=0.20, help="Deterministic sub-grid terrain detail amplitude")
     p.add_argument("--detail-hurst", type=float, default=0.65, help="Fractal amplitude falloff exponent")
-    p.add_argument("--detail-harmonics", type=int, default=6, help="Spherical harmonics/waves evaluated per detail band")
+    p.add_argument("--detail-harmonics", type=int, default=6, help="Spherical waves evaluated per detail band")
     p.add_argument("--planet-radius-m", type=float, default=None, help="Override radius discovery from world.json")
 
     request = p.add_mutually_exclusive_group()
@@ -69,6 +69,8 @@ def _parser() -> argparse.ArgumentParser:
         default=[],
         help="Field to materialize; repeat for multiple fields (default: elevation_m)",
     )
+    p.add_argument("--mesh", action="store_true", help="Also cache a render-ready local terrain mesh with perimeter skirts")
+    p.add_argument("--skirt-depth-m", type=float, default=None, help="Override automatic mixed-LOD terrain skirt depth")
     p.add_argument("--json", action="store_true", help="Emit machine-readable JSON only")
     return p
 
@@ -87,9 +89,16 @@ def _level(args, pyramid: PlanetTilePyramid, parser: argparse.ArgumentParser) ->
     return 0
 
 
-def _result_payload(pyramid: PlanetTilePyramid, key: TileKey, fields: Sequence[str]):
+def _result_payload(
+    pyramid: PlanetTilePyramid,
+    key: TileKey,
+    fields: Sequence[str],
+    *,
+    mesh: bool,
+    skirt_depth_m: float | None,
+):
     result = pyramid.generate_tile(key, fields)
-    return {
+    payload = {
         "key": {"face": key.face, "level": key.level, "x": key.x, "y": key.y},
         "meters_per_sample_approx": approximate_meters_per_sample(
             pyramid.planet_radius_m, key.level, pyramid.spec.tile_size
@@ -98,11 +107,23 @@ def _result_payload(pyramid: PlanetTilePyramid, key: TileKey, fields: Sequence[s
         "metadata": str(result.metadata_path),
         "fields": {name: str(path) for name, path in result.fields.items()},
     }
+    if mesh:
+        payload["mesh"] = str(
+            write_terrain_mesh(
+                pyramid,
+                key,
+                skirt_depth_m=skirt_depth_m,
+                overwrite=skirt_depth_m is not None,
+            )
+        )
+    return payload
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.skirt_depth_m is not None and args.skirt_depth_m < 0:
+        parser.error("--skirt-depth-m must be >= 0")
     try:
         spec = TilePyramidSpec(
             tile_size=args.tile_size,
@@ -146,7 +167,16 @@ def main(argv: list[str] | None = None) -> int:
         else:
             keys = ()
 
-        payload["tiles"] = [_result_payload(pyramid, key, fields) for key in keys]
+        payload["tiles"] = [
+            _result_payload(
+                pyramid,
+                key,
+                fields,
+                mesh=bool(args.mesh),
+                skirt_depth_m=args.skirt_depth_m,
+            )
+            for key in keys
+        ]
         if args.meters_per_sample is not None:
             payload["requested_meters_per_sample"] = float(args.meters_per_sample)
         if args.visible is not None:
