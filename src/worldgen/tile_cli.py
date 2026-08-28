@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Sequence
 
+from .local_downscaling import LocalTileDownscaler
 from .planet_tiles import (
     PlanetTilePyramid,
     TileKey,
@@ -13,6 +14,7 @@ from .planet_tiles import (
     latlon_to_tile,
 )
 from .terrain_mesh import write_terrain_mesh
+from .tile_products import TileProductExporter
 
 
 def _tile_address(value: str) -> TileKey:
@@ -67,10 +69,15 @@ def _parser() -> argparse.ArgumentParser:
         dest="fields",
         action="append",
         default=[],
-        help="Field to materialize; repeat for multiple fields (default: elevation_m)",
+        help="Scientific field to materialize; repeat for multiple fields (default: elevation_m)",
     )
     p.add_argument("--mesh", action="store_true", help="Also cache a render-ready local terrain mesh with perimeter skirts")
     p.add_argument("--skirt-depth-m", type=float, default=None, help="Override automatic mixed-LOD terrain skirt depth")
+    p.add_argument("--local-temperature", action="store_true", help="Cache terrain-downscaled annual temperature")
+    p.add_argument("--local-temperature-monthly", action="store_true", help="Cache terrain-downscaled monthly temperature")
+    p.add_argument("--height-png", action="store_true", help="Cache globally decoded 16-bit PNG height tiles")
+    p.add_argument("--true-color-png", action="store_true", help="Cache bilinearly sampled global true-colour PNG tiles")
+    p.add_argument("--terrain-temperature-png", action="store_true", help="Cache diagnostic terrain/local-temperature PNG tiles")
     p.add_argument("--json", action="store_true", help="Emit machine-readable JSON only")
     return p
 
@@ -96,6 +103,13 @@ def _result_payload(
     *,
     mesh: bool,
     skirt_depth_m: float | None,
+    downscaler: LocalTileDownscaler | None,
+    products: TileProductExporter | None,
+    local_temperature: bool,
+    local_temperature_monthly: bool,
+    height_png: bool,
+    true_color_png: bool,
+    terrain_temperature_png: bool,
 ):
     result = pyramid.generate_tile(key, fields)
     payload = {
@@ -116,6 +130,33 @@ def _result_payload(
                 overwrite=skirt_depth_m is not None,
             )
         )
+    if downscaler is not None:
+        derived = {}
+        if local_temperature:
+            downscaler.annual_temperature_c(key)
+            derived["annual_temperature_c"] = str(
+                downscaler._path(key, "annual_temperature_c")
+            )
+        if local_temperature_monthly:
+            downscaler.monthly_temperature_c(key)
+            derived["temperature_c_monthly"] = str(
+                downscaler._path(key, "temperature_c_monthly")
+            )
+        if derived:
+            payload["downscaled_fields"] = derived
+    if products is not None:
+        viewer = {}
+        if height_png:
+            viewer["height_png"] = str(products.height_png(key))
+            viewer["height_encoding"] = str(products.encoding_path)
+        if true_color_png:
+            viewer["true_color_png"] = str(products.true_color_png(key))
+        if terrain_temperature_png:
+            viewer["terrain_temperature_png"] = str(
+                products.terrain_temperature_png(key)
+            )
+        if viewer:
+            payload["viewer_products"] = viewer
     return payload
 
 
@@ -141,6 +182,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
 
     fields = tuple(args.fields) if args.fields else ("elevation_m",)
+    want_downscaled = bool(args.local_temperature or args.local_temperature_monthly)
+    want_products = bool(
+        args.height_png or args.true_color_png or args.terrain_temperature_png
+    )
+    downscaler = LocalTileDownscaler(pyramid) if (want_downscaled or args.terrain_temperature_png) else None
+    products = TileProductExporter(pyramid, downscaler=downscaler) if want_products else None
     payload: dict[str, object] = {
         "tileset": str(pyramid.manifest_path),
         "planet_radius_m": pyramid.planet_radius_m,
@@ -174,6 +221,13 @@ def main(argv: list[str] | None = None) -> int:
                 fields,
                 mesh=bool(args.mesh),
                 skirt_depth_m=args.skirt_depth_m,
+                downscaler=downscaler,
+                products=products,
+                local_temperature=bool(args.local_temperature),
+                local_temperature_monthly=bool(args.local_temperature_monthly),
+                height_png=bool(args.height_png),
+                true_color_png=bool(args.true_color_png),
+                terrain_temperature_png=bool(args.terrain_temperature_png),
             )
             for key in keys
         ]
