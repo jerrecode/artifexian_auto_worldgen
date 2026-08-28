@@ -2,16 +2,17 @@ from __future__ import annotations
 
 """Runtime coordination for sparse planetary tile generation.
 
-The scientific :class:`PlanetTilePyramid` stays deterministic and synchronous. This
+Persistent tile files are authoritative and independent of process memory. This
 module adds execution policy needed by interactive clients: per-tile request
-coalescing, persistent byte quotas, LRU eviction, and cache statistics. Keeping these
-concerns separate prevents viewer/service concurrency policy from leaking into the
-physical tile-generation contract.
+coalescing, a byte-bounded decoded RAM LRU, persistent disk quotas, and cache
+statistics. A tile can therefore stay permanently precomputed on disk while its
+decoded data is repeatedly loaded into and evicted from RAM as camera locality
+changes.
 
 A deliberately precomputed complete prefix can be pinned. The persistent LRU then
 protects every generated product at or below that z-level while deeper opportunistic
-content remains evictable. An explicit precompute request therefore cannot be
-silently undone by later interactive navigation.
+content remains evictable. RAM residency remains independent: pinned files are not
+implicitly pinned in memory.
 """
 
 from contextlib import contextmanager
@@ -21,7 +22,10 @@ from pathlib import Path
 from threading import Lock, RLock
 from typing import Hashable, Iterator, Sequence
 
+import numpy as np
+
 from .planet_tiles import PlanetTilePyramid, TileKey, TileResult
+from .tile_memory import ResidentTileCacheStats, ResidentTileMemoryCache
 from .tile_pins import PinnedPrefix, path_is_pinned, read_pinned_prefix
 
 
@@ -43,14 +47,7 @@ class _KeyLock:
 
 
 class KeyedRequestCoalescer:
-    """Serialize work for one logical key while allowing unrelated keys in parallel.
-
-    This is intentionally a keyed mutex rather than a memoized Future. A second
-    caller waits for the first caller for the same tile, then re-enters the normal
-    cache-aware generator. Therefore overlapping field requests cannot perform
-    duplicate simultaneous writes, while a later caller may still add a field that
-    the first caller did not request.
-    """
+    """Serialize work for one logical key while allowing unrelated keys in parallel."""
 
     def __init__(self) -> None:
         self._guard = RLock()
@@ -82,15 +79,9 @@ class KeyedRequestCoalescer:
 class PersistentTileFileLRU:
     """Filesystem LRU quota for generated tile products.
 
-    File modification time is the access clock. Runtime reads/generation call
-    :meth:`touch` for returned products. `tileset.json` and `precompute/` control
-    metadata are never managed as payload. Temporary dot-files are ignored so an
-    interrupted atomic write cannot become a cache candidate.
-
-    If a complete prefix is pinned, any managed product whose path contains a z-level
-    at or below the pinned maximum is non-evictable. When the pinned prefix alone is
-    larger than the configured byte quota, the cache intentionally remains over
-    budget instead of violating the archival pin.
+    Runtime access changes modification time only for evictable products. Pinned
+    precomputed files are intentionally left untouched on reads, so a completed
+    static prefix behaves as archival content rather than a mutable disk cache.
     """
 
     def __init__(self, root: str | Path, *, max_bytes: int | None) -> None:
@@ -127,9 +118,13 @@ class PersistentTileFileLRU:
         return read_pinned_prefix(self.root)
 
     def touch(self, paths: Sequence[str | Path]) -> None:
+        """Advance LRU time for evictable files without mutating pinned static files."""
         with self._lock:
+            pin = self._pin()
             for value in paths:
                 path = Path(value)
+                if pin is not None and path_is_pinned(self.root, path, pin):
+                    continue
                 try:
                     os.utime(path, None)
                 except FileNotFoundError:
@@ -147,13 +142,9 @@ class PersistentTileFileLRU:
     def prune(self, *, protected: Sequence[str | Path] = ()) -> tuple[Path, ...]:
         """Evict least-recently-used unpinned files until the byte budget is met.
 
-        `protected` files are never deleted during the call. This lets a request
-        generate/touch its response and then enforce the quota without deleting the
-        exact files being returned. Pinned prefix products are also permanently
-        protected until the pin is removed or changed.
-
-        If protected/pinned data alone exceed the whole quota, the cache may remain
-        over budget; preservation takes precedence over the soft runtime quota.
+        Files in ``protected`` are kept for the current response. Pinned prefix files
+        are always kept. If those protected classes alone exceed the configured disk
+        quota, persistence wins and the cache remains over budget.
         """
         if self.max_bytes is None:
             return ()
@@ -221,24 +212,52 @@ class PersistentTileFileLRU:
 
 
 class PlanetTileRuntime:
-    """Bounded, concurrency-safe interactive wrapper around `PlanetTilePyramid`."""
+    """Concurrency-safe static-file loader with bounded process RAM residency.
+
+    Disk and RAM are independent tiers:
+
+    * ``PlanetTilePyramid`` owns deterministic static files;
+    * ``PersistentTileFileLRU`` may evict only unpinned opportunistic disk products;
+    * ``ResidentTileMemoryCache`` owns temporary decoded arrays/bytes in process RAM.
+
+    Evicting RAM never deletes disk data. Evicting disk never invalidates an object
+    already returned to a caller. Callers should release their own references when a
+    tile leaves the active viewport if prompt physical-memory reclamation is desired.
+    """
+
+    DEFAULT_MEMORY_CACHE_BYTES = 256 * 1024**2
 
     def __init__(
         self,
         pyramid: PlanetTilePyramid,
         *,
         disk_cache_max_bytes: int | None = None,
+        memory_cache_max_bytes: int = DEFAULT_MEMORY_CACHE_BYTES,
     ) -> None:
         self.pyramid = pyramid
         self.coalescer = KeyedRequestCoalescer()
         self.disk_cache = PersistentTileFileLRU(
             pyramid.root, max_bytes=disk_cache_max_bytes
         )
+        self.memory_cache = ResidentTileMemoryCache(max_bytes=memory_cache_max_bytes)
 
     @staticmethod
     def _request_key(key: TileKey) -> tuple[str, int, int, int]:
         key.validate()
         return key.face, int(key.level), int(key.x), int(key.y)
+
+    @classmethod
+    def _field_memory_key(cls, key: TileKey, field: str) -> tuple[object, ...]:
+        return ("field", *cls._request_key(key), str(field))
+
+    def _product_path(self, value: str | Path) -> Path:
+        path = Path(value).expanduser().resolve()
+        root = self.pyramid.root.resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"tile product must be below {root}: {path}") from exc
+        return path
 
     def generate_tile(
         self, key: TileKey, fields: Sequence[str] = ("elevation_m",)
@@ -251,17 +270,92 @@ class PlanetTileRuntime:
             self.disk_cache.prune(protected=returned)
             return result
 
-    def load_field(self, key: TileKey, field: str, *, generate: bool = True):
+    def load_field(self, key: TileKey, field: str, *, generate: bool = True) -> np.ndarray:
+        """Load a scientific field into the byte-bounded decoded RAM cache."""
+        memory_key = self._field_memory_key(key, field)
+        cached = self.memory_cache.get(memory_key)
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+
         request_key = self._request_key(key)
-        with self.coalescer.hold(request_key):
+        with self.coalescer.hold(("load-field", *request_key, str(field))):
+            # Another waiter may have populated the resident cache while this caller
+            # was blocked on the keyed lock.
+            cached = self.memory_cache.peek(memory_key)
+            if cached is not None:
+                return cached  # type: ignore[return-value]
+
             path = self.pyramid._field_path(key, field)
-            if not path.exists() and generate:
+            if not path.exists():
+                if not generate:
+                    raise FileNotFoundError(path)
                 self.pyramid.generate_tile(key, (field,))
-            values = self.pyramid.load_field(key, field, generate=False)
+
+            values = np.load(path, allow_pickle=False)
+            if not isinstance(values, np.ndarray):
+                values = np.asarray(values)
+            # Static tile fields are immutable runtime inputs. Read-only arrays catch
+            # accidental in-place modification that would otherwise diverge RAM from
+            # the authoritative file.
+            try:
+                values.flags.writeable = False
+            except ValueError:
+                pass
+            self.memory_cache.put(memory_key, values, size_bytes=int(values.nbytes))
             metadata = self.pyramid._metadata_path(key)
             self.disk_cache.touch((path, metadata))
             self.disk_cache.prune(protected=(path, metadata))
             return values
+
+    def load_product_bytes(self, path: str | Path) -> bytes:
+        """Load any static tile product (PNG/mesh/vector/etc.) through the RAM LRU."""
+        product = self._product_path(path)
+        memory_key = ("product-bytes", str(product))
+        cached = self.memory_cache.get(memory_key)
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+
+        with self.coalescer.hold(memory_key):
+            cached = self.memory_cache.peek(memory_key)
+            if cached is not None:
+                return cached  # type: ignore[return-value]
+            payload = product.read_bytes()
+            self.memory_cache.put(memory_key, payload, size_bytes=len(payload))
+            self.disk_cache.touch((product,))
+            self.disk_cache.prune(protected=(product,))
+            return payload
+
+    def release_field(self, key: TileKey, field: str) -> bool:
+        """Drop the runtime cache reference for one decoded field; keep its file."""
+        return self.memory_cache.discard(self._field_memory_key(key, field))
+
+    def release_tile(self, key: TileKey) -> int:
+        """Drop all resident objects belonging to one tile address."""
+        address = self._request_key(key)
+
+        def belongs(cache_key: Hashable) -> bool:
+            if not isinstance(cache_key, tuple):
+                return False
+            if len(cache_key) >= 5 and cache_key[0] == "field":
+                return tuple(cache_key[1:5]) == address
+            if len(cache_key) >= 2 and cache_key[0] == "product-bytes":
+                level_token = f"/z{key.level:02d}/"
+                face_token = f"/{key.face}/"
+                x_token = f"/x{key.x:08d}/"
+                y_token = f"/y{key.y:08d}."
+                text = str(cache_key[1]).replace("\\", "/")
+                return all(token in text for token in (level_token, face_token, x_token, y_token))
+            return False
+
+        return self.memory_cache.discard_where(belongs)
+
+    def release_product(self, path: str | Path) -> bool:
+        product = self._product_path(path)
+        return self.memory_cache.discard(("product-bytes", str(product)))
+
+    def clear_memory_cache(self) -> int:
+        """Unload every runtime-cached tile object without deleting static files."""
+        return self.memory_cache.clear()
 
     def prune(self) -> tuple[Path, ...]:
         return self.disk_cache.prune()
@@ -269,10 +363,15 @@ class PlanetTileRuntime:
     def cache_stats(self) -> PersistentTileCacheStats:
         return self.disk_cache.stats()
 
+    def memory_cache_stats(self) -> ResidentTileCacheStats:
+        return self.memory_cache.stats()
+
 
 __all__ = [
     "KeyedRequestCoalescer",
     "PersistentTileCacheStats",
     "PersistentTileFileLRU",
     "PlanetTileRuntime",
+    "ResidentTileCacheStats",
+    "ResidentTileMemoryCache",
 ]
