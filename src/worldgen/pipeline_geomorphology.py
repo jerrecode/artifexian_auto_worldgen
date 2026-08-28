@@ -153,6 +153,19 @@ class WorldPipeline(_LandscapeWorldPipeline):
                 "river_capture_susceptibility", "isostatic_adjustment_m",
             ):
                 arrays[name] = np.asarray(getattr(g, name), np.float32)
+        forcing = world.get("condensate_hydrology")
+        if forcing is not None:
+            arrays.update({
+                "liquid_condensate_input_mm_year": np.asarray(forcing.annual_liquid_input_mm, np.float32),
+                "solid_condensate_input_mm_year": np.asarray(forcing.annual_solid_input_mm, np.float32),
+                "total_condensate_input_mm_year": np.asarray(forcing.annual_total_precipitation_depth_mm, np.float32),
+            })
+            hydro = world["hydrology"]
+            arrays.update({
+                "soil_liquid_storage_mm": np.asarray(hydro.soil_liquid_storage_mm, np.float32),
+                "subsurface_liquid_storage_mm": np.asarray(hydro.subsurface_liquid_storage_mm, np.float32),
+                "solid_condensate_storage_mm": np.asarray(hydro.solid_condensate_storage_mm, np.float32),
+            })
         pa = world.get("planetary_appearance")
         if pa is not None:
             arrays.update({
@@ -187,7 +200,7 @@ class WorldPipeline(_LandscapeWorldPipeline):
             ("60_landslide_erosion.png", g.landslide_erosion_m, "Mass-wasting / Landslide Erosion (m)", "inferno"),
             ("61_glacial_erosion.png", g.glacial_erosion_m, "Glacial Erosion (m)", "Blues"),
             ("62_glacial_deposition.png", g.glacial_deposition_m, "Glacial Deposition (m)", "PuBuGn"),
-            ("63_groundwater_spring_erosion.png", g.spring_erosion_m, "Spring / Groundwater Erosion (m)", "Blues"),
+            ("63_groundwater_spring_erosion.png", g.spring_erosion_m, "Subsurface-liquid / Spring Erosion (m)", "Blues"),
             ("64_karst_erosion.png", g.karst_erosion_m, "Karst Dissolution / Erosion (m)", "cividis"),
             ("65_floodplain_deposition.png", g.floodplain_deposition_m, "Floodplain Deposition (m)", "YlOrBr"),
             ("66_alluvial_fans.png", g.alluvial_fan_deposition_m, "Alluvial Fan Deposition (m)", "YlOrBr"),
@@ -210,7 +223,7 @@ class WorldPipeline(_LandscapeWorldPipeline):
             return report + "\n"
         m = g.metadata
         return report + "\n\n## Secondary geomorphic processes\n\n" + (
-            f"- Coupled active processes: regolith/weathering, mass wasting, glacial erosion/deposition, groundwater/spring erosion, karst, floodplains, alluvial fans, wetlands, braided channels, avulsion, estuaries, submarine canyons, coastal erosion, river capture and isostatic response.\n"
+            f"- Coupled active processes: regolith/weathering, mass wasting, glacial erosion/deposition, subsurface-liquid/spring erosion, karst, floodplains, alluvial fans, wetlands, braided channels, avulsion, estuaries, submarine canyons, coastal erosion, river capture and isostatic response.\n"
             f"- Maximum landslide erosion {m['max_landslide_erosion_m']:.2f} m; glacial erosion {m['max_glacial_erosion_m']:.2f} m; coastal erosion {m['max_coastal_erosion_m']:.2f} m.\n"
             f"- Capture-breach candidate cells: {m['river_capture_breach_cells']}; final receiver topology is recomputed after the terrain modifications.\n"
             f"- Wetland fraction of land (index > 0.45): {100.0*m['wetland_area_fraction_land']:.2f}%.\n"
