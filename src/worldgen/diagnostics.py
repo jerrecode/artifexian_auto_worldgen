@@ -144,6 +144,31 @@ def world_diagnostics(world: Mapping[str, Any]) -> dict[str, Any]:
             "P + initial storage = runoff + AET + final storage within numerical bucket tolerance",
         ))
 
+    condensate = world.get("condensate_hydrology")
+    condensate_residual = None
+    active_condensates: list[str] = []
+    if condensate is not None:
+        meta = getattr(condensate, "metadata", {}) or {}
+        condensate_residual = abs(float(meta.get("mass_conservation_relative_l1_residual", 0.0)))
+        active_condensates = list(meta.get("active_hydrologic_species", []))
+        invariants.append(InvariantResult(
+            "hydrology:multicondensate_mass_partition_closed",
+            condensate_residual <= 1e-6,
+            condensate_residual,
+            1e-6,
+            "sum of all species condensate mass fluxes must equal the transported reference condensate mass",
+        ))
+        forcing_shape_ok = (
+            np.asarray(condensate.monthly_total_precipitation_depth_mm).shape
+            == np.asarray(climate.precipitation_mm).shape
+        )
+        invariants.append(InvariantResult(
+            "hydrology:multicondensate_forcing_shape_matches_climate",
+            forcing_shape_ok,
+            str(np.asarray(condensate.monthly_total_precipitation_depth_mm).shape),
+            detail="species-aware hydrologic forcing must retain the monthly climate raster shape",
+        ))
+
     sediment = {}
     if surface is not None:
         eroded = np.maximum(np.asarray(surface.cumulative_erosion_m, float), 0.0)
@@ -203,7 +228,7 @@ def world_diagnostics(world: Mapping[str, Any]) -> dict[str, Any]:
     hashes = {name: array_digest(value) for name, value in arrays.items()}
     watershed_meta = hydro.metadata.get("watersheds", {}) if isinstance(hydro.metadata, dict) else {}
     result = {
-        "schema_version": 2,
+        "schema_version": 3,
         "invariants": [asdict(x) for x in invariants],
         "all_invariants_passed": bool(all(x.passed for x in invariants)),
         "metrics": {
@@ -227,6 +252,8 @@ def world_diagnostics(world: Mapping[str, Any]) -> dict[str, Any]:
             "precipitation_erosion_correlation": precip_erosion_corr,
             "runoff_erosion_correlation": runoff_erosion_corr,
             "discharge_erosion_correlation": discharge_erosion_corr,
+            "multicondensate_mass_partition_relative_l1_residual": condensate_residual,
+            "active_hydrologic_condensates": active_condensates,
             **sediment,
         },
         "field_hashes": hashes,
