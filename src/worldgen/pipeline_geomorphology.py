@@ -11,6 +11,7 @@ from .pipeline_landscape import WorldPipeline as _LandscapeWorldPipeline
 from .geomorphic_fluids import scaled_hydrology_config
 from .secondary_geomorphology import evolve_secondary_geomorphology
 from .appearance_advanced import attenuate_deep_bathymetry
+from .appearance_planetary import apply_composition_aware_appearance
 from .render import _save_field, _save_power_field
 from .condensate_pipeline import install_multicondensate_hydrology
 
@@ -130,6 +131,11 @@ class WorldPipeline(_LandscapeWorldPipeline):
         world = super().generate(out_dir=None)
         if self._secondary_enabled(world):
             world = self._apply_secondary_feedback(world)
+        # This must be the final visual pass: surface-liquid composition, final
+        # precipitation-driven pore-liquid storage, exotic sea ice, photochemical
+        # deposits, clouds and atmospheric transfer all depend on the accepted final
+        # shoreline/hydrology/volatile state.
+        world = apply_composition_aware_appearance(world, self.cfg)
         if out_dir is not None:
             self._stage("output", lambda: self.save(world, Path(out_dir)))
         return world
@@ -147,6 +153,16 @@ class WorldPipeline(_LandscapeWorldPipeline):
                 "river_capture_susceptibility", "isostatic_adjustment_m",
             ):
                 arrays[name] = np.asarray(getattr(g, name), np.float32)
+        pa = world.get("planetary_appearance")
+        if pa is not None:
+            arrays.update({
+                "surface_liquid_true_color_rgb": np.rint(
+                    np.clip(np.asarray(pa.surface_liquid_rgb, np.float32), 0.0, 1.0) * 255.0
+                ).astype(np.uint8),
+                "atmospheric_haze_optical_depth": np.asarray(pa.atmospheric_haze_optical_depth, np.float32),
+                "ground_liquid_humidity_index": np.asarray(pa.ground_liquid_humidity_index, np.float32),
+                "solid_condensate_persistence": np.asarray(pa.solid_condensate_persistence, np.float32),
+            })
         return arrays
 
     def _json_export(self, world: dict[str, Any]) -> dict[str, Any]:
@@ -154,6 +170,9 @@ class WorldPipeline(_LandscapeWorldPipeline):
         g = world.get("secondary_geomorphology")
         if g is not None:
             payload["secondary_geomorphology"] = dict(g.metadata)
+        pa = world.get("planetary_appearance")
+        if pa is not None:
+            payload["planetary_appearance"] = pa.to_dict()
         return payload
 
     def save(self, world: dict[str, Any], out: Path) -> None:
