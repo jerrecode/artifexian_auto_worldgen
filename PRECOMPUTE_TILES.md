@@ -56,6 +56,17 @@ worldgen-tiles \
 
 This creates every z0-z6 elevation tile. Levels z7 and deeper remain available on demand through the normal sparse API/viewer.
 
+A successful precompute is **pinned by default**. The interactive persistent LRU will not evict generated products belonging to z0-z6 even when a later camera session has a smaller cache quota. Deeper lazily generated tiles remain normal LRU candidates.
+
+For a disposable cache warm-up instead of an archival prefix, opt out explicitly:
+
+```bash
+worldgen-tiles \
+  --world world-out \
+  --precompute-depth 6 \
+  --precompute-no-pin
+```
+
 ## Precompute several scientific fields
 
 ```bash
@@ -154,9 +165,19 @@ It records the plan, product selection, completed count, cache hits, last comple
 
 No giant in-memory list of all tiles is required. Tile addresses are streamed breadth-first and the parallel scheduler keeps only a bounded `~2 * workers` task window in flight.
 
-## Interaction with cache eviction
+## Pinned prefix and cache eviction
 
-Complete-prefix precomputation is an offline persistence request. If a runtime disk quota is configured below the size of the requested complete prefix, quota eviction and complete precomputation are contradictory policies. For archival/prebuilt maps, provision a disk quota large enough for the prefix or disable runtime eviction for that output directory.
+On successful completion, the CLI writes:
+
+```text
+tiles/cubesphere_v1/precompute/pinned_prefix.json
+```
+
+The manifest records the deepest protected prefix and the source-world fingerprint. Pinning is monotonic: completing a shallower prefix later does not accidentally reduce an existing deeper pin.
+
+The runtime disk LRU excludes precompute control manifests from payload accounting and will not delete any generated product with a `zNN` level less than or equal to the pinned depth. This applies consistently to scientific fields, metadata, meshes, derived local physics, imagery and vectors.
+
+If the pinned prefix itself is larger than the configured runtime disk quota, preservation wins: cache statistics report an over-budget cache rather than deleting data the user explicitly requested to keep. Deeper unpinned tiles can still be evicted normally. Use `--precompute-no-pin` when that archival guarantee is not desired.
 
 ## Viewer behavior after precomputation
 
@@ -165,9 +186,9 @@ Nothing changes in the viewer address space. If the camera requests a tile at or
 A common deployment pattern is therefore:
 
 ```text
-z0-z5   precomputed and immediately available
+z0-z5   precomputed, pinned and immediately available
 z6-z10  optionally precomputed for important worlds/regions
-z11+    generated on demand and cached
+z11+    generated on demand and cached/evicted normally
 ```
 
 This preserves instant coarse/medium zoom while retaining effectively arbitrary deep logical resolution without requiring the entire planet to be prebuilt at metre scale.
