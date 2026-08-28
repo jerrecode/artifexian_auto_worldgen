@@ -98,8 +98,6 @@ def _advective_precip(grid: SphereGrid, temp: np.ndarray, p: np.ndarray, u: np.n
     if cfg.phase_coupled_evaporation:
         humidity_capacity = relative_vapor_capacity(condensible_species, ocean_t + 273.15, reference_temperature_k)
         phase = phase_code_grid(condensible_species, ocean_t + 273.15, surface_pressure_bar)
-        # Liquid reservoirs evaporate efficiently; frozen reservoirs can sublimate,
-        # while a nominal ocean whose condensable is unstable as liquid is strongly suppressed.
         reservoir = np.where(phase == 1, 1.0, np.where(phase == 2, 0.12, np.where(phase == 3, 0.35, 0.03)))
         evap = ocean * np.clip(humidity_capacity, 0.02, 6.0) * reservoir
     else:
@@ -172,10 +170,14 @@ def classify_koppen(temp: np.ndarray, precip: np.ndarray) -> np.ndarray:
 
 def build_climate(grid: SphereGrid, astronomy: AstronomyResult, terrain: TerrainResult, ocean: OceanResult,
                   cfg: ClimateConfig, tcfg: TerrainConfig, rng: np.random.Generator,
-                  noise_cfg: NoiseConfig | None = None, static_noise: StaticNoiseFields | None = None) -> ClimateResult:
+                  noise_cfg: NoiseConfig | None = None, static_noise: StaticNoiseFields | None = None,
+                  temperature_correction: np.ndarray | None = None) -> ClimateResult:
     if cfg.months != 12: raise ValueError("Current climate implementation requires 12 months")
     h,w=terrain.land.shape; temp=np.empty((12,h,w),np.float32); precip_raw=np.empty_like(temp); pressure=np.empty_like(temp); wu=np.empty_like(temp); wv=np.empty_like(temp); gwu=np.empty_like(temp); gwv=np.empty_like(temp); humidity=np.empty_like(temp); hfu=np.empty_like(temp); hfv=np.empty_like(temp)
     phase_monthly=np.empty((12,h,w),np.uint8); saturation_monthly=np.empty((12,h,w),np.float32)
+    correction = np.zeros((h,w), dtype=np.float32) if temperature_correction is None else np.asarray(temperature_correction, dtype=np.float32)
+    if correction.shape != (h,w) or np.any(~np.isfinite(correction)):
+        raise ValueError("temperature_correction must be a finite array matching the climate grid")
     mean_target=astronomy.planet["mean_surface_temperature_c_approx"]; tilt=astronomy.planet["axial_tilt_deg"]; dist_ocean=distance_to(terrain.ocean,grid)
     requested=cfg.condensible_species
     condensible = astronomy.volatile_chemistry.get("active_condensible") if requested == "auto" else requested
@@ -195,6 +197,7 @@ def build_climate(grid: SphereGrid, astronomy: AstronomyResult, terrain: Terrain
         tm=lat_base+response*seasonal_forcing[m]+coastal_current-tcfg.lapse_rate_k_per_km*np.maximum(ocean.elevation_km,0.0)
         sst_m=np.asarray(ocean.sst_anomaly_c_monthly[m] if hasattr(ocean,"sst_anomaly_c_monthly") else ocean.sst_anomaly_c,float)
         tm += sst_m*terrain.ocean + smooth_periodic(sst_m,(3.0,5.0))*np.exp(-dist_ocean/520.0)*terrain.land + texture
+        tm += correction
         phase_monthly[m]=phase_code_grid(condensible,tm+273.15,surface_pressure)
         saturation_monthly[m]=np.asarray(saturation_pressure_bar(condensible,tm+273.15,backend="builtin"),dtype=np.float32)
         itcz_lat=cfg.seasonal_itcz_shift_fraction*declinations[m]; p,u,v,gu,gv=_pressure_and_winds(grid,tm,terrain.land,ocean.elevation_km,cfg,itcz_lat)
@@ -223,6 +226,9 @@ def build_climate(grid: SphereGrid, astronomy: AstronomyResult, terrain: Terrain
           "active_condensible_species":condensible,"phase_codes":{"gas":0,"liquid":1,"solid":2,"supercritical":3},
           "precipitation_units_semantics":f"{condensible} liquid-equivalent mm under configured precipitation scaling; not necessarily water",
           "phase_coupled_evaporation":bool(cfg.phase_coupled_evaporation),
+          "atmogen_temperature_correction_applied":bool(temperature_correction is not None),
+          "atmogen_temperature_correction_mean_c":float(np.sum(correction*grid.cell_area_weights)),
+          "atmogen_temperature_correction_max_abs_c":float(np.max(np.abs(correction))),
           "precipitation_scaling":"spherical area-weighted target + power-tail shaping + tanh extreme soft-cap; no hard clipping","precipitation_extreme_softcap_mm_month":float(cap),"precipitation_softcap_alpha":float(precip_alpha),
           "classification":"Köppen-Geiger-like only for H2O climates; EXO marker for non-water condensables",
           "circulation":"seasonally migrating ITCZ + explicit trade winds/westerlies/polar easterlies + pressure anomalies","orographic_precipitation":"iterative humidity advection with physical upwind elevation gain and lee-side moisture depletion",
