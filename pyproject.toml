@@ -10,7 +10,7 @@ license = "MIT"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "atmogen @ git+https://github.com/jerrecode/atmogen.git@3b57e5dcef06f2d9a4218487a1a4f4ee349d6ea0",
+  "atmogen @ git+https://github.com/jerrecode/atmogen.git@f385068e5b06f56db45fe9e96c5264c1fe8d4349",
   "numpy>=2.0",
   "scipy>=1.13",
   "matplotlib>=3.8",
