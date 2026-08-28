@@ -74,6 +74,16 @@ jobs:
             --output 'showcase/${{ matrix.slug }}/showcase_audit.json' \
             | tee 'showcase/${{ matrix.slug }}/showcase_audit.log'
 
+      - name: Audit composition-aware surface and atmosphere rendering
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python scripts/audit_planetary_optics.py \
+            'showcase/${{ matrix.slug }}' \
+            --output 'showcase/${{ matrix.slug }}/planetary_optics_audit.json' \
+            --enforce \
+            | tee 'showcase/${{ matrix.slug }}/planetary_optics_audit.log'
+
       - name: Enforce showcase invariants
         shell: bash
         run: |
@@ -84,9 +94,12 @@ jobs:
           root=Path('showcase')/slug
           diag=json.loads((root/'diagnostics.json').read_text())
           audit=json.loads((root/'showcase_audit.json').read_text())
+          optics=json.loads((root/'planetary_optics_audit.json').read_text())
           failures=[]
           if not diag.get('all_invariants_passed',False):
               failures.append('diagnostics.json contains failed scientific/numerical invariants')
+          if not optics.get('all_invariants_passed',False):
+              failures.append(f"planetary optics invariant failures: {optics.get('invariants')}")
           h=audit['hydrology']; c=audit['conservation']; d=audit['saved_diagnostics']
           if h.get('river_cells_on_ocean',0)!=0:
               failures.append(f"{h['river_cells_on_ocean']} resolved river cells lie on ocean")
@@ -118,6 +131,12 @@ jobs:
               'erosion_relief_ratio':audit['landscape']['mean_erosion_to_relief_ratio'],
               'runoff_erosion_corr':audit['landscape']['runoff_erosion_correlation'],
               'condensates':audit['multicondensate']['active_hydrologic_species'],
+              'surface_liquid_rgb':optics['surface_liquid']['mean_rendered_rgb'],
+              'surface_liquid_composition':optics['surface_liquid']['composition_volume_fraction'],
+              'mean_haze_optical_depth':optics['atmosphere']['mean_haze_optical_depth'],
+              'mean_top_of_atmosphere_rgb':optics['atmosphere']['mean_top_of_atmosphere_rgb'],
+              'mean_ground_liquid_humidity':optics['ground_liquid']['mean_land_humidity_index'],
+              'humidity_liquid_precip_corr':optics['ground_liquid']['humidity_vs_liquid_precipitation_correlation'],
           },indent=2))
           PY
 
@@ -129,14 +148,15 @@ jobs:
           ROOT='showcase/${{ matrix.slug }}'
           PKG='showcase-artifact-${{ matrix.slug }}'
           mkdir -p "$PKG/maps"
-          for f in world.json world_report.md diagnostics.json run_manifest.json timings.json timings_cli.json advanced_planetary_physics.json surface_liquids.json showcase_audit.json showcase_audit.log generation.log; do
+          for f in world.json world_report.md diagnostics.json run_manifest.json timings.json timings_cli.json advanced_planetary_physics.json surface_liquids.json showcase_audit.json showcase_audit.log planetary_optics_audit.json planetary_optics_audit.log generation.log; do
             [ ! -f "$ROOT/$f" ] || cp "$ROOT/$f" "$PKG/"
           done
           if [ -d "$ROOT/maps" ]; then
             # Preserve visual evidence while avoiding the multi-GB numerical archive.
             cp -a "$ROOT/maps/." "$PKG/maps/"
           fi
-          python - <<'PY'
+          if [ -f "$ROOT/world_arrays.npz" ]; then
+            python - <<'PY'
           import json
           from pathlib import Path
           import numpy as np
@@ -148,6 +168,7 @@ jobs:
               keys=list(z.files)
           (out/'world_arrays_inventory.json').write_text(json.dumps({'keys':keys,'arrays':inv},indent=2))
           PY
+          fi
           find "$PKG" -type f -printf '%P\t%s\n' | sort > "$PKG/file_inventory.tsv"
           du -sh "$PKG"
 
