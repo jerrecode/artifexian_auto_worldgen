@@ -7,10 +7,12 @@ legacy deterministic world
   -> adaptive atmosphere/ocean coupling
   -> conserved volatile inventory + spherical liquid-level solve
   -> multicomponent chemistry/volatile cycle
+  -> mass-conservative multicomponent condensate hydrology
   -> exotic liquid-mixture state
   -> automatic silicate + cryogenic geodynamics
   -> cryogeology
-  -> fluid-property-aware geomorphic diagnostics
+  -> fluid-property-aware landscape evolution + secondary geomorphology
+  -> final composition-aware surface-liquid and atmospheric visible rendering
 ```
 
 The advanced layers are enabled when `astronomy.greenhouse_model: composition` is used. Legacy configurations continue to use the established reduced-order Earthlike path.
@@ -26,20 +28,21 @@ Two model tiers are intentional:
 
 This is a screening chemistry model, not Gibbs free-energy minimization or a kinetic reaction network.
 
-## Simultaneous condensates
+## Simultaneous condensates and land hydrology
 
 The base climate solver retains one transported reference moisture tracer for performance. `volatile_cycle.py` then determines every atmospheric species that is abundant enough and sufficiently close to saturation over a non-negligible area. Several species can be active simultaneously.
 
-For each active condensate it derives:
+For each active condensate it derives liquid/solid precipitation propensity, frost deposition, evaporation/sublimation potential and reservoir exchange. `condensate_hydrology.py` then treats the reference precipitation as mass flux, partitions that mass between all eligible condensates, and converts each species to liquid-volume depth using its own density. The partition is explicitly mass-conservative.
 
-- annual liquid-equivalent precipitation;
-- liquid versus solid precipitation fraction;
-- frost deposition;
-- evaporation potential;
-- sublimation potential;
-- surface-reservoir exchange.
+The resulting monthly liquid/solid condensate fields feed the actual land bucket, runoff, groundwater/baseflow and drainage solver. The bucket therefore means **mobile/stored condensate liquid**, not intrinsically water. Compatibility names such as `soil_water_storage_mm`, `groundwater_storage_mm` and `snowpack_mm` are retained for existing consumers, but new public aliases are available:
 
-The base transported condensate flux is partitioned conservatively between eligible species rather than independently duplicated. This preserves the reduced-order moisture budget at this layer, although each species does not yet feed its own latent heat back into the circulation.
+```text
+soil_liquid_storage_mm
+subsurface_liquid_storage_mm
+solid_condensate_storage_mm
+```
+
+The final `ground_liquid_humidity_index` combines persistent soil-liquid storage with current thermodynamically liquid precipitation input. Rain on an H2O world, methane rain on Titan-like worlds, or another supported liquid condensate therefore raises ground humidity using the same chemically generic geometric-liquid semantics.
 
 ## Photochemistry and energetic-particle chemistry
 
@@ -74,58 +77,52 @@ Ammonia-water and methanol-water mixtures receive bounded eutectic-like freezing
 
 ## Automatic geodynamic regimes
 
-`geodynamics.py` combines internal heat, tidal heat fraction, body mass/gravity, surface temperature, configured ice-shell thickness and antifreeze content. Automatic mode can select among:
+`geodynamics.py` combines internal heat, tidal heat fraction, body mass/gravity, surface temperature, configured ice-shell thickness and antifreeze content. Automatic mode can select among inactive, weakly active lid, stagnant lid, mobile lid, tidally forced, and heat-pipe/magma-dominated regimes. Ice-rich bodies independently receive inactive, conductive-shell, episodic-cryotectonic or active-cryotectonic regimes.
 
-- inactive;
-- weakly active lid;
-- stagnant lid;
-- mobile lid;
-- tidally forced;
-- heat-pipe/magma-dominated.
-
-Ice-rich bodies independently receive a cryogenic regime:
-
-- inactive;
-- conductive ice shell;
-- episodic cryotectonics;
-- active cryotectonics.
-
-Explicit user-selected tectonic modes remain authoritative; the classifier primarily upgrades `auto`.
+The low-speed tectonic initializer also respects genuinely inactive/stagnant bodies. The old terrestrial minimum speed is retained only for the historical active regime; configurations below that scale use a proportional low-speed distribution rather than failing or silently forcing Earth-like plate speeds.
 
 ## Cryogeology
 
-`cryogeology.py` produces spatial fields for:
-
-- ice-shell thickness and thermal thinning;
-- basal melt;
-- brittle fracture;
-- diapirism;
-- chaos-terrain propensity;
-- cryovolcanism;
-- plume venting;
-- sublimation erosion;
-- volatile frost deposition;
-- clathrate destabilization.
-
-It distinguishes thin, strongly fractured venting shells from thicker convecting/diapiric shells. Tidal forcing and inherited stress structure spatially focus activity. NH3/CH3OH antifreeze fractions increase shell mobility and basal-liquid persistence.
+`cryogeology.py` produces spatial fields for ice-shell thickness/thermal thinning, basal melt, brittle fracture, diapirism, chaos-terrain propensity, cryovolcanism, plume venting, sublimation erosion, volatile frost deposition and clathrate destabilization. It distinguishes thin, strongly fractured venting shells from thicker convecting/diapiric shells. Tidal forcing and inherited stress structure spatially focus activity.
 
 ## Methane and other non-water geomorphology
 
-`geomorphic_fluids.py` derives a parameter block from actual mobile-liquid density, viscosity and surface tension plus local gravity. Water at Earth gravity is the reference state. The block supplies dimensionless multipliers for:
+`geomorphic_fluids.py` derives a parameter block from actual mobile-liquid density, viscosity and surface tension plus local gravity. Water at Earth gravity is the reference state. The block supplies dimensionless multipliers for stream power, runoff efficiency, sediment transport, deposition, lateral bank erosion, delta retention, hillslope diffusion, evaporation loss and substrate erodibility.
 
-- stream power;
-- runoff efficiency;
-- sediment transport capacity;
-- deposition efficiency;
-- lateral bank erosion;
-- delta retention;
-- hillslope diffusion;
-- evaporation loss;
-- substrate erodibility.
+These coefficients are now fed through real surface-evolution recoupling rather than remaining diagnostic only. After fluid-aware erosion/deposition changes the bed, the conserved liquid level, ocean/climate state and drainage graph are solved again. Secondary geomorphology then adds mass wasting, glacial/cryogenic erosion and deposition, subsurface-liquid/spring erosion, karst screening, floodplains, alluvial fans, wetlands, braided/avulsing channels, estuaries, submarine canyons, coastal erosion, capture susceptibility and isostatic response before the final drainage reroute.
 
-The diagnostics therefore do not assume that a methane river on Titan has water density, water viscosity or Earth gravity. The layer also generates evaporite, organic-sediment, sublimation-landform and cryogenic mass-wasting indices.
+## Composition-aware true color
 
-The current 0.5 implementation uses these coefficients to describe/project the advanced geomorphic regime and to support future selectable fluid-aware landscape-evolution kernels. The legacy surface-evolution raster is not silently re-run with changed coefficients after the final conserved sea-level solve; doing that correctly requires another coupled liquid-level/climate/hydrology convergence loop rather than a one-line multiplier.
+`planetary_optics.py` and `appearance_planetary.py` replace the Earth-only visible assumptions after the final physical state has converged.
+
+### Surface liquid color
+
+The authoritative dynamic `surface_liquids.liquid_mask` and `liquid_depth_m` are rendered using the actual mobile liquid composition. The reduced-order optical model uses:
+
+- composition-weighted broadband RGB absorption coefficients;
+- two-way Beer-Lambert attenuation of bottom light;
+- shallow-bottom visibility for clear liquids;
+- deep-column scattering/source color;
+- composition-dependent refractive index and Fresnel/sky reflection;
+- suspended-sediment turbidity;
+- photochemical organic deposition/suspension where present;
+- exotic-ocean sea-ice fraction rather than a hard-coded 0 °C water threshold.
+
+Consequently methane/ethane seas are no longer painted terrestrial ocean blue. Pure cryogenic hydrocarbons are treated as comparatively transparent/neutral molecular liquids; Titan-like orange/brown appearance is supplied primarily by organic haze/deposition and atmospheric transfer rather than by pretending liquid methane itself is orange.
+
+### Atmospheric coloration
+
+`true_color_with_clouds` is now a top-of-atmosphere composite rather than merely `surface + white cloud`. The visible screening model includes:
+
+- molecular column scaling from surface pressure, gravity and mean molar mass;
+- composition-weighted Rayleigh efficiency with wavelength^-4 behavior;
+- broadband molecular visible absorption;
+- cloud color from the actual precipitating condensates;
+- photochemical aerosol optical depth/color, including tholins, sulfuric-acid aerosol, sulfur and other registered products.
+
+The clear `true_color` product represents the corrected surface/liquid raster; `true_color_with_clouds` additionally passes that surface through the modeled atmosphere/cloud/haze column.
+
+This is a **three-band reduced-order visible transfer model**, not line-by-line spectral or multiple-scattering radiative transfer. It is designed to make composition and pressure matter in the correct direction without claiming laboratory colorimetry. Venus is a particularly important limitation: H2SO4 aerosol/clouds are represented from explicit trace SO2 + H2O chemistry, but the detailed identity and spectrum of the short-wavelength absorber responsible for part of Venus's yellow/UV contrast is not hard-coded as if it were known exactly.
 
 ## Outputs
 
@@ -138,7 +135,22 @@ advanced_planetary_physics.json
 advanced_planetary_fields.npz
 ```
 
-`advanced_planetary_fields.npz` contains multicomponent precipitation/frost fields, photochemical deposition, cryogeology, ocean-state and exotic-geomorphology rasters where applicable.
+The normal `world_arrays.npz` now also includes the final composition-aware fields when available:
+
+```text
+liquid_condensate_input_mm_year
+solid_condensate_input_mm_year
+total_condensate_input_mm_year
+soil_liquid_storage_mm
+subsurface_liquid_storage_mm
+solid_condensate_storage_mm
+ground_liquid_humidity_index
+solid_condensate_persistence
+surface_liquid_true_color_rgb
+atmospheric_haze_optical_depth
+```
+
+Additional PNGs expose surface-liquid optical color, ground-liquid humidity, atmospheric haze optical depth and generic solid-condensate persistence.
 
 ## Scientific limitations
 
@@ -149,9 +161,10 @@ The advanced layer deliberately records what it does not solve. Important remain
 - species-specific latent-heat feedback in the circulation;
 - salinity/solute speciation and a true seawater/exotic-fluid equation of state;
 - primitive-equation ocean circulation and dynamic sea ice;
-- astronomical tide fields and dissipative tidal currents;
+- full non-equilibrium methane/ethane lake fractionation and basin-specific composition;
+- multiple-scattering, wavelength-resolved visible radiative transfer and aerosol phase functions;
 - mantle rheology/convection and plate-yield mechanics;
 - viscoelastic ice-shell tidal stress and fracture propagation;
-- fully fluid-aware coupled landscape evolution with grain-size/cohesive sediment physics.
+- grain-size/cohesive sediment transport and species-resolved porous-media flow.
 
 These limitations are why advanced modules use names such as `index`, `proxy`, `screening` and `approx` rather than implying laboratory-precision predictions.
