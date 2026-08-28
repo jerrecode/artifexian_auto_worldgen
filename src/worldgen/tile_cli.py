@@ -23,6 +23,7 @@ from .precompute import (
     precompute_complete_prefix,
 )
 from .terrain_mesh import write_terrain_mesh
+from .tile_pins import pin_complete_prefix
 from .tile_products import TileProductExporter
 
 
@@ -104,6 +105,11 @@ def _parser() -> argparse.ArgumentParser:
     pre.add_argument("--precompute-max-gib", type=float, default=16.0, help="Safety limit for estimated uncompressed array/mesh payload")
     pre.add_argument("--precompute-force-large", action="store_true", help="Bypass precompute tile/storage safety limits after reviewing the plan")
     pre.add_argument("--precompute-plan-only", action="store_true", help="Print the tile-count/storage plan without materializing tiles")
+    pre.add_argument(
+        "--precompute-no-pin",
+        action="store_true",
+        help="Do not protect the completed prefix from later interactive disk-LRU eviction",
+    )
     pre.add_argument("--precompute-progress-every", type=int, default=128, help="Status-manifest and stderr progress interval in completed tiles")
     pre.add_argument("--precompute-orography", action="store_true", help="Precompute terrain normals/slope and terrain-aware wind/precipitation")
     pre.add_argument("--precompute-surface", action="store_true", help="Precompute soil moisture, snow, vegetation, albedo and local biome proxy")
@@ -227,6 +233,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--skirt-depth-m must be >= 0")
     if args.precompute_plan_only and args.precompute_depth is None:
         parser.error("--precompute-plan-only requires --precompute-depth")
+    if args.precompute_no_pin and args.precompute_depth is None:
+        parser.error("--precompute-no-pin requires --precompute-depth")
     if args.precompute_max_gib <= 0:
         parser.error("--precompute-max-gib must be > 0")
     if args.precompute_max_tiles < 1:
@@ -269,6 +277,7 @@ def main(argv: list[str] | None = None) -> int:
             "estimated_uncompressed_bytes": plan.estimated_uncompressed_bytes,
             "estimated_uncompressed_gib": plan.estimated_uncompressed_gib,
             "products": asdict(plan.products),
+            "pin_on_success": not bool(args.precompute_no_pin),
             "note": (
                 "estimate covers uncompressed scientific arrays/meshes; PNG/vector/filesystem "
                 "overhead is data-dependent"
@@ -306,6 +315,10 @@ def main(argv: list[str] | None = None) -> int:
                     progress=show_progress,
                 )
                 payload["precompute"] = asdict(report)
+                if not args.precompute_no_pin:
+                    payload["pinned_prefix"] = asdict(
+                        pin_complete_prefix(pyramid, plan.maximum_level)
+                    )
             except (OSError, KeyError, ValueError, RuntimeError, PrecomputeLimitError) as exc:
                 parser.error(str(exc))
         payload["tiles"] = []
