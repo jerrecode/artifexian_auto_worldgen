@@ -12,7 +12,7 @@ import numpy as np
 import atmogen
 
 
-ATMOGEN_COMPATIBLE_REVISION = "f385068e5b06f56db45fe9e96c5264c1fe8d4349"
+ATMOGEN_COMPATIBLE_REVISION = "bd234ab952e04158bbffa63706793f9add9f4e59"
 
 
 def atmogen_runtime_metadata() -> dict[str, Any]:
@@ -62,6 +62,18 @@ class AtmogenAdapter:
             * 1e5,
             chemistry_mode=str(cfg.chemistry_mode),
             radiation_mode=str(cfg.radiation_mode),
+            temperature_profile_mode=str(cfg.temperature_profile_mode),
+            gray_optical_depth_pressure_exponent=float(
+                cfg.gray_optical_depth_pressure_exponent
+            ),
+            moist_condensible=str(cfg.moist_condensible),
+            moist_saturation_threshold=float(cfg.moist_saturation_threshold),
+            moist_max_saturation_mixing_ratio=float(
+                cfg.moist_max_saturation_mixing_ratio
+            ),
+            moist_allow_estimated_saturation=bool(
+                cfg.moist_allow_estimated_saturation
+            ),
             cloud_mode=str(cfg.cloud_mode),
             activity_model=str(getattr(cfg, "activity_model", "auto")),
             liquid_phase_split=bool(getattr(cfg, "liquid_phase_split", True)),
