@@ -11,7 +11,9 @@ adds invariants that are important enough to keep explicit at the public API:
   field in that child instead of rebuilding the same large index/weight arrays;
 * resumability is provenance-safe: incomplete child payloads are never reused under
   a different refinement specification, and a changed base NPZ cannot silently
-  inherit an older refinement tree.
+  inherit an older refinement tree;
+* forcing fields may be interpolated, but drainage topology is regenerated once on
+  the complete composed refined sphere so section boundaries cannot become outlets.
 """
 
 from dataclasses import asdict
@@ -25,6 +27,17 @@ import numpy as np
 
 from . import refinement_core as _core
 from .refinement_core import *  # noqa: F401,F403
+from .refinement_hydrology import (
+    DERIVED_HYDROLOGY_FIELDS,
+    load_refinement_hydrology_context,
+    recompute_refined_hydrology,
+)
+
+
+# Topology-derived hydrology fields are never interpolated into child sections.  They
+# are regenerated after a complete level has been composed.  Updating the core set at
+# import time also makes newly materialized base indexes carry the correct policy.
+_core._SKIP_REFINEMENT = set(_core._SKIP_REFINEMENT) | set(DERIVED_HYDROLOGY_FIELDS)
 
 
 def _partition_invariant_spherical_detail(
@@ -112,12 +125,13 @@ def _sample_with_context(
 
 
 class RefinementEngine(_core.RefinementEngine):
-    """Refinement engine with bounded sampler reuse and provenance-safe resume."""
+    """Refinement engine with sampler reuse, safe resume and refined hydrology."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._sampling_context_key: tuple[Any, ...] | None = None
         self._sampling_context: dict[str, Any] | None = None
+        self._hydrology_context: tuple[float, Any] | None = None
 
     def _reset_sampling_context(self) -> None:
         self._sampling_context_key = None
@@ -130,6 +144,43 @@ class RefinementEngine(_core.RefinementEngine):
         manifest["levels"] = {}
         self._reset_sampling_context()
         self._save_manifest(manifest)
+
+    def _load_manifest(self) -> dict[str, Any]:
+        manifest = super()._load_manifest()
+        limitations = [
+            item
+            for item in manifest.get("limitations", [])
+            if "flow_to is not interpolated" not in str(item)
+        ]
+        statement = (
+            "drainage topology (flow receivers, accumulation, channels and watersheds) "
+            "is recomputed globally after each complete refined level is composed"
+        )
+        if statement not in limitations:
+            limitations.append(statement)
+        inherited = (
+            "global atmosphere/ocean/tectonic state remains inherited from the parent "
+            "level rather than being solved independently inside arbitrary sections"
+        )
+        if inherited not in limitations:
+            limitations.append(inherited)
+        manifest["limitations"] = limitations
+        return manifest
+
+    def _mark_derived_fields_noninterpolable(self, level: int) -> None:
+        path = self._level_index_path(level)
+        if not path.exists():
+            return
+        index = self._load_index(level)
+        changed = False
+        for name in DERIVED_HYDROLOGY_FIELDS:
+            entry = index.get("entries", {}).get(name)
+            if entry is not None and entry.get("mode") != "skip":
+                entry["mode"] = "skip"
+                entry["recomputed_after_composition"] = bool(level > 0)
+                changed = True
+        if changed:
+            _core._atomic_write_json(path, index)
 
     def _prepare_base_level(self, manifest: dict[str, Any]) -> None:
         source = self.world_root / "world_arrays.npz"
@@ -169,6 +220,7 @@ class RefinementEngine(_core.RefinementEngine):
             if not isinstance(index.get("source_fingerprint"), dict) or not index["source_fingerprint"].get("sha256"):
                 index["source_fingerprint"] = _source_fingerprint(source, include_hash=True)
                 _core._atomic_write_json(index_path, index)
+        self._mark_derived_fields_noninterpolable(0)
 
     def _node_sampling_context(
         self,
@@ -218,12 +270,99 @@ class RefinementEngine(_core.RefinementEngine):
         self._sampling_context = context
         return context
 
+    def _hydrology_config(self) -> tuple[float, Any]:
+        if self._hydrology_context is None:
+            self._hydrology_context = load_refinement_hydrology_context(self.world_root)
+        return self._hydrology_context
+
+    def _ensure_level_hydrology(self, level: int, *, force: bool = False) -> dict[str, Any] | None:
+        if int(level) <= 0:
+            self._mark_derived_fields_noninterpolable(0)
+            return None
+        index_path = self._level_index_path(level)
+        if not index_path.exists():
+            return None
+        index = self._load_index(level)
+        if index.get("hydrology_recomputed") and not force:
+            self._mark_derived_fields_noninterpolable(level)
+            return index.get("hydrology_metadata")
+
+        arrays_dir = self._level_dir(level) / "arrays"
+        elevation_path = arrays_dir / "elevation_km.npy"
+        if not elevation_path.exists():
+            raise FileNotFoundError(
+                f"cannot recompute refined hydrology without {elevation_path}"
+            )
+        elevation = np.load(elevation_path, mmap_mode="r", allow_pickle=False)
+        forcing: dict[str, np.ndarray] = {}
+        for name in (
+            "runoff_mm_year",
+            "annual_precipitation_mm",
+            "baseflow_mm_year",
+            "storminess_index",
+        ):
+            path = arrays_dir / f"{name}.npy"
+            if path.exists():
+                forcing[name] = np.load(path, mmap_mode="r", allow_pickle=False)
+        radius_km, cfg = self._hydrology_config()
+        _core._emit(
+            self.progress,
+            event="refined_hydrology_start",
+            path=f"level[{level}]/hydrology",
+            level=level,
+            resolution=index.get("resolution"),
+        )
+        result = recompute_refined_hydrology(
+            elevation,
+            forcing,
+            radius_km=radius_km,
+            cfg=cfg,
+        )
+        for name, value in result.arrays.items():
+            _core._atomic_save_npy(arrays_dir / f"{name}.npy", value)
+            arr = np.asarray(value)
+            if arr.ndim == 2:
+                spatial_axes = [0, 1]
+            else:
+                spatial_axes = None
+            index.setdefault("entries", {})[name] = {
+                "shape": list(arr.shape),
+                "dtype": arr.dtype.str,
+                "spatial_axes": spatial_axes,
+                "mode": "skip",
+                "recomputed_after_composition": True,
+            }
+        index["hydrology_recomputed"] = True
+        index["hydrology_metadata"] = result.metadata
+        omitted = set(index.get("omitted_fields", []))
+        omitted.difference_update(result.arrays)
+        index["omitted_fields"] = sorted(omitted)
+        _core._atomic_write_json(index_path, index)
+        _core._atomic_write_json(
+            self._level_dir(level) / "hydrology_refinement.json",
+            result.metadata,
+        )
+        _core._emit(
+            self.progress,
+            event="refined_hydrology_done",
+            path=f"level[{level}]/hydrology",
+            level=level,
+            watersheds=result.metadata.get("terminal_watershed_count", 0),
+            max_strahler_order=result.metadata.get("max_strahler_order", 0),
+        )
+        return result.metadata
+
     def _process_level(
         self,
         manifest: dict[str, Any],
         parent_level: int,
         target_level: int,
     ) -> None:
+        # Migrate older completed refined parents before using them as a new source.
+        # This makes resume safe across the introduction of the hydrology-refinement
+        # kernel without forcing users to discard expensive refinement levels.
+        if parent_level > 0:
+            self._ensure_level_hydrology(parent_level)
         parent_index = self._load_index(parent_level)
         parent_width, parent_height = map(int, parent_index["resolution"])
         expected_resolution = [
@@ -261,6 +400,19 @@ class RefinementEngine(_core.RefinementEngine):
                 )
 
         super()._process_level(manifest, parent_level, target_level)
+
+    def _compose_level(
+        self,
+        parent_index: dict[str, Any],
+        target_level: int,
+        nodes: list[_core.RefinementNode],
+        target_shape: tuple[int, int],
+    ) -> dict[str, Any]:
+        index = super()._compose_level(parent_index, target_level, nodes, target_shape)
+        # Force recomputation because a newly composed elevation raster is the source
+        # of truth even when an interrupted run left stale derived arrays on disk.
+        self._ensure_level_hydrology(target_level, force=True)
+        return self._load_index(target_level)
 
     def _process_node_field(
         self,
