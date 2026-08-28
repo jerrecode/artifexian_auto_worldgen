@@ -12,6 +12,7 @@ from .geomorphic_fluids import scaled_hydrology_config
 from .secondary_geomorphology import evolve_secondary_geomorphology
 from .appearance_advanced import attenuate_deep_bathymetry
 from .render import _save_field, _save_power_field
+from .condensate_pipeline import install_multicondensate_hydrology
 
 
 class WorldPipeline(_LandscapeWorldPipeline):
@@ -27,6 +28,10 @@ class WorldPipeline(_LandscapeWorldPipeline):
     def _apply_secondary_feedback(self, world: dict[str, Any]) -> dict[str, Any]:
         c = self.cfg
         grid = world["grid"]
+        if world.get("condensate_hydrology") is None:
+            world = install_multicondensate_hydrology(
+                self, world, suffix="pre_secondary_geomorphology", rebuild_dependents=True
+            )
         result = self._stage(
             "secondary_geomorphology",
             lambda: evolve_secondary_geomorphology(
@@ -77,7 +82,7 @@ class WorldPipeline(_LandscapeWorldPipeline):
             result.elevation_km,
             erosion,
             deposition,
-            np.asarray(normalized := np.clip(
+            np.asarray(np.clip(
                 (erosion + deposition) / max(float(np.max(erosion + deposition)), 1.0), 0.0, 1.0
             ), np.float32),
             zero,
@@ -94,7 +99,9 @@ class WorldPipeline(_LandscapeWorldPipeline):
 
         # Rebuild the full liquid/climate/drainage graph. Capture breaches, fans,
         # coastal erosion and avulsion aggradation therefore influence actual receiver
-        # topology rather than staying as display-only indices.
+        # topology rather than staying as display-only indices.  The final accepted
+        # drainage state is then reinstalled from the multicomponent condensate mass
+        # forcing so exotic precipitation drives the exported network as well.
         scaled = scaled_hydrology_config(
             c.hydrology,
             world["geomorphic_fluid_parameters"],
@@ -102,6 +109,13 @@ class WorldPipeline(_LandscapeWorldPipeline):
         )
         world = self._equilibrate_surface_liquids(world, hydrology_cfg=scaled)
         world = self._build_exotic_layers(world, suffix="post_secondary_geomorphology")
+        world = install_multicondensate_hydrology(
+            self,
+            world,
+            hydrology_cfg=scaled,
+            suffix="post_secondary_geomorphology",
+            rebuild_dependents=True,
+        )
         world["secondary_geomorphology"] = result
         world["appearance"] = attenuate_deep_bathymetry(
             world["appearance"], world["terrain"], world["ocean"], world["weather"], c.appearance
