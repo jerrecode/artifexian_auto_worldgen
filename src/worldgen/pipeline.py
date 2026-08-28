@@ -17,6 +17,7 @@ import numpy as np
 from . import pipeline_base as _base
 from .convergence import ConvergenceThresholds, ConvergenceTracker
 from .atmogen_adapter import AtmogenAdapter, result_summary as atmogen_result_summary
+from .atmogen_coupler import solve_representative_columns
 
 
 class WorldPipeline(_base.WorldPipeline):
@@ -98,6 +99,10 @@ class WorldPipeline(_base.WorldPipeline):
                 "atmogen_column",
                 lambda: AtmogenAdapter(c).solve(astro),
             )
+        atmogen_feedback: np.ndarray | None = None
+        atmogen_column_history: list[dict[str, Any]] = []
+        latest_atmogen_columns = None
+
         cum_er = np.zeros(shape, np.float32)
         cum_dep = np.zeros(shape, np.float32)
         cum_delta = np.zeros(shape, np.float32)
@@ -206,7 +211,7 @@ class WorldPipeline(_base.WorldPipeline):
             )
             climate = self._stage(
                 f"climate_pass_{pass_number}",
-                lambda cc=ccfg: _base.build_climate(
+                lambda cc=ccfg, feedback=atmogen_feedback: _base.build_climate(
                     grid,
                     astro,
                     terrain,
@@ -216,8 +221,28 @@ class WorldPipeline(_base.WorldPipeline):
                     self.rng("climate-stationary"),
                     c.noise,
                     static_noise,
+                    temperature_correction=feedback,
                 ),
             )
+            if bool(c.atmogen.enabled) and bool(c.atmogen.representative_columns_enabled):
+                latest_atmogen_columns = self._stage(
+                    f"atmogen_columns_pass_{pass_number}",
+                    lambda current_climate=climate: solve_representative_columns(
+                        grid=grid,
+                        astronomy_result=astro,
+                        climate_result=current_climate,
+                        world_config=c,
+                    ),
+                )
+                atmogen_feedback = latest_atmogen_columns.temperature_correction_c
+                climate.metadata["atmogen_representative_columns"] = dict(
+                    latest_atmogen_columns.diagnostics
+                )
+                atmogen_column_history.append({
+                    "stage": f"atmogen_columns_pass_{pass_number}",
+                    **latest_atmogen_columns.diagnostics,
+                })
+
             geology = self._stage(
                 f"geology_pass_{pass_number}",
                 lambda: _base.build_geology(
@@ -313,6 +338,8 @@ class WorldPipeline(_base.WorldPipeline):
                     )
                 ),
             }
+            if latest_atmogen_columns is not None:
+                stat["atmogen_columns"] = dict(latest_atmogen_columns.diagnostics)
             temperature_change = None
             precipitation_change = None
             if prev_temp is not None:
@@ -406,7 +433,7 @@ class WorldPipeline(_base.WorldPipeline):
             gc.collect()
             climate = self._stage(
                 f"climate_final_couple_{pass_number}",
-                lambda: _base.build_climate(
+                lambda feedback=atmogen_feedback: _base.build_climate(
                     grid,
                     astro,
                     terrain,
@@ -416,8 +443,28 @@ class WorldPipeline(_base.WorldPipeline):
                     self.rng("climate-stationary"),
                     c.noise,
                     static_noise,
+                    temperature_correction=feedback,
                 ),
             )
+            if bool(c.atmogen.enabled) and bool(c.atmogen.representative_columns_enabled):
+                latest_atmogen_columns = self._stage(
+                    f"atmogen_columns_final_{pass_number}",
+                    lambda current_climate=climate: solve_representative_columns(
+                        grid=grid,
+                        astronomy_result=astro,
+                        climate_result=current_climate,
+                        world_config=c,
+                    ),
+                )
+                atmogen_feedback = latest_atmogen_columns.temperature_correction_c
+                climate.metadata["atmogen_representative_columns"] = dict(
+                    latest_atmogen_columns.diagnostics
+                )
+                atmogen_column_history.append({
+                    "stage": f"atmogen_columns_final_{pass_number}",
+                    **latest_atmogen_columns.diagnostics,
+                })
+
             temperature_change = float(
                 np.sum(
                     np.abs(climate.annual_temperature_c - prev_temp)
@@ -440,6 +487,8 @@ class WorldPipeline(_base.WorldPipeline):
                 "mean_abs_temperature_change_c": temperature_change,
                 "mean_abs_precipitation_change_mm_year": precipitation_change,
             }
+            if latest_atmogen_columns is not None:
+                stat["atmogen_columns"] = dict(latest_atmogen_columns.diagnostics)
             final_decision = None
             if final_tracker is not None:
                 final_decision = final_tracker.evaluate(
@@ -462,6 +511,13 @@ class WorldPipeline(_base.WorldPipeline):
             "final_coupling_mode": "adaptive" if adaptive_final else "fixed",
             "final_coupling_passes_executed": int(executed_final),
             "final_coupling_stop_reason": final_stop_reason,
+            "atmogen_representative_columns_enabled": bool(
+                c.atmogen.enabled and c.atmogen.representative_columns_enabled
+            ),
+            "atmogen_representative_column_solves": len(atmogen_column_history),
+            "atmogen_latest_column_diagnostics": (
+                {} if latest_atmogen_columns is None else dict(latest_atmogen_columns.diagnostics)
+            ),
         }
 
         geology = self._stage(
@@ -576,9 +632,15 @@ class WorldPipeline(_base.WorldPipeline):
             "society": society,
             "coupling_history": coupling_history,
             "coupling_summary": coupling_summary,
+            "atmogen_column_history": atmogen_column_history,
         }
         if atmogen_result is not None:
             world["atmogen"] = atmogen_result
+        if latest_atmogen_columns is not None:
+            world["atmogen_representative_columns"] = {
+                "diagnostics": dict(latest_atmogen_columns.diagnostics),
+                "summaries": latest_atmogen_columns.summaries,
+            }
         if out_dir is not None:
             self._stage("output", lambda: self.save(world, Path(out_dir)))
         return world
@@ -588,6 +650,10 @@ class WorldPipeline(_base.WorldPipeline):
         payload["coupling_summary"] = world.get("coupling_summary", {})
         if world.get("atmogen") is not None:
             payload["atmogen"] = atmogen_result_summary(world["atmogen"])
+        if world.get("atmogen_representative_columns") is not None:
+            payload["atmogen_representative_columns"] = world[
+                "atmogen_representative_columns"
+            ]
         return payload
 
     def _report(self, world: dict[str, Any]) -> str:
@@ -613,7 +679,19 @@ class WorldPipeline(_base.WorldPipeline):
                 f"- Solver converged: {result.convergence.converged}; iterations: {result.convergence.iterations}.",
                 f"- Derived Bond albedo: {result.spectra.bond_albedo:.6f}; surface temperature: {float(result.atmosphere.temperature_k[0]):.3f} K.",
                 f"- Energy imbalance: {result.energy_budget.imbalance_w_m2:.6e} W/m²; reservoir closure residual: {result.surface.mass_closure_relative:.6e}.",
-                "- This is a reduced-order representative vertical column; worldgen retains horizontal climate transport and geography.",
+                f"- Vertical process model: {result.vertical.model}; microphysics-step surface precipitation: {result.vertical.surface_precipitation_kg_m2:.6e} kg/m².",
+                "- Worldgen retains horizontal transport/geography; atmogen owns the solved local vertical material state.",
+            ])
+        rep = world.get("atmogen_representative_columns")
+        if rep is not None:
+            diag = rep.get("diagnostics", {})
+            lines.extend([
+                "",
+                "## atmogen geographic representative columns",
+                "",
+                f"- Representative columns: {diag.get('column_count', 0)}; all converged: {diag.get('all_columns_converged', False)}.",
+                f"- Area-mean applied next-pass temperature correction: {diag.get('temperature_correction_area_mean_c', 0.0):.4f} °C; maximum absolute correction: {diag.get('temperature_correction_max_abs_c', 0.0):.4f} °C.",
+                "- Cloud precipitation values are per configured microphysics operator step, not annual climatological precipitation.",
             ])
         return "\n".join(lines) + "\n"
 
