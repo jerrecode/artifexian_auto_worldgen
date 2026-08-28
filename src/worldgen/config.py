@@ -91,7 +91,33 @@ class AtmogenConfig:
     chemistry_mode: str = "fixed_species"  # fixed_species | equilibrium
     vertical_layers: int = 24
     radiation_mode: str = "semi_gray_spectral_shortwave"
-    cloud_mode: str = "equilibrium_bulk"
+    activity_model: str = "auto"  # auto | ideal | nrtl
+    liquid_phase_split: bool = True
+
+    # atmogen-enabled worlds use the resolved vertical path by default.  Legacy
+    # worlds are unaffected because the complete backend remains opt-in.
+    vertical_transport_mode: str = "eddy_diffusion"  # none | eddy_diffusion
+    eddy_diffusivity_m2_s: float = 50.0
+    cloud_mode: str = "lognormal_sedimentation"  # equilibrium_bulk | lognormal_sedimentation
+    cloud_suspended_fraction: float = 0.01
+    cloud_condensate_column_cap_kg_m2: float = 0.2
+    cloud_particle_median_radius_m: float = 1.0e-5
+    cloud_particle_geometric_std: float = 1.4
+    cloud_particle_density_kg_m3: float | None = None
+    cloud_refractive_index_real: float | None = None
+    cloud_refractive_index_imag: float = 0.0
+    gas_dynamic_viscosity_pa_s: float = 1.8e-5
+    cloud_microphysics_timestep_s: float = 3600.0
+    cloud_reevaporation_timescale_s: float | None = None
+    cloud_quadrature_order: int = 12
+
+    # Geographic coupling solves a bounded deterministic set of representative
+    # columns and feeds the relaxed temperature correction into the next climate pass.
+    representative_columns_enabled: bool = True
+    representative_column_count: int = 8
+    representative_feedback_relaxation: float = 0.25
+    representative_feedback_max_abs_k: float = 20.0
+
     max_iterations: int = 40
     relative_temperature_tolerance: float = 2.0e-5
     composition_tolerance: float = 1.0e-9
@@ -465,14 +491,33 @@ class WorldConfig:
         _boolean("atmogen.enabled", ag.enabled)
         if ag.fidelity not in {"FAST", "STANDARD", "HIGH", "REFERENCE"}: raise ValueError("atmogen.fidelity must be FAST, STANDARD, HIGH, or REFERENCE")
         if ag.chemistry_mode not in {"fixed_species", "equilibrium"}: raise ValueError("atmogen.chemistry_mode must be fixed_species or equilibrium")
+        if ag.activity_model not in {"auto", "ideal", "nrtl"}: raise ValueError("atmogen.activity_model must be auto, ideal, or nrtl")
+        _boolean("atmogen.liquid_phase_split", ag.liquid_phase_split)
+        if ag.vertical_transport_mode not in {"none", "eddy_diffusion"}: raise ValueError("atmogen.vertical_transport_mode must be none or eddy_diffusion")
+        if ag.cloud_mode not in {"equilibrium_bulk", "lognormal_sedimentation"}: raise ValueError("atmogen.cloud_mode must be equilibrium_bulk or lognormal_sedimentation")
         _integer("atmogen.vertical_layers", ag.vertical_layers, minimum=4, maximum=512)
         _integer("atmogen.max_iterations", ag.max_iterations, minimum=1, maximum=10000)
-        for name in ("relative_temperature_tolerance", "composition_tolerance", "energy_tolerance_w_m2", "surface_inventory_reference_mass_kg"):
+        _integer("atmogen.cloud_quadrature_order", ag.cloud_quadrature_order, minimum=1, maximum=128)
+        _integer("atmogen.representative_column_count", ag.representative_column_count, minimum=1, maximum=256)
+        for name in (
+            "relative_temperature_tolerance", "composition_tolerance", "energy_tolerance_w_m2",
+            "surface_inventory_reference_mass_kg", "eddy_diffusivity_m2_s",
+            "cloud_condensate_column_cap_kg_m2", "cloud_particle_median_radius_m",
+            "cloud_particle_geometric_std", "gas_dynamic_viscosity_pa_s",
+            "cloud_microphysics_timestep_s", "representative_feedback_max_abs_k",
+        ):
             _number(f"atmogen.{name}", getattr(ag, name), minimum=0.0, min_inclusive=False)
+        _fraction("atmogen.cloud_suspended_fraction", ag.cloud_suspended_fraction)
+        _fraction("atmogen.representative_feedback_relaxation", ag.representative_feedback_relaxation)
+        _number("atmogen.cloud_refractive_index_imag", ag.cloud_refractive_index_imag, minimum=0.0)
+        if ag.cloud_particle_geometric_std < 1.0: raise ValueError("atmogen.cloud_particle_geometric_std must be >= 1")
+        if ag.cloud_particle_density_kg_m3 is not None: _number("atmogen.cloud_particle_density_kg_m3", ag.cloud_particle_density_kg_m3, minimum=0.0, min_inclusive=False)
+        if ag.cloud_refractive_index_real is not None: _number("atmogen.cloud_refractive_index_real", ag.cloud_refractive_index_real, minimum=0.0, min_inclusive=False)
+        if ag.cloud_reevaporation_timescale_s is not None: _number("atmogen.cloud_reevaporation_timescale_s", ag.cloud_reevaporation_timescale_s, minimum=0.0, min_inclusive=False)
+        _boolean("atmogen.representative_columns_enabled", ag.representative_columns_enabled)
         _number("atmogen.relaxation", ag.relaxation, minimum=0.0, maximum=1.0, min_inclusive=False)
         _boolean("atmogen.allow_fidelity_fallback", ag.allow_fidelity_fallback)
         if not isinstance(ag.radiation_mode, str) or not ag.radiation_mode: raise TypeError("atmogen.radiation_mode must be a non-empty string")
-        if not isinstance(ag.cloud_mode, str) or not ag.cloud_mode: raise TypeError("atmogen.cloud_mode must be a non-empty string")
 
         t = self.tectonics
         _integer("tectonics.plate_count", t.plate_count, minimum=2, maximum=32766)
