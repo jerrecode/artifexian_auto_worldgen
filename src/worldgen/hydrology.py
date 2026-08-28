@@ -16,6 +16,8 @@ from .priority_flood import (
     numba_priority_flood_available,
 )
 from .hydrology_advanced import (
+    AdvancedHydrologyResult,
+    WaterBalanceResult,
     build_hydrology_advanced,
     evolve_surface_advanced,
     runoff_mm_advanced,
@@ -39,6 +41,30 @@ def _build_water_balance_dispatch(climate, land, geology, cfg):
 
 
 _advanced.build_water_balance = _build_water_balance_dispatch
+
+
+# Compatibility terminology: these storage fields predate exotic-fluid support and
+# retain their serialized names, but their numerical semantics in a composition-aware
+# world are active-condensate liquid/solid equivalent depths, not intrinsically H2O.
+# Public aliases let new callers remain chemically explicit without breaking older
+# consumers of soil_water_storage_mm/groundwater_storage_mm/snowpack_mm.
+def _soil_liquid_storage(self):
+    return self.soil_water_storage_mm
+
+
+def _subsurface_liquid_storage(self):
+    return self.groundwater_storage_mm
+
+
+def _solid_condensate_storage(self):
+    return self.snowpack_mm
+
+
+for _result_cls in (WaterBalanceResult, AdvancedHydrologyResult):
+    _result_cls.soil_liquid_storage_mm = property(_soil_liquid_storage)
+    _result_cls.subsurface_liquid_storage_mm = property(_subsurface_liquid_storage)
+    _result_cls.solid_condensate_storage_mm = property(_solid_condensate_storage)
+
 
 # Install deterministic optimized/conservative backends into the shared equations.
 # Both the interval and adaptive surface-evolution policies resolve these names from
