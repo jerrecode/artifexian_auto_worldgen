@@ -18,13 +18,13 @@ _COMMON_PHYSICAL = {
 }
 
 _STAGE_FILES: dict[str, set[str]] = {
-    "atmogen": {"atmogen_adapter.py", "astronomy.py"},
+    "atmogen": {"atmogen_adapter.py", "atmogen_coupler.py", "astronomy.py", "climate.py"},
     "astronomy": {"astronomy.py"},
     "tectonics": {"tectonics.py", "noise.py", "mathops.py"},
     "noise_cache": {"noise.py", "mathops.py", "tiling.py"},
     "terrain": {"terrain.py", "noise.py"},
     "ocean": {"ocean.py", "noise.py"},
-    "climate": {"climate.py", "noise.py"},
+    "climate": {"climate.py", "noise.py", "atmogen_coupler.py", "atmogen_adapter.py"},
     "geology": {"geology.py", "noise.py"},
     "surface": {
         "hydrology.py",
@@ -63,8 +63,6 @@ def fingerprint_source_files(
     for rel in paths:
         path = root / rel
         if not path.is_file():
-            # Missing declared dependencies must change the fingerprint rather than
-            # silently disappearing from it.
             marker = f"MISSING:{rel}".encode("utf-8")
             h.update(len(marker).to_bytes(4, "little"))
             h.update(marker)
@@ -83,7 +81,7 @@ def stage_source_files(stage_name: str) -> tuple[str, ...]:
     name = str(stage_name)
     if name == "astronomy":
         kind = "astronomy"
-    elif name == "atmogen_column":
+    elif name.startswith("atmogen_"):
         kind = "atmogen"
     elif name == "tectonics":
         kind = "tectonics"
@@ -112,7 +110,6 @@ def stage_source_files(stage_name: str) -> tuple[str, ...]:
     elif name == "output":
         kind = "output"
     else:
-        # Unknown future stages conservatively hash every Python module.
         root = Path(__file__).resolve().parent
         return tuple(
             sorted(
