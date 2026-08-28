@@ -21,7 +21,7 @@ import numpy as np
 
 from . import pipeline_base as _base
 from .pipeline import WorldPipeline as _AdaptiveWorldPipeline
-from .surface_liquids import SurfaceLiquidResult, solve_surface_liquids
+from .surface_liquids import SurfaceLiquidResult, place_partitioned_liquids, solve_surface_liquids
 
 # Approximate mass of Earth's oceans.  The reference is deliberately a named unit so
 # configs can express 0.1 ocean masses, 3 ocean masses, etc. without unwieldy values.
@@ -34,7 +34,8 @@ class WorldPipeline(_AdaptiveWorldPipeline):
     @staticmethod
     def _surface_liquids_enabled(cfg) -> bool:
         return bool(
-            getattr(cfg.astronomy, "greenhouse_model", "legacy") == "composition"
+            (bool(getattr(getattr(cfg, "atmogen", None), "enabled", False))
+             or getattr(cfg.astronomy, "greenhouse_model", "legacy") == "composition")
             and getattr(cfg.astronomy, "surface_volatiles", None)
         )
 
@@ -111,9 +112,13 @@ class WorldPipeline(_AdaptiveWorldPipeline):
         tolerance_m = 2.0
 
         for iteration in range(1, max_iterations + 1):
+            atmogen_result = world.get("atmogen")
             liquids = self._stage(
                 f"surface_liquid_equilibrium_{iteration}",
-                lambda cl=climate: solve_surface_liquids(
+                lambda cl=climate, ar=atmogen_result: place_partitioned_liquids(
+                    grid, bed_datum_km, inventories, ar.surface,
+                    temperature_k=float(ar.atmosphere.temperature_k[0]),
+                ) if ar is not None else solve_surface_liquids(
                     grid,
                     bed_datum_km,
                     cl.annual_temperature_c,

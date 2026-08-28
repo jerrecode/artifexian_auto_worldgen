@@ -1,5 +1,22 @@
 # Artifexian Automatic World Generator
 
+## Standalone atmosphere/material backend
+
+The optional `atmogen.enabled` path uses the separately versioned `atmogen` package
+as the authoritative representative-column atmosphere, phase-reservoir, cloud and
+spectral-radiation backend. The dependency is pinned to a compatible Git revision;
+run manifests and checkpoint keys record its package/API/data versions and material
+database hash. For sibling development, install `../atmogen` editable before this
+package. See `config/atmogen_fast.yaml` for the compact configuration boundary.
+
+Worldgen still owns spherical terrain, horizontal climate/ocean transport, and the
+exact spherical-wedge liquid-volume fill. On the new path, the phase masses,
+densities and liquid volumes passed into that geographic fill come from `atmogen`.
+The legacy reduced-order composition chemistry/optics layer is not run in parallel
+when `atmogen` is enabled. The current integration solves one representative FAST
+column; representative-column clustering and iterative horizontal column coupling
+remain future work and are not claimed as implemented.
+
 A deterministic, configurable Python pipeline that reconstructs the *kind of work* performed across the supplied **Worldbuilder's Log** transcripts as one automated procedural system.
 
 The goal is not to automate Photoshop, GPlates, Blender, Desmos, or spreadsheet clicks. The goal is to replace those manual representations with the underlying data and operations they stand for: spherical geometry, orbital physics, kinematic plate history, continuous raster fields, hydrology, climate, rule-based geology/resource generation, and a seeded constrained history generator.

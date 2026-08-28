@@ -1,0 +1,24 @@
+seed: 20260828
+resolution:
+  width: 128
+  height: 64
+astronomy:
+  star_mass_solar: 1.0
+  semimajor_axis_au: 1.0
+  greenhouse_model: composition
+  atmosphere_pressure_bar: 1.0
+  atmosphere_top_pressure_bar: 1.0e-6
+  atmosphere:
+    N2: 0.7808
+    O2: 0.2095
+    Ar: 0.0093
+    CO2: 0.0004
+  surface_volatiles:
+    H2O: 1.0
+atmogen:
+  enabled: true
+  fidelity: FAST
+  chemistry_mode: fixed_species
+  vertical_layers: 24
+  radiation_mode: semi_gray_spectral_shortwave
+  cloud_mode: equilibrium_bulk

@@ -1,0 +1,64 @@
+from dataclasses import asdict
+
+import numpy as np
+
+from worldgen.astronomy import build_astronomy
+from worldgen.atmogen_adapter import AtmogenAdapter, ATMOGEN_COMPATIBLE_REVISION, atmogen_runtime_metadata
+from worldgen.checkpoint import stage_cache_key
+from worldgen.config import WorldConfig
+from worldgen.fingerprints import stage_source_fingerprint
+from worldgen.grid import SphereGrid
+from worldgen.rng import RngPool
+from worldgen.surface_liquids import integrate_liquid_volume_m3, place_partitioned_liquids
+
+
+def configured_world() -> WorldConfig:
+    cfg = WorldConfig()
+    cfg.astronomy.semimajor_axis_au = 1.0
+    cfg.astronomy.greenhouse_model = "composition"
+    cfg.atmogen.enabled = True
+    cfg.atmogen.chemistry_mode = "fixed_species"
+    cfg.atmogen.vertical_layers = 12
+    return cfg.validate()
+
+
+def test_adapter_replaces_old_greenhouse_authority_and_records_revision():
+    cfg = configured_world()
+    astro = build_astronomy(cfg.astronomy, RngPool(cfg.seed)("astronomy"))
+    old_model = astro.atmosphere["greenhouse_model"]
+    result = AtmogenAdapter(cfg).solve(astro)
+    assert old_model == "composition"
+    assert astro.atmosphere["greenhouse_model"] == "atmogen"
+    assert astro.volatile_chemistry["authority"] == "atmogen"
+    assert result.convergence.converged
+    assert abs(result.energy_budget.imbalance_w_m2) < 1e-9
+    assert result.surface.mass_closure_relative < 1e-12
+    assert atmogen_runtime_metadata()["compatible_git_revision"] == ATMOGEN_COMPATIBLE_REVISION
+
+
+def test_atmogen_phase_volume_uses_worldgen_spherical_geometry():
+    cfg = configured_world()
+    astro = build_astronomy(cfg.astronomy, RngPool(cfg.seed)("astronomy"))
+    result = AtmogenAdapter(cfg).solve(astro)
+    grid = SphereGrid(64, 32, 6371.0)
+    bed = np.linspace(-5, 5, grid.width * grid.height).reshape(grid.shape)
+    inventories = {"H2O": cfg.atmogen.surface_inventory_reference_mass_kg}
+    placed = place_partitioned_liquids(grid, bed, inventories, result.surface,
+                                       temperature_k=float(result.atmosphere.temperature_k[0]))
+    direct = integrate_liquid_volume_m3(grid, bed, placed.liquid_level_km)
+    assert abs(direct - placed.total_liquid_volume_m3) / max(placed.total_liquid_volume_m3, 1) < 1e-9
+    assert placed.metadata["phase_authority"] == "atmogen"
+
+
+def test_atmogen_settings_change_only_dependent_stage_key_inputs():
+    a = configured_world()
+    b = configured_world()
+    b.atmogen.vertical_layers = 36
+    # Tectonics has no atmogen dependency; its stage-scoped input stays identical.
+    tect_a = {key: a.to_dict()[key] for key in ("seed", "resolution", "tectonics", "noise")}
+    tect_b = {key: b.to_dict()[key] for key in ("seed", "resolution", "tectonics", "noise")}
+    assert tect_a == tect_b
+    fp = stage_source_fingerprint("atmogen_column")
+    atm_a = {"astronomy": asdict(a.astronomy), "atmogen": asdict(a.atmogen)}
+    atm_b = {"astronomy": asdict(b.astronomy), "atmogen": asdict(b.atmogen)}
+    assert stage_cache_key("atmogen_column", atm_a, fp) != stage_cache_key("atmogen_column", atm_b, fp)

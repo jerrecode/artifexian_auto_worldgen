@@ -18,6 +18,7 @@ _COMMON_PHYSICAL = {
 }
 
 _STAGE_FILES: dict[str, set[str]] = {
+    "atmogen": {"atmogen_adapter.py", "astronomy.py"},
     "astronomy": {"astronomy.py"},
     "tectonics": {"tectonics.py", "noise.py", "mathops.py"},
     "noise_cache": {"noise.py", "mathops.py", "tiling.py"},
@@ -82,6 +83,8 @@ def stage_source_files(stage_name: str) -> tuple[str, ...]:
     name = str(stage_name)
     if name == "astronomy":
         kind = "astronomy"
+    elif name == "atmogen_column":
+        kind = "atmogen"
     elif name == "tectonics":
         kind = "tectonics"
     elif name == "noise_cache":

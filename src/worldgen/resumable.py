@@ -8,6 +8,7 @@ from typing import Any, Callable
 from .checkpoint import CheckpointStore, stage_cache_key
 from .fingerprints import stage_source_fingerprint
 from .pipeline import WorldPipeline
+from .atmogen_adapter import atmogen_runtime_metadata
 
 
 class ResumableWorldPipeline(WorldPipeline):
@@ -37,6 +38,8 @@ class ResumableWorldPipeline(WorldPipeline):
         sections: set[str] = {"seed"}
         if name == "astronomy":
             sections |= {"astronomy"}
+        elif name == "atmogen_column":
+            sections |= {"astronomy", "atmogen"}
         elif name == "tectonics":
             sections |= {"resolution", "tectonics", "noise"}
         elif name == "noise_cache":
@@ -65,10 +68,13 @@ class ResumableWorldPipeline(WorldPipeline):
             sections |= {"output"}
         else:
             return {"config": c, "dependency_digest": self._dependency_digest}
-        return {
+        result = {
             "config": {key: c[key] for key in sorted(sections) if key in c},
             "dependency_digest": self._dependency_digest,
         }
+        if name == "atmogen_column":
+            result["atmogen_runtime"] = atmogen_runtime_metadata()
+        return result
 
     def _stage_source_fingerprint(self, name: str) -> str:
         value = self._source_fingerprint_cache.get(name)

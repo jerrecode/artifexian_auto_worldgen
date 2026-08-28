@@ -366,6 +366,42 @@ def solve_surface_liquids(
     )
 
 
+def place_partitioned_liquids(
+    grid: SphereGrid,
+    bed_elevation_km: np.ndarray,
+    inventories_kg: Mapping[str, float],
+    phase_result,
+    *,
+    temperature_k: float,
+) -> SurfaceLiquidResult:
+    """Place authoritative atmogen phase volumes over spherical topography."""
+    bed = np.asarray(bed_elevation_km, dtype=np.float64)
+    if bed.shape != grid.shape:
+        raise ValueError("bed_elevation_km shape must match grid")
+    partitions: dict[str, VolatilePartition] = {}
+    keys = set(inventories_kg) | set(phase_result.atmospheric_mass_kg) | set(phase_result.liquid_mass_kg) | set(phase_result.solid_mass_kg)
+    for raw_key in sorted(keys):
+        key = canonical_species(raw_key)
+        total = float(inventories_kg.get(raw_key, inventories_kg.get(key, 0.0)))
+        vapor = float(phase_result.atmospheric_mass_kg.get(key, 0.0))
+        liquid = float(phase_result.liquid_mass_kg.get(key, 0.0))
+        solid = float(phase_result.solid_mass_kg.get(key, 0.0))
+        volume = float(phase_result.liquid_volume_m3.get(key, 0.0))
+        density = liquid / volume if volume > 0 else float(SPECIES[key].liquid_density_kg_m3)
+        partitions[key] = VolatilePartition(key, total, vapor, solid, liquid, 0.0, density, volume, vapor,
+                                             1.0 if solid > 0 else 0.0, 1.0 if liquid > 0 else 0.0,
+                                             float(temperature_k) if liquid > 0 else None)
+    total_mass = float(sum(p.liquid_mass_kg for p in partitions.values()))
+    total_volume = float(sum(p.liquid_volume_m3 for p in partitions.values()))
+    level_km, depth_m, integrated = solve_global_liquid_level(grid, bed, total_volume)
+    return SurfaceLiquidResult(float(level_km), depth_m, depth_m > 1e-6, (bed - level_km).astype(np.float32),
+                               total_mass, total_volume, integrated, integrated - total_volume, partitions,
+                               {"method": "atmogen phase volumes + worldgen exact spherical-wedge equipotential fill",
+                                "phase_authority": "atmogen", "inventory_total_kg": float(sum(inventories_kg.values())),
+                                "mass_closure_relative": float(phase_result.mass_closure_relative),
+                                "geometry": "spherical raster wedges using exact radial shell volume per cell solid angle"})
+
+
 __all__ = [
     "VolatilePartition",
     "SurfaceLiquidResult",
@@ -373,4 +409,5 @@ __all__ = [
     "solve_global_liquid_level",
     "partition_volatile_inventory",
     "solve_surface_liquids",
+    "place_partitioned_liquids",
 ]

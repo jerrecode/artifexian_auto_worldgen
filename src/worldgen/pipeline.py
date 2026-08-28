@@ -16,6 +16,7 @@ import numpy as np
 
 from . import pipeline_base as _base
 from .convergence import ConvergenceThresholds, ConvergenceTracker
+from .atmogen_adapter import AtmogenAdapter, result_summary as atmogen_result_summary
 
 
 class WorldPipeline(_base.WorldPipeline):
@@ -91,6 +92,12 @@ class WorldPipeline(_base.WorldPipeline):
             "noise_cache",
             lambda: _base.build_static_noise_fields(shape, c.noise, self.rng),
         )
+        atmogen_result = None
+        if bool(c.atmogen.enabled):
+            atmogen_result = self._stage(
+                "atmogen_column",
+                lambda: AtmogenAdapter(c).solve(astro),
+            )
         cum_er = np.zeros(shape, np.float32)
         cum_dep = np.zeros(shape, np.float32)
         cum_delta = np.zeros(shape, np.float32)
@@ -570,6 +577,8 @@ class WorldPipeline(_base.WorldPipeline):
             "coupling_history": coupling_history,
             "coupling_summary": coupling_summary,
         }
+        if atmogen_result is not None:
+            world["atmogen"] = atmogen_result
         if out_dir is not None:
             self._stage("output", lambda: self.save(world, Path(out_dir)))
         return world
@@ -577,6 +586,8 @@ class WorldPipeline(_base.WorldPipeline):
     def _json_export(self, world: dict[str, Any]) -> dict[str, Any]:
         payload = super()._json_export(world)
         payload["coupling_summary"] = world.get("coupling_summary", {})
+        if world.get("atmogen") is not None:
+            payload["atmogen"] = atmogen_result_summary(world["atmogen"])
         return payload
 
     def _report(self, world: dict[str, Any]) -> str:
@@ -593,6 +604,17 @@ class WorldPipeline(_base.WorldPipeline):
             f"- Final atmosphere-ocean mode: {summary.get('final_coupling_mode', 'fixed')}; passes executed: {summary.get('final_coupling_passes_executed', 0)}; stop reason: {summary.get('final_coupling_stop_reason', 'unknown')}.",
             "- Adaptive convergence is a numerical stopping criterion for this reduced-order model; it is not evidence that the model is a complete physical Earth-system solution.",
         ]
+        if world.get("atmogen") is not None:
+            result = world["atmogen"]
+            lines.extend([
+                "",
+                "## atmogen representative column",
+                "",
+                f"- Solver converged: {result.convergence.converged}; iterations: {result.convergence.iterations}.",
+                f"- Derived Bond albedo: {result.spectra.bond_albedo:.6f}; surface temperature: {float(result.atmosphere.temperature_k[0]):.3f} K.",
+                f"- Energy imbalance: {result.energy_budget.imbalance_w_m2:.6e} W/m²; reservoir closure residual: {result.surface.mass_closure_relative:.6e}.",
+                "- This is a reduced-order representative vertical column; worldgen retains horizontal climate transport and geography.",
+            ])
         return "\n".join(lines) + "\n"
 
 

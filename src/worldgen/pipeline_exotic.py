@@ -32,6 +32,10 @@ class WorldPipeline(_LiquidWorldPipeline):
 
     @staticmethod
     def _advanced_chemistry_enabled(cfg) -> bool:
+        if bool(getattr(getattr(cfg, "atmogen", None), "enabled", False)):
+            # atmogen is authoritative on the new path; do not run the older proxy
+            # chemistry/optics engine in competition with it.
+            return False
         return str(getattr(cfg.astronomy, "greenhouse_model", "legacy")) == "composition"
 
     def _build_exotic_layers(self, world: dict[str, Any]) -> dict[str, Any]:

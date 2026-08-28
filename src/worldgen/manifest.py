@@ -14,6 +14,7 @@ import numpy as np
 import scipy
 
 from .checkpoint import package_source_fingerprint, stable_json_hash
+from .atmogen_adapter import atmogen_runtime_metadata
 
 
 MANIFEST_SCHEMA_VERSION = 1
@@ -108,6 +109,7 @@ def build_run_manifest(
             "numpy": np.__version__,
             "scipy": scipy.__version__,
         },
+        "atmogen": {**atmogen_runtime_metadata(), "enabled": bool(cfg.get("atmogen", {}).get("enabled", False))},
         "runtime_plan": runtime,
         "stage_seconds": dict(timings or {}),
         "checkpoint_stats": dict(checkpoint_stats or {}),

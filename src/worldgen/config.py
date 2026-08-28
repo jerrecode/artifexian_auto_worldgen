@@ -83,6 +83,25 @@ class AstronomyConfig:
 
 
 @dataclass(slots=True)
+class AtmogenConfig:
+    """Configuration boundary for the standalone vertical material solver."""
+
+    enabled: bool = False
+    fidelity: str = "FAST"  # FAST | STANDARD | HIGH | REFERENCE
+    chemistry_mode: str = "fixed_species"  # fixed_species | equilibrium
+    vertical_layers: int = 24
+    radiation_mode: str = "semi_gray_spectral_shortwave"
+    cloud_mode: str = "equilibrium_bulk"
+    max_iterations: int = 40
+    relative_temperature_tolerance: float = 2.0e-5
+    composition_tolerance: float = 1.0e-9
+    energy_tolerance_w_m2: float = 0.05
+    relaxation: float = 0.55
+    allow_fidelity_fallback: bool = True
+    surface_inventory_reference_mass_kg: float = 1.3321e21
+
+
+@dataclass(slots=True)
 class TectonicsConfig:
     plate_count: int = 14
     continental_fraction_target: float = 0.29
@@ -362,6 +381,7 @@ class WorldConfig:
     seed: int = 20260826
     resolution: ResolutionConfig = field(default_factory=ResolutionConfig)
     astronomy: AstronomyConfig = field(default_factory=AstronomyConfig)
+    atmogen: AtmogenConfig = field(default_factory=AtmogenConfig)
     noise: NoiseConfig = field(default_factory=NoiseConfig)
     tectonics: TectonicsConfig = field(default_factory=TectonicsConfig)
     terrain: TerrainConfig = field(default_factory=TerrainConfig)
@@ -441,6 +461,19 @@ class WorldConfig:
         _number("astronomy.stellar_neighborhood_radius_ly", a.stellar_neighborhood_radius_ly, minimum=0.0)
         _number("astronomy.stellar_density_per_ly3", a.stellar_density_per_ly3, minimum=0.0)
 
+        ag = self.atmogen
+        _boolean("atmogen.enabled", ag.enabled)
+        if ag.fidelity not in {"FAST", "STANDARD", "HIGH", "REFERENCE"}: raise ValueError("atmogen.fidelity must be FAST, STANDARD, HIGH, or REFERENCE")
+        if ag.chemistry_mode not in {"fixed_species", "equilibrium"}: raise ValueError("atmogen.chemistry_mode must be fixed_species or equilibrium")
+        _integer("atmogen.vertical_layers", ag.vertical_layers, minimum=4, maximum=512)
+        _integer("atmogen.max_iterations", ag.max_iterations, minimum=1, maximum=10000)
+        for name in ("relative_temperature_tolerance", "composition_tolerance", "energy_tolerance_w_m2", "surface_inventory_reference_mass_kg"):
+            _number(f"atmogen.{name}", getattr(ag, name), minimum=0.0, min_inclusive=False)
+        _number("atmogen.relaxation", ag.relaxation, minimum=0.0, maximum=1.0, min_inclusive=False)
+        _boolean("atmogen.allow_fidelity_fallback", ag.allow_fidelity_fallback)
+        if not isinstance(ag.radiation_mode, str) or not ag.radiation_mode: raise TypeError("atmogen.radiation_mode must be a non-empty string")
+        if not isinstance(ag.cloud_mode, str) or not ag.cloud_mode: raise TypeError("atmogen.cloud_mode must be a non-empty string")
+
         t = self.tectonics
         _integer("tectonics.plate_count", t.plate_count, minimum=2, maximum=32766)
         _fraction("tectonics.continental_fraction_target", t.continental_fraction_target); _fraction("tectonics.continental_plate_fraction", t.continental_plate_fraction)
@@ -513,7 +546,7 @@ class WorldConfig:
 
 
 _SECTION_TYPES = {
-    "resolution": ResolutionConfig, "astronomy": AstronomyConfig, "noise": NoiseConfig,
+    "resolution": ResolutionConfig, "astronomy": AstronomyConfig, "atmogen": AtmogenConfig, "noise": NoiseConfig,
     "tectonics": TectonicsConfig, "terrain": TerrainConfig, "ocean": OceanConfig,
     "climate": ClimateConfig, "hydrology": HydrologyConfig, "simulation": SimulationConfig,
     "weather": WeatherConfig, "resources": ResourcesConfig, "society": SocietyConfig,
