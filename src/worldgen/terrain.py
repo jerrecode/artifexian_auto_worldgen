@@ -64,13 +64,18 @@ def rebuild_terrain_from_elevation(
     # Continuous lowland score: flat, low-elevation land is strongest.
     low = land.astype(float) * np.exp(-np.maximum(elev, 0.0) / 0.85) * (1.0 - 0.70 * rough)
     low = normalize01(low) * land
-    meta = {
+    # Geometry-derived metadata is canonical and must never be overwritten by a
+    # carried-forward metadata dictionary from an older shoreline.  Build from the
+    # historical/provenance payload first, then stamp fields that describe this exact
+    # raster last.
+    meta = dict(metadata_extra or {})
+    meta.update({
         "actual_land_fraction": grid.weighted_fraction(land),
+        "actual_ocean_fraction": grid.weighted_fraction(ocean),
         "sea_level_offset_km": float(sea_level_offset_km),
         "max_elevation_km_pre_bathymetry": float(np.max(elev)),
-    }
-    if metadata_extra:
-        meta.update(metadata_extra)
+        "geometry_metadata_reconciled": True,
+    })
     return TerrainResult(elev.astype(np.float32), land, ocean, coast, shelf, float(sea_level_offset_km),
                          mountain.astype(np.float32), low.astype(np.float32), rough.astype(np.float32), meta)
 
