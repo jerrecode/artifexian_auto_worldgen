@@ -12,9 +12,15 @@ astronomy:
   thermodynamics_backend: auto
   atmosphere_pressure_bar: 92.0
   atmosphere_top_pressure_bar: 1.0e-5
+  # Approximate lower-atmosphere bulk/trace composition. SO2 and H2O are retained
+  # explicitly because their oxidation/hydration supplies the H2SO4 cloud aerosol;
+  # omitting them leaves a chemically impossible CO2/N2-only visible atmosphere.
   atmosphere:
-    CO2: 0.965
+    CO2: 0.964775
     N2: 0.035
+    SO2: 0.00015
+    Ar: 0.000055
+    H2O: 0.000020
   surface_volatiles:
     SO2: 1.0
   surface_condensible: SO2
