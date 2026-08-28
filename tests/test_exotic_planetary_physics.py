@@ -53,6 +53,18 @@ def test_titanlike_nitrogen_methane_photochemistry_generates_tholin_and_nitriles
     assert products["THOLIN"].deposited
 
 
+def test_venuslike_trace_so2_and_water_generate_sulfuric_acid_aerosol():
+    astro = _astronomy_stub(gravity=8.87)
+    astro.planet["semimajor_axis_au"] = 0.723
+    products = evaluate_photochemistry(
+        astro,
+        {"CO2": 0.964775, "N2": 0.035, "SO2": 1.5e-4, "H2O": 2.0e-5, "Ar": 5.5e-5},
+    )
+    assert "H2SO4" in products
+    assert products["H2SO4"].aerosol
+    assert products["H2SO4"].production_index > 0.0
+
+
 def test_multiple_condensates_can_be_active_without_single_species_exclusivity():
     temp = np.full((16, 32), 94.0 - 273.15)
     condensates = detect_condensates(
@@ -158,13 +170,38 @@ def _tiny_advanced_config() -> WorldConfig:
     return c.validate()
 
 
-def test_canonical_pipeline_exports_advanced_planetary_layers():
+def test_canonical_pipeline_exports_advanced_planetary_layers_and_final_optics():
     world = WorldPipeline(_tiny_advanced_config(), progress=None).generate()
     for key in (
         "surface_liquids", "volatile_cycle", "exotic_ocean", "geodynamics",
         "cryogeology", "geomorphic_fluid_parameters", "exotic_geomorphology",
+        "condensate_hydrology", "planetary_appearance",
     ):
         assert key in world
     assert world["geomorphic_fluid_parameters"].active_fluid in {"CH4", "C2H6"}
     assert world["geodynamics"].regime
     assert world["volatile_cycle"].metadata["precipitation_partition_conservative"]
+
+    pa = world["planetary_appearance"]
+    hydro = world["hydrology"]
+    np.testing.assert_allclose(
+        world["appearance"].soil_moisture_index,
+        pa.ground_liquid_humidity_index,
+        rtol=0.0,
+        atol=0.0,
+    )
+    np.testing.assert_array_equal(hydro.soil_liquid_storage_mm, hydro.soil_water_storage_mm)
+    np.testing.assert_array_equal(hydro.subsurface_liquid_storage_mm, hydro.groundwater_storage_mm)
+    np.testing.assert_array_equal(hydro.solid_condensate_storage_mm, hydro.snowpack_mm)
+    assert pa.metadata["ground_humidity_semantics"].startswith("fractional pore-volume wetness")
+    assert "CH4" in pa.metadata["surface_liquid_optics"]["composition_volume_fraction"]
+
+    wet = np.asarray(world["surface_liquids"].liquid_mask, dtype=bool)
+    if np.any(wet):
+        liquid_rgb = np.asarray(pa.surface_liquid_rgb, dtype=float)[wet]
+        assert np.all(np.isfinite(liquid_rgb))
+        assert np.any(liquid_rgb > 0.0)
+    clear = np.asarray(world["appearance"].true_color_rgb, dtype=np.int16)
+    toa = np.asarray(world["appearance"].true_color_with_clouds_rgb, dtype=np.int16)
+    assert clear.shape == toa.shape == (*world["grid"].shape, 3)
+    assert np.mean(np.abs(clear.astype(float) - toa.astype(float))) > 1.0
