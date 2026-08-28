@@ -12,7 +12,7 @@ import numpy as np
 import atmogen
 
 
-ATMOGEN_COMPATIBLE_REVISION = "3b57e5dcef06f2d9a4218487a1a4f4ee349d6ea0"
+ATMOGEN_COMPATIBLE_REVISION = "f385068e5b06f56db45fe9e96c5264c1fe8d4349"
 
 
 def atmogen_runtime_metadata() -> dict[str, Any]:
@@ -31,7 +31,9 @@ def atmogen_runtime_metadata() -> dict[str, Any]:
 
 
 def _normalize(values: Mapping[str, float]) -> dict[str, float]:
-    positive = {str(key): float(value) for key, value in values.items() if float(value) > 0}
+    positive = {
+        str(key): float(value) for key, value in values.items() if float(value) > 0
+    }
     total = sum(positive.values())
     if total <= 0:
         raise ValueError("atmosphere composition must contain a positive amount")
@@ -54,34 +56,67 @@ class AtmogenAdapter:
         return atmogen.SolverSettings(
             fidelity=atmogen.Fidelity(cfg.fidelity),
             vertical_layers=int(cfg.vertical_layers),
-            top_pressure_pa=float(self.world_config.astronomy.atmosphere_top_pressure_bar) * 1e5,
+            top_pressure_pa=float(
+                self.world_config.astronomy.atmosphere_top_pressure_bar
+            )
+            * 1e5,
             chemistry_mode=str(cfg.chemistry_mode),
             radiation_mode=str(cfg.radiation_mode),
             cloud_mode=str(cfg.cloud_mode),
             activity_model=str(getattr(cfg, "activity_model", "auto")),
             liquid_phase_split=bool(getattr(cfg, "liquid_phase_split", True)),
-            vertical_transport_mode=str(getattr(cfg, "vertical_transport_mode", "none")),
-            eddy_diffusivity_m2_s=float(getattr(cfg, "eddy_diffusivity_m2_s", 50.0)),
-            cloud_suspended_fraction=float(getattr(cfg, "cloud_suspended_fraction", 0.01)),
-            cloud_condensate_column_cap_kg_m2=float(getattr(cfg, "cloud_condensate_column_cap_kg_m2", 0.2)),
-            cloud_particle_median_radius_m=float(getattr(cfg, "cloud_particle_median_radius_m", 10e-6)),
-            cloud_particle_geometric_std=float(getattr(cfg, "cloud_particle_geometric_std", 1.4)),
-            cloud_particle_density_kg_m3=_optional_float(cfg, "cloud_particle_density_kg_m3"),
-            cloud_refractive_index_real=_optional_float(cfg, "cloud_refractive_index_real"),
-            cloud_refractive_index_imag=float(getattr(cfg, "cloud_refractive_index_imag", 0.0)),
-            gas_dynamic_viscosity_pa_s=float(getattr(cfg, "gas_dynamic_viscosity_pa_s", 1.8e-5)),
-            cloud_microphysics_timestep_s=float(getattr(cfg, "cloud_microphysics_timestep_s", 3600.0)),
-            cloud_reevaporation_timescale_s=_optional_float(cfg, "cloud_reevaporation_timescale_s"),
+            vertical_transport_mode=str(
+                getattr(cfg, "vertical_transport_mode", "none")
+            ),
+            eddy_diffusivity_m2_s=float(
+                getattr(cfg, "eddy_diffusivity_m2_s", 50.0)
+            ),
+            cloud_suspended_fraction=float(
+                getattr(cfg, "cloud_suspended_fraction", 0.01)
+            ),
+            cloud_condensate_column_cap_kg_m2=float(
+                getattr(cfg, "cloud_condensate_column_cap_kg_m2", 0.2)
+            ),
+            cloud_particle_median_radius_m=float(
+                getattr(cfg, "cloud_particle_median_radius_m", 10e-6)
+            ),
+            cloud_particle_geometric_std=float(
+                getattr(cfg, "cloud_particle_geometric_std", 1.4)
+            ),
+            cloud_particle_density_kg_m3=_optional_float(
+                cfg, "cloud_particle_density_kg_m3"
+            ),
+            cloud_refractive_index_real=_optional_float(
+                cfg, "cloud_refractive_index_real"
+            ),
+            cloud_refractive_index_imag=float(
+                getattr(cfg, "cloud_refractive_index_imag", 0.0)
+            ),
+            gas_dynamic_viscosity_pa_s=float(
+                getattr(cfg, "gas_dynamic_viscosity_pa_s", 1.8e-5)
+            ),
+            cloud_microphysics_timestep_s=float(
+                getattr(cfg, "cloud_microphysics_timestep_s", 3600.0)
+            ),
+            cloud_reevaporation_timescale_s=_optional_float(
+                cfg, "cloud_reevaporation_timescale_s"
+            ),
             cloud_quadrature_order=int(getattr(cfg, "cloud_quadrature_order", 12)),
             max_iterations=int(cfg.max_iterations),
-            relative_temperature_tolerance=float(cfg.relative_temperature_tolerance),
+            relative_temperature_tolerance=float(
+                cfg.relative_temperature_tolerance
+            ),
             composition_tolerance=float(cfg.composition_tolerance),
             energy_tolerance_w_m2=float(cfg.energy_tolerance_w_m2),
             relaxation=float(cfg.relaxation),
             allow_fidelity_fallback=bool(cfg.allow_fidelity_fallback),
         )
 
-    def _inventory(self) -> tuple[dict[str, float], atmogen.ElementInventory, atmogen.SurfaceReservoirs]:
+    def _inventory(
+        self,
+    ) -> tuple[
+        dict[str, float], atmogen.ElementInventory, atmogen.SurfaceReservoirs
+    ]:
         cfg = self.world_config
         species = _normalize(cfg.astronomy.atmosphere)
         elements = atmogen.species_moles_to_elements(species)
@@ -89,7 +124,8 @@ class AtmogenAdapter:
             elements, species, "legacy_species_composition_initial_state"
         )
         surface_mass = {
-            str(key): float(value) * float(cfg.atmogen.surface_inventory_reference_mass_kg)
+            str(key): float(value)
+            * float(cfg.atmogen.surface_inventory_reference_mass_kg)
             for key, value in cfg.astronomy.surface_volatiles.items()
             if float(value) > 0
         }
@@ -105,11 +141,18 @@ class AtmogenAdapter:
             float(astronomy_result.star["effective_temperature_k"]), flux
         )
 
-    def planet_state(self, astronomy_result, *, initial_surface_temperature_k: float | None = None) -> atmogen.PlanetPhysicalState:
+    def planet_state(
+        self,
+        astronomy_result,
+        *,
+        initial_surface_temperature_k: float | None = None,
+    ) -> atmogen.PlanetPhysicalState:
         acfg = self.world_config.astronomy
         return atmogen.PlanetPhysicalState(
             radius_m=float(astronomy_result.planet["radius_earth"]) * 6.371e6,
-            gravity_m_s2=float(astronomy_result.planet["surface_gravity_m_s2"]),
+            gravity_m_s2=float(
+                astronomy_result.planet["surface_gravity_m_s2"]
+            ),
             surface_pressure_pa=float(acfg.atmosphere_pressure_bar) * 1e5,
             initial_surface_temperature_k=(
                 float(astronomy_result.planet["equilibrium_temperature_k"])
@@ -118,7 +161,9 @@ class AtmogenAdapter:
             ),
             surface_albedo_initial=float(acfg.albedo),
             internal_heat_flux_w_m2=float(
-                astronomy_result.interior.get("total_internal_heat_flux_w_m2_approx", 0.0)
+                astronomy_result.interior.get(
+                    "total_internal_heat_flux_w_m2_approx", 0.0
+                )
             ),
         )
 
@@ -142,10 +187,15 @@ class AtmogenAdapter:
         stellar_flux_scale: np.ndarray,
     ) -> tuple[atmogen.PlanetChemistryResult, ...]:
         """Solve representative geographic columns without duplicating atmogen physics."""
-        temperatures = np.asarray(initial_surface_temperature_k, dtype=float).reshape(-1)
+        temperatures = np.asarray(
+            initial_surface_temperature_k, dtype=float
+        ).reshape(-1)
         scales = np.asarray(stellar_flux_scale, dtype=float).reshape(-1)
         if temperatures.shape != scales.shape or temperatures.size == 0:
-            raise ValueError("column temperatures and stellar forcing scales must have equal non-zero length")
+            raise ValueError(
+                "column temperatures and stellar forcing scales must have equal "
+                "non-zero length"
+            )
         if np.any(~np.isfinite(temperatures)) or np.any(temperatures <= 0):
             raise ValueError("column temperatures must be finite and positive")
         if np.any(~np.isfinite(scales)) or np.any(scales <= 0):
@@ -154,7 +204,8 @@ class AtmogenAdapter:
         columns = tuple(
             atmogen.ColumnInput(
                 planet=self.planet_state(
-                    astronomy_result, initial_surface_temperature_k=float(temp)
+                    astronomy_result,
+                    initial_surface_temperature_k=float(temp),
                 ),
                 inventory=inventory,
                 surface=surface,
@@ -163,53 +214,99 @@ class AtmogenAdapter:
             for temp, scale in zip(temperatures, scales, strict=True)
         )
         return atmogen.solve_columns(
-            atmogen.ColumnBatchInput(columns=columns, star=self.stellar_spectrum(astronomy_result)),
+            atmogen.ColumnBatchInput(
+                columns=columns, star=self.stellar_spectrum(astronomy_result)
+            ),
             settings=self._settings(),
         )
 
     @staticmethod
     def apply_to_astronomy(astronomy_result, result) -> None:
         temperature_k = float(result.atmosphere.temperature_k[0])
-        fractions = {key: float(value) for key, value in result.atmosphere.mole_fractions.items()}
+        fractions = {
+            key: float(value)
+            for key, value in result.atmosphere.mole_fractions.items()
+        }
         pressure_bar = float(astronomy_result.atmosphere["surface_pressure_bar"])
-        astronomy_result.atmosphere.update({
-            "fractions": fractions,
-            "partial_pressures_bar": {key: pressure_bar * value for key, value in fractions.items()},
-            "mean_molar_mass_g_mol": result.atmosphere.mean_molar_mass_kg_mol * 1000.0,
-            "hydrostatic_thickness_km_approx": float(result.atmosphere.altitude_m[-1]) / 1000.0,
-            "effective_thickness_km_approx": float(result.atmosphere.altitude_m[-1]) / 1000.0,
-            "greenhouse_model": "atmogen",
-            "greenhouse_temperature_increment_k_approx": temperature_k - float(astronomy_result.planet["equilibrium_temperature_k"]),
-            "greenhouse_optical_depth_terms": {"model": "atmogen_semi_gray", "total": result.energy_budget.longwave_optical_depth},
-            "atmogen": result_summary(result),
-        })
-        astronomy_result.planet.update({
-            "mean_surface_temperature_c_approx": temperature_k - 273.15,
-            "greenhouse_increment_k_approx": temperature_k - float(astronomy_result.planet["equilibrium_temperature_k"]),
-            "bond_albedo": float(result.spectra.bond_albedo),
-            "geometric_albedo_approx": float(result.spectra.geometric_albedo_approx),
-        })
+        astronomy_result.atmosphere.update(
+            {
+                "fractions": fractions,
+                "partial_pressures_bar": {
+                    key: pressure_bar * value for key, value in fractions.items()
+                },
+                "mean_molar_mass_g_mol": (
+                    result.atmosphere.mean_molar_mass_kg_mol * 1000.0
+                ),
+                "hydrostatic_thickness_km_approx": (
+                    float(result.atmosphere.altitude_m[-1]) / 1000.0
+                ),
+                "effective_thickness_km_approx": (
+                    float(result.atmosphere.altitude_m[-1]) / 1000.0
+                ),
+                "greenhouse_model": "atmogen",
+                "greenhouse_temperature_increment_k_approx": (
+                    temperature_k
+                    - float(astronomy_result.planet["equilibrium_temperature_k"])
+                ),
+                "greenhouse_optical_depth_terms": {
+                    "model": "atmogen_semi_gray",
+                    "total": result.energy_budget.longwave_optical_depth,
+                },
+                "atmogen": result_summary(result),
+            }
+        )
+        astronomy_result.planet.update(
+            {
+                "mean_surface_temperature_c_approx": temperature_k - 273.15,
+                "greenhouse_increment_k_approx": (
+                    temperature_k
+                    - float(astronomy_result.planet["equilibrium_temperature_k"])
+                ),
+                "bond_albedo": float(result.spectra.bond_albedo),
+                "geometric_albedo_approx": float(
+                    result.spectra.geometric_albedo_approx
+                ),
+            }
+        )
         astronomy_result.volatile_chemistry["authority"] = "atmogen"
         astronomy_result.volatile_chemistry["atmogen"] = result_summary(result)
 
 
 def result_summary(result) -> dict[str, Any]:
     vertical = result.vertical
+    atmosphere = result.atmosphere
     return {
         "provenance": dict(result.provenance),
         "convergence": asdict(result.convergence),
         "diagnostics": dict(result.diagnostics),
-        "surface_temperature_k": float(result.atmosphere.temperature_k[0]),
-        "surface_pressure_pa": float(result.atmosphere.pressure_interface_pa[0]),
-        "mean_molar_mass_kg_mol": float(result.atmosphere.mean_molar_mass_kg_mol),
-        "mole_fractions": dict(result.atmosphere.mole_fractions),
+        "surface_temperature_k": float(atmosphere.temperature_k[0]),
+        "surface_pressure_pa": float(atmosphere.pressure_interface_pa[0]),
+        "mean_molar_mass_kg_mol": float(atmosphere.mean_molar_mass_kg_mol),
+        "mole_fractions": dict(atmosphere.mole_fractions),
+        "vertical_profile": {
+            "pressure_pa": atmosphere.pressure_pa.tolist(),
+            "pressure_interface_pa": atmosphere.pressure_interface_pa.tolist(),
+            "altitude_m": atmosphere.altitude_m.tolist(),
+            "temperature_k": atmosphere.temperature_k.tolist(),
+            "density_kg_m3": atmosphere.density_kg_m3.tolist(),
+            "hydrostatic_relative_residual": float(
+                atmosphere.hydrostatic_relative_residual
+            ),
+            "temperature_profile_model": result.diagnostics.get(
+                "temperature_profile_model"
+            ),
+        },
         "phase_reservoirs": {
             "atmospheric_mass_kg": dict(result.surface.atmospheric_mass_kg),
             "liquid_mass_kg": dict(result.surface.liquid_mass_kg),
             "solid_mass_kg": dict(result.surface.solid_mass_kg),
             "liquid_volume_m3": dict(result.surface.liquid_volume_m3),
-            "surface_vapor_mole_fractions": dict(result.surface.surface_vapor_mole_fractions),
-            "liquid_phases": [asdict(phase) for phase in result.surface.liquid_phases],
+            "surface_vapor_mole_fractions": dict(
+                result.surface.surface_vapor_mole_fractions
+            ),
+            "liquid_phases": [
+                asdict(phase) for phase in result.surface.liquid_phases
+            ],
             "activity_model": str(result.surface.activity_model),
             "fallbacks": list(result.surface.fallbacks),
             "mass_closure_relative": float(result.surface.mass_closure_relative),
@@ -222,21 +319,39 @@ def result_summary(result) -> dict[str, Any]:
             "eddy_diffusivity_m2_s": vertical.eddy_diffusivity_m2_s.tolist(),
             "mixing_timescale_s": vertical.mixing_timescale_s.tolist(),
             "cloud_condensate_kg_m2": vertical.cloud_condensate_kg_m2.tolist(),
-            "cloud_settling_velocity_m_s": vertical.cloud_settling_velocity_m_s.tolist(),
-            "cloud_sedimentation_flux_kg_m2_s": vertical.cloud_sedimentation_flux_kg_m2_s.tolist(),
-            "surface_precipitation_kg_m2_per_step": float(vertical.surface_precipitation_kg_m2),
-            "precipitation_reevaporated_kg_m2": vertical.precipitation_reevaporated_kg_m2.tolist(),
-            "reevaporation_latent_cooling_w_m2_diagnostic": float(vertical.reevaporation_latent_cooling_w_m2),
+            "cloud_settling_velocity_m_s": (
+                vertical.cloud_settling_velocity_m_s.tolist()
+            ),
+            "cloud_sedimentation_flux_kg_m2_s": (
+                vertical.cloud_sedimentation_flux_kg_m2_s.tolist()
+            ),
+            "surface_precipitation_kg_m2_per_step": float(
+                vertical.surface_precipitation_kg_m2
+            ),
+            "precipitation_reevaporated_kg_m2": (
+                vertical.precipitation_reevaporated_kg_m2.tolist()
+            ),
+            "reevaporation_latent_cooling_w_m2_diagnostic": float(
+                vertical.reevaporation_latent_cooling_w_m2
+            ),
             "mass_closure_relative": float(vertical.mass_closure_relative),
         },
         "energy_budget": asdict(result.energy_budget),
         "spectra": {
             "bond_albedo": float(result.spectra.bond_albedo),
-            "geometric_albedo_approx": float(result.spectra.geometric_albedo_approx),
+            "geometric_albedo_approx": float(
+                result.spectra.geometric_albedo_approx
+            ),
             "visible_srgb": list(result.spectra.visible_srgb),
-            "shortwave_wavelength_m": result.spectra.shortwave_wavelength_m.tolist(),
+            "shortwave_wavelength_m": (
+                result.spectra.shortwave_wavelength_m.tolist()
+            ),
             "spectral_albedo": result.spectra.spectral_albedo.tolist(),
-            "outgoing_thermal_wavelength_m": result.spectra.thermal_wavelength_m.tolist(),
-            "outgoing_thermal_w_m2_m": result.spectra.outgoing_thermal_w_m2_m.tolist(),
+            "outgoing_thermal_wavelength_m": (
+                result.spectra.thermal_wavelength_m.tolist()
+            ),
+            "outgoing_thermal_w_m2_m": (
+                result.spectra.outgoing_thermal_w_m2_m.tolist()
+            ),
         },
     }
