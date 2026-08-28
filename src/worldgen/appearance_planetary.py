@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 
 from .appearance import _ROCK_RGB, _render_rgb
+from .aerosol_cloud_decks import apply_composition_cloud_decks
 from .planetary_optics import (
     atmosphere_visible_optics,
     composite_top_of_atmosphere,
@@ -156,6 +157,7 @@ def apply_composition_aware_appearance(world: dict[str, Any], cfg: Any) -> dict[
     annual, jan, jul = _rerender_surface_base(world, cfg, solid)
     organic = _organic_surface_deposition(world)
     optics = atmosphere_visible_optics(world["astronomy"], volatile, shape=world["grid"].shape)
+    optics = apply_composition_cloud_decks(optics, volatile)
     sky_reflection = np.clip(
         0.72 * np.asarray(optics.rayleigh_scatter_rgb, dtype=np.float64)
         + 0.28 * np.asarray(optics.haze_rgb, dtype=np.float64),
