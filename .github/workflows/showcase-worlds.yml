@@ -57,7 +57,8 @@ jobs:
             tests/test_planet_tiles.py \
             tests/test_precompute.py \
             tests/test_precompute_cli.py \
-            tests/test_tile_memory_cache.py
+            tests/test_tile_memory.py \
+            tests/test_tile_runtime.py
 
       - name: Generate 256x128 physical base world with atmogen
         run: |
