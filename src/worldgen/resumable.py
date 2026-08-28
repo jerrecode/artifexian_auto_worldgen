@@ -27,7 +27,7 @@ class ResumableWorldPipeline(WorldPipeline):
         self.checkpoint_store = CheckpointStore(checkpoint_dir, max_bytes=checkpoint_max_bytes)
         self.resume = bool(resume)
         self._config_dict = config.to_dict()
-        self._dependency_digest = hashlib.sha256(b"worldgen-stage-root-v3").hexdigest()
+        self._dependency_digest = hashlib.sha256(b"worldgen-stage-root-v4-atmogen-columns").hexdigest()
         self._source_fingerprint_cache: dict[str, str] = {}
         self.checkpoint_hits: list[str] = []
         self.stage_cache_keys: dict[str, str] = {}
@@ -36,10 +36,16 @@ class ResumableWorldPipeline(WorldPipeline):
     def _stage_config(self, name: str) -> dict[str, Any]:
         c = self._config_dict
         sections: set[str] = {"seed"}
+        include_atmogen_runtime = False
         if name == "astronomy":
             sections |= {"astronomy"}
-        elif name == "atmogen_column":
-            sections |= {"astronomy", "atmogen"}
+        elif name.startswith("atmogen_"):
+            # Global and geographic atmogen stages depend on the exact standalone
+            # engine/data revision. Representative columns additionally consume
+            # climate/geographic forcing, which arrives transitively via the running
+            # dependency digest and directly via the climate configuration.
+            sections |= {"astronomy", "atmogen", "climate", "terrain", "resolution"}
+            include_atmogen_runtime = True
         elif name == "tectonics":
             sections |= {"resolution", "tectonics", "noise"}
         elif name == "noise_cache":
@@ -49,7 +55,9 @@ class ResumableWorldPipeline(WorldPipeline):
         elif name.startswith("ocean"):
             sections |= {"ocean", "terrain", "noise", "simulation"}
         elif name.startswith("climate"):
-            sections |= {"climate", "terrain", "noise", "simulation"}
+            sections |= {"climate", "terrain", "noise", "simulation", "atmogen"}
+            if bool(c.get("atmogen", {}).get("enabled", False)):
+                include_atmogen_runtime = True
         elif name.startswith("geology"):
             sections |= {"noise"}
         elif name.startswith("surface") and name != "surface_appearance":
@@ -72,7 +80,7 @@ class ResumableWorldPipeline(WorldPipeline):
             "config": {key: c[key] for key in sorted(sections) if key in c},
             "dependency_digest": self._dependency_digest,
         }
-        if name == "atmogen_column":
+        if include_atmogen_runtime:
             result["atmogen_runtime"] = atmogen_runtime_metadata()
         return result
 
