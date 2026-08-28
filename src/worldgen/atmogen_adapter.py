@@ -12,7 +12,7 @@ import numpy as np
 import atmogen
 
 
-ATMOGEN_COMPATIBLE_REVISION = "202ae8ca94a026db40776077fe20cd51eefc8c44"
+ATMOGEN_COMPATIBLE_REVISION = "86d68f5473afe6cd247afaa226b5d06a906f3fef"
 
 
 def atmogen_runtime_metadata() -> dict[str, Any]:
@@ -124,6 +124,10 @@ def result_summary(result) -> dict[str, Any]:
             "liquid_mass_kg": dict(result.surface.liquid_mass_kg),
             "solid_mass_kg": dict(result.surface.solid_mass_kg),
             "liquid_volume_m3": dict(result.surface.liquid_volume_m3),
+            "surface_vapor_mole_fractions": dict(result.surface.surface_vapor_mole_fractions),
+            "liquid_phases": [asdict(phase) for phase in result.surface.liquid_phases],
+            "activity_model": str(result.surface.activity_model),
+            "fallbacks": list(result.surface.fallbacks),
             "mass_closure_relative": float(result.surface.mass_closure_relative),
         },
         "clouds": asdict(result.clouds),
