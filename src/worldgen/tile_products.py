@@ -91,7 +91,7 @@ def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
     _atomic_write(path, json.dumps(payload, indent=2, sort_keys=True).encode("utf-8"))
 
 
-def _png_bytes(values: np.ndarray, mode: str) -> bytes:
+def _png_bytes(values: np.ndarray) -> bytes:
     try:
         from PIL import Image
     except ImportError as exc:  # pragma: no cover - matplotlib currently brings Pillow
@@ -100,7 +100,7 @@ def _png_bytes(values: np.ndarray, mode: str) -> bytes:
         ) from exc
     import io
 
-    image = Image.fromarray(np.asarray(values), mode=mode)
+    image = Image.fromarray(np.asarray(values))
     buffer = io.BytesIO()
     image.save(buffer, format="PNG", optimize=False, compress_level=6)
     return buffer.getvalue()
@@ -197,7 +197,7 @@ class TileProductExporter:
         if path.exists():
             return path
         encoded = np.asarray(self.height_u16(key), dtype=np.uint16)
-        _atomic_write(path, _png_bytes(encoded, "I;16"))
+        _atomic_write(path, _png_bytes(encoded))
         return path
 
     def inherited_true_color_rgb(self, key: TileKey) -> np.ndarray:
@@ -232,7 +232,7 @@ class TileProductExporter:
         if path.exists():
             return path
         rgb = np.asarray(self.inherited_true_color_rgb(key), dtype=np.uint8)
-        _atomic_write(path, _png_bytes(rgb, "RGB"))
+        _atomic_write(path, _png_bytes(rgb))
         return path
 
     def terrain_temperature_rgb(self, key: TileKey) -> np.ndarray:
@@ -272,7 +272,7 @@ class TileProductExporter:
         if path.exists():
             return path
         rgb = np.asarray(self.terrain_temperature_rgb(key), dtype=np.uint8)
-        _atomic_write(path, _png_bytes(rgb, "RGB"))
+        _atomic_write(path, _png_bytes(rgb))
         return path
 
 

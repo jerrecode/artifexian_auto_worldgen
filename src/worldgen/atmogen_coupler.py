@@ -22,6 +22,7 @@ class RepresentativeColumnCouplingResult:
     cluster_index: np.ndarray
     representative_temperature_k: np.ndarray
     representative_stellar_flux_scale: np.ndarray
+    representative_surface_elevation_m: np.ndarray
     representative_area_fraction: np.ndarray
     solved_surface_temperature_k: np.ndarray
     summaries: tuple[dict[str, Any], ...]
@@ -70,6 +71,7 @@ def cluster_representative_states(
     temperature_c: np.ndarray,
     stellar_flux_scale: np.ndarray,
     cell_area_weights: np.ndarray,
+    surface_elevation_m: np.ndarray | None = None,
     count: int,
     iterations: int = 5,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -83,30 +85,46 @@ def cluster_representative_states(
         raise ValueError("representative-column inputs must be finite")
     if np.any(forcing < 0) or np.any(weights < 0) or float(np.sum(weights)) <= 0:
         raise ValueError("forcing/weights must be non-negative with positive total area")
+    elevation = (
+        np.zeros_like(temperature)
+        if surface_elevation_m is None
+        else np.asarray(surface_elevation_m, dtype=float)
+    )
+    if elevation.shape != temperature.shape or np.any(~np.isfinite(elevation)):
+        raise ValueError("surface elevation must be finite and share the climate shape")
 
     flat_t = temperature.reshape(-1)
     flat_f = forcing.reshape(-1)
     flat_w = weights.reshape(-1)
+    flat_e = elevation.reshape(-1)
     active = flat_w > 0
     t = flat_t[active]
     f = flat_f[active]
     w = flat_w[active]
+    e = flat_e[active]
     k = min(max(1, int(count)), t.size)
 
     t_scale = max(float(np.sqrt(np.average((t - np.average(t, weights=w)) ** 2, weights=w))), 2.0)
     f_scale = max(float(np.sqrt(np.average((f - np.average(f, weights=w)) ** 2, weights=w))), 0.05)
     t_norm = (t - np.average(t, weights=w)) / t_scale
     f_norm = (f - np.average(f, weights=w)) / f_scale
-    key = 0.55 * f_norm + 0.45 * t_norm
+    e_scale = max(float(np.sqrt(np.average((e - np.average(e, weights=w)) ** 2, weights=w))), 500.0)
+    e_norm = (e - np.average(e, weights=w)) / e_scale
+    key = 0.45 * f_norm + 0.35 * t_norm + 0.20 * e_norm
     init = _weighted_quantile_indices(key, w, k)
     centers_t = t_norm[init].copy()
     centers_f = f_norm[init].copy()
+    centers_e = e_norm[init].copy()
     assignment = np.zeros(t.size, dtype=np.int32)
 
     for _ in range(max(1, int(iterations))):
         best = np.full(t.size, np.inf, dtype=float)
         for idx in range(k):
-            distance = (t_norm - centers_t[idx]) ** 2 + (f_norm - centers_f[idx]) ** 2
+            distance = (
+                (t_norm - centers_t[idx]) ** 2
+                + (f_norm - centers_f[idx]) ** 2
+                + (e_norm - centers_e[idx]) ** 2
+            )
             take = distance < best
             assignment[take] = idx
             best[take] = distance[take]
@@ -117,6 +135,7 @@ def cluster_representative_states(
             local_w = w[selected]
             centers_t[idx] = float(np.average(t_norm[selected], weights=local_w))
             centers_f[idx] = float(np.average(f_norm[selected], weights=local_w))
+            centers_e[idx] = float(np.average(e_norm[selected], weights=local_w))
 
     rep_t = np.empty(k, dtype=float)
     rep_f = np.empty(k, dtype=float)
@@ -142,24 +161,40 @@ def solve_representative_columns(
     astronomy_result,
     climate_result,
     world_config,
+    terrain_result=None,
 ) -> RepresentativeColumnCouplingResult:
     """Solve clustered vertical columns and return a bounded next-pass temperature correction."""
     cfg = world_config.atmogen
     forcing = annual_stellar_flux_scale(grid, astronomy_result)
+    surface_elevation = (
+        np.zeros_like(climate_result.annual_temperature_c, dtype=float)
+        if terrain_result is None
+        else np.maximum(np.asarray(terrain_result.elevation_km, dtype=float), 0.0)
+        * 1000.0
+    )
     cluster, representative_t, representative_f, area_fraction = cluster_representative_states(
         temperature_c=climate_result.annual_temperature_c,
         stellar_flux_scale=forcing,
         cell_area_weights=grid.cell_area_weights,
+        surface_elevation_m=surface_elevation,
         count=int(cfg.representative_column_count),
     )
     # Avoid mathematically zero annual forcing at degenerate pole/grid combinations;
     # this is only an input floor to the column solver and is recorded below.
     representative_f = np.maximum(representative_f, 1.0e-6)
+    representative_elevation = np.empty(representative_t.size, dtype=float)
+    weights = np.asarray(grid.cell_area_weights, dtype=float)
+    for idx in range(representative_t.size):
+        selected = cluster == idx
+        representative_elevation[idx] = float(
+            np.average(surface_elevation[selected], weights=weights[selected])
+        )
     adapter = AtmogenAdapter(world_config)
     batch = adapter.solve_columns_with_diagnostics(
         astronomy_result,
         initial_surface_temperature_k=representative_t,
         stellar_flux_scale=representative_f,
+        surface_elevation_m=representative_elevation,
     )
     results = batch.results
     solved_t = np.asarray([float(item.atmosphere.temperature_k[0]) for item in results], dtype=float)
@@ -177,6 +212,10 @@ def solve_representative_columns(
         summary["area_fraction"] = float(area_fraction[idx])
         summary["input_surface_temperature_k"] = float(representative_t[idx])
         summary["stellar_flux_scale"] = float(representative_f[idx])
+        summary["surface_elevation_m"] = float(representative_elevation[idx])
+        summary["surface_boundary"] = dict(
+            batch.diagnostics.surface_boundaries[idx]
+        )
         summary["raw_temperature_delta_k"] = float(raw_delta[idx])
         summary["applied_temperature_delta_k"] = float(relaxed_delta[idx])
         summary["column_state_fingerprint"] = batch.diagnostics.fingerprints[idx]
@@ -186,7 +225,6 @@ def solve_representative_columns(
         summary["reused_column_state"] = bool(batch.diagnostics.reused[idx])
         summaries.append(summary)
 
-    weights = np.asarray(grid.cell_area_weights, dtype=float)
     diagnostics = {
         "column_count": int(len(results)),
         "unique_column_state_count": int(batch.diagnostics.unique_state_count),
@@ -205,6 +243,15 @@ def solve_representative_columns(
             batch.diagnostics.fallback_event_count
         ),
         "atmogen_database_sha256": batch.diagnostics.database_sha256,
+        "surface_boundary_modes": list(
+            batch.diagnostics.surface_boundary_modes
+        ),
+        "representative_surface_elevation_min_m": float(
+            np.min(representative_elevation)
+        ),
+        "representative_surface_elevation_max_m": float(
+            np.max(representative_elevation)
+        ),
         "forcing_scale_area_mean": float(np.sum(forcing * weights)),
         "temperature_correction_area_mean_c": float(np.sum(correction * weights)),
         "temperature_correction_max_abs_c": float(np.max(np.abs(correction))),
@@ -219,6 +266,7 @@ def solve_representative_columns(
         cluster_index=cluster,
         representative_temperature_k=representative_t,
         representative_stellar_flux_scale=representative_f,
+        representative_surface_elevation_m=representative_elevation,
         representative_area_fraction=area_fraction,
         solved_surface_temperature_k=solved_t,
         summaries=tuple(summaries),

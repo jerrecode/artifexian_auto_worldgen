@@ -232,6 +232,7 @@ class WorldPipeline(_base.WorldPipeline):
                         astronomy_result=astro,
                         climate_result=current_climate,
                         world_config=c,
+                        terrain_result=terrain,
                     ),
                 )
                 atmogen_feedback = latest_atmogen_columns.temperature_correction_c
@@ -454,6 +455,7 @@ class WorldPipeline(_base.WorldPipeline):
                         astronomy_result=astro,
                         climate_result=current_climate,
                         world_config=c,
+                        terrain_result=terrain,
                     ),
                 )
                 atmogen_feedback = latest_atmogen_columns.temperature_correction_c

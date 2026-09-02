@@ -43,8 +43,8 @@ def test_adapter_replaces_old_greenhouse_authority_and_records_revision():
     assert result.surface.mass_closure_relative < 1e-12
     metadata = atmogen_runtime_metadata()
     assert metadata["compatible_git_revision"] == ATMOGEN_COMPATIBLE_REVISION
-    assert metadata["package_version"] == "0.11.0"
-    assert metadata["api_schema_version"] == 10
+    assert metadata["package_version"] == "0.12.0"
+    assert metadata["api_schema_version"] == 11
     assert metadata["data_schema_version"] == 4
 
 
@@ -71,7 +71,27 @@ def test_standard_fidelity_exposes_nonisothermal_vertical_profile():
     assert temperature[0] > temperature[-1]
     assert np.all(np.diff(pressure) < 0.0)
     assert profile["hydrostatic_relative_residual"] < 2e-12
-    assert atmogen_runtime_metadata()["package_version"] == "0.11.0"
+    assert atmogen_runtime_metadata()["package_version"] == "0.12.0"
+
+
+def test_local_column_elevation_changes_pressure_with_explicit_provenance():
+    cfg = configured_world()
+    astro = build_astronomy(cfg.astronomy, RngPool(cfg.seed)("astronomy"))
+    batch = AtmogenAdapter(cfg).solve_columns_with_diagnostics(
+        astro,
+        initial_surface_temperature_k=np.asarray([280.0, 280.0]),
+        stellar_flux_scale=np.asarray([1.0, 1.0]),
+        surface_elevation_m=np.asarray([0.0, 2500.0]),
+    )
+    sea_level, mountain = batch.results
+    assert mountain.atmosphere.pressure_interface_pa[0] < (
+        sea_level.atmosphere.pressure_interface_pa[0]
+    )
+    assert batch.diagnostics.surface_boundary_modes == (
+        "hydrostatic_adjusted",
+        "hydrostatic_adjusted",
+    )
+    assert batch.diagnostics.surface_boundaries[1]["elevation_delta_m"] == 2500.0
 
 
 def test_high_fidelity_worldgen_adapter_uses_water_saturated_profile():

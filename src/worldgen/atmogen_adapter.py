@@ -12,7 +12,7 @@ import numpy as np
 import atmogen
 
 
-ATMOGEN_COMPATIBLE_REVISION = "32f688391c6c24a97d06e406258b320c241ae648"
+ATMOGEN_COMPATIBLE_REVISION = "bb7dcb29042584913888129806eeac0082ca14ce"
 
 
 def atmogen_runtime_metadata() -> dict[str, Any]:
@@ -158,6 +158,7 @@ class AtmogenAdapter:
         astronomy_result,
         *,
         initial_surface_temperature_k: float | None = None,
+        surface_pressure_pa: float | None = None,
     ) -> atmogen.PlanetPhysicalState:
         acfg = self.world_config.astronomy
         return atmogen.PlanetPhysicalState(
@@ -165,7 +166,11 @@ class AtmogenAdapter:
             gravity_m_s2=float(
                 astronomy_result.planet["surface_gravity_m_s2"]
             ),
-            surface_pressure_pa=float(acfg.atmosphere_pressure_bar) * 1e5,
+            surface_pressure_pa=(
+                float(acfg.atmosphere_pressure_bar) * 1e5
+                if surface_pressure_pa is None
+                else float(surface_pressure_pa)
+            ),
             initial_surface_temperature_k=(
                 float(astronomy_result.planet["equilibrium_temperature_k"])
                 if initial_surface_temperature_k is None
@@ -197,12 +202,14 @@ class AtmogenAdapter:
         *,
         initial_surface_temperature_k: np.ndarray,
         stellar_flux_scale: np.ndarray,
+        surface_elevation_m: np.ndarray | None = None,
     ) -> tuple[atmogen.PlanetChemistryResult, ...]:
         """Solve representative geographic columns without duplicating atmogen physics."""
         return self.solve_columns_with_diagnostics(
             astronomy_result,
             initial_surface_temperature_k=initial_surface_temperature_k,
             stellar_flux_scale=stellar_flux_scale,
+            surface_elevation_m=surface_elevation_m,
         ).results
 
     def solve_columns_with_diagnostics(
@@ -211,6 +218,7 @@ class AtmogenAdapter:
         *,
         initial_surface_temperature_k: np.ndarray,
         stellar_flux_scale: np.ndarray,
+        surface_elevation_m: np.ndarray | None = None,
     ) -> atmogen.ColumnBatchResult:
         """Solve representative columns with atmogen-owned cache identities."""
         temperatures = np.asarray(
@@ -226,18 +234,63 @@ class AtmogenAdapter:
             raise ValueError("column temperatures must be finite and positive")
         if np.any(~np.isfinite(scales)) or np.any(scales <= 0):
             raise ValueError("column stellar forcing scales must be finite and positive")
-        _species, inventory, surface = self._inventory()
+        elevations = (
+            np.zeros_like(temperatures)
+            if surface_elevation_m is None
+            else np.asarray(surface_elevation_m, dtype=float).reshape(-1)
+        )
+        if elevations.shape != temperatures.shape or np.any(~np.isfinite(elevations)):
+            raise ValueError(
+                "column surface elevations must be finite and match temperatures"
+            )
+        species, inventory, surface = self._inventory()
+        mean_molar_mass = float(
+            sum(
+                fraction
+                * atmogen.BUILTIN_DATABASE.get(name).molar_mass_kg_mol
+                for name, fraction in species.items()
+            )
+        )
+        parent_pressure = float(self.world_config.astronomy.atmosphere_pressure_bar) * 1e5
+        gravity = float(astronomy_result.planet["surface_gravity_m_s2"])
+        adjusted = surface_elevation_m is not None
+        pressures = [
+            atmogen.pressure_from_elevation(
+                parent_pressure,
+                float(elevation),
+                gravity_m_s2=gravity,
+                reference_temperature_k=float(temp),
+                mean_molar_mass_kg_mol=mean_molar_mass,
+            )
+            if adjusted
+            else parent_pressure
+            for temp, elevation in zip(temperatures, elevations, strict=True)
+        ]
         columns = tuple(
             atmogen.ColumnInput(
                 planet=self.planet_state(
                     astronomy_result,
                     initial_surface_temperature_k=float(temp),
+                    surface_pressure_pa=float(pressure),
                 ),
                 inventory=inventory,
                 surface=surface,
                 stellar_flux_scale=float(scale),
+                surface_boundary=(
+                    atmogen.ColumnSurfaceBoundary(
+                        mode=atmogen.SurfaceBoundaryMode.HYDROSTATIC_ADJUSTED,
+                        elevation_delta_m=float(elevation),
+                        parent_surface_pressure_pa=parent_pressure,
+                        reference_temperature_k=float(temp),
+                        mean_molar_mass_kg_mol=mean_molar_mass,
+                    )
+                    if adjusted
+                    else atmogen.ColumnSurfaceBoundary()
+                ),
             )
-            for temp, scale in zip(temperatures, scales, strict=True)
+            for temp, scale, elevation, pressure in zip(
+                temperatures, scales, elevations, pressures, strict=True
+            )
         )
         return atmogen.solve_columns_with_diagnostics(
             atmogen.ColumnBatchInput(

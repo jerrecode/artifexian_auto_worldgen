@@ -125,11 +125,15 @@ class AtmogenCouplingTests(unittest.TestCase):
         climate = SimpleNamespace(
             annual_temperature_c=15.0 - 0.45 * np.abs(grid.lat)
         )
+        terrain = SimpleNamespace(
+            elevation_km=np.maximum(3.0 * np.cos(np.deg2rad(grid.lat)), 0.0)
+        )
         result = solve_representative_columns(
             grid=grid,
             astronomy_result=astronomy,
             climate_result=climate,
             world_config=cfg,
+            terrain_result=terrain,
         )
         diagnostics = result.diagnostics
         self.assertEqual(diagnostics["column_count"], 3)
@@ -139,6 +143,13 @@ class AtmogenCouplingTests(unittest.TestCase):
             len(set(diagnostics["column_fingerprints"])),
         )
         self.assertEqual(len(diagnostics["atmogen_database_sha256"]), 64)
+        self.assertEqual(
+            diagnostics["surface_boundary_modes"],
+            ["hydrostatic_adjusted"] * 3,
+        )
+        self.assertGreater(
+            diagnostics["representative_surface_elevation_max_m"], 0.0
+        )
         for index, summary in enumerate(result.summaries):
             self.assertEqual(
                 summary["column_state_fingerprint"],
