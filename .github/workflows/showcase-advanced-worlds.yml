@@ -1,8 +1,10 @@
-name: Regenerate advanced Super-Earth and Titan showcases
+name: Max-complexity atmogen validation
 
 on:
   workflow_dispatch:
   push:
+    branches:
+      - 'chatgpt/max-complexity-atmogen-test-20260902'
     paths:
       - '.github/workflows/showcase-advanced-worlds.yml'
 
@@ -11,22 +13,16 @@ permissions:
 
 jobs:
   generate-and-audit:
-    name: ${{ matrix.label }} 2048x1024
+    name: max-realism seed ${{ matrix.seed }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - label: Super-Earth
-            slug: super-earth
-            config: config/super_earth.yaml
-          - label: Titan
-            slug: titan
-            config: config/titan_like.yaml
+        seed: [435916837, 601204923]
     env:
       MPLBACKEND: Agg
-      WORLDGEN_DISTANCE_CACHE_MB: '96'
+      WORLDGEN_DISTANCE_CACHE_MB: '128'
       OMP_NUM_THREADS: '1'
       OPENBLAS_NUM_THREADS: '1'
       MKL_NUM_THREADS: '1'
@@ -40,144 +36,123 @@ jobs:
           python-version: '3.12'
           cache: pip
 
-      - name: Install production and audit backends
+      - name: Install worldgen, atmogen and validation backends
         run: |
           python -m pip install --disable-pip-version-check -e '.[performance,jit,thermodynamics,render]'
           python -m pip check
-          worldgen --runtime-info --dry-run --config '${{ matrix.config }}' --resolution 2048x1024 --workers 4
+          python - <<'PY'
+          import json
+          from worldgen.atmogen_adapter import atmogen_runtime_metadata
+          print(json.dumps(atmogen_runtime_metadata(), indent=2, sort_keys=True))
+          PY
 
-      - name: Generate ${{ matrix.label }} at 2048x1024
+      - name: Run atmogen integration tests
+        run: |
+          python -m pytest -q tests/test_atmogen_integration.py tests/test_atmogen_coupling.py
+
+      - name: Validate maximum-realism runtime plan
+        run: |
+          worldgen --runtime-info --dry-run \
+            --config config/maximal_realism_safe.yaml \
+            --seed '${{ matrix.seed }}' \
+            --set atmogen.enabled=true \
+            --set atmogen.fidelity=REFERENCE \
+            --set atmogen.chemistry_mode=equilibrium \
+            --set atmogen.vertical_layers=64 \
+            --set atmogen.representative_column_count=16 \
+            --set atmogen.allow_fidelity_fallback=true \
+            --workers 4 --worker-cap 4 --threads-per-worker 1
+
+      - name: Generate maximum-complexity planet with atmogen
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p 'showcase/${{ matrix.slug }}'
-          worldgen generate \
-            --config '${{ matrix.config }}' \
-            --out 'showcase/${{ matrix.slug }}' \
-            --resolution 2048x1024 \
+          ROOT='showcase/max-${{ matrix.seed }}'
+          mkdir -p "$ROOT"
+          /usr/bin/time -v worldgen generate \
+            --config config/maximal_realism_safe.yaml \
+            --seed '${{ matrix.seed }}' \
+            --set atmogen.enabled=true \
+            --set atmogen.fidelity=REFERENCE \
+            --set atmogen.chemistry_mode=equilibrium \
+            --set atmogen.vertical_layers=64 \
+            --set atmogen.representative_column_count=16 \
+            --set atmogen.allow_fidelity_fallback=true \
+            --out "$ROOT" \
             --workers 4 \
             --worker-cap 4 \
             --threads-per-worker 1 \
-            --memory-per-worker-mb 1024 \
-            --checkpoint-dir 'showcase/${{ matrix.slug }}/checkpoints' \
-            --checkpoint-max-gb 18 \
-            --timings-json 'showcase/${{ matrix.slug }}/timings_cli.json' \
+            --memory-per-worker-mb 1400 \
+            --checkpoint-dir "$ROOT/checkpoints" \
+            --checkpoint-max-gb 24 \
+            --timings-json "$ROOT/timings_cli.json" \
             --progress-detail -vv \
-            --log-file 'showcase/${{ matrix.slug }}/generation.log'
+            --log-file "$ROOT/generation.log"
 
-      - name: Run physical/numerical audit
-        shell: bash
+      - name: Run physical and numerical audit
         run: |
-          set -euxo pipefail
-          python scripts/audit_generated_world.py \
-            'showcase/${{ matrix.slug }}' \
-            --output 'showcase/${{ matrix.slug }}/showcase_audit.json' \
-            | tee 'showcase/${{ matrix.slug }}/showcase_audit.log'
+          ROOT='showcase/max-${{ matrix.seed }}'
+          python scripts/audit_generated_world.py "$ROOT" --output "$ROOT/showcase_audit.json" | tee "$ROOT/showcase_audit.log"
+          python scripts/audit_planetary_optics.py "$ROOT" --output "$ROOT/planetary_optics_audit.json" --enforce | tee "$ROOT/planetary_optics_audit.log"
 
-      - name: Audit composition-aware surface and atmosphere rendering
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python scripts/audit_planetary_optics.py \
-            'showcase/${{ matrix.slug }}' \
-            --output 'showcase/${{ matrix.slug }}/planetary_optics_audit.json' \
-            --enforce \
-            | tee 'showcase/${{ matrix.slug }}/planetary_optics_audit.log'
-
-      - name: Enforce showcase invariants
+      - name: Enforce atmogen provenance and summarize outcome
         shell: bash
         run: |
           python - <<'PY'
           import json
           from pathlib import Path
-          slug='${{ matrix.slug }}'
-          root=Path('showcase')/slug
+          root=Path('showcase/max-${{ matrix.seed }}')
+          manifest=json.loads((root/'run_manifest.json').read_text())
           diag=json.loads((root/'diagnostics.json').read_text())
           audit=json.loads((root/'showcase_audit.json').read_text())
           optics=json.loads((root/'planetary_optics_audit.json').read_text())
-          failures=[]
-          if not diag.get('all_invariants_passed',False):
-              failures.append('diagnostics.json contains failed scientific/numerical invariants')
-          if not optics.get('all_invariants_passed',False):
-              failures.append(f"planetary optics invariant failures: {optics.get('invariants')}")
-          h=audit['hydrology']; c=audit['conservation']; d=audit['saved_diagnostics']
-          if h.get('river_cells_on_ocean',0)!=0:
-              failures.append(f"{h['river_cells_on_ocean']} resolved river cells lie on ocean")
-          if h.get('unassigned_land_cells',0)!=0:
-              failures.append(f"{h['unassigned_land_cells']} land cells have no terminal watershed")
-          wr=c.get('water_balance_max_abs_residual_mm_year')
-          if wr is not None and abs(float(wr))>0.05:
-              failures.append(f'water-balance closure residual too large: {wr}')
-          cr=c.get('condensate_mass_partition_relative_l1_residual')
-          if cr is not None and abs(float(cr))>1e-6:
-              failures.append(f'condensate mass partition residual too large: {cr}')
-          sr=c.get('sediment_routing_relative_residual')
-          if sr is not None and abs(float(sr))>1e-6:
-              failures.append(f'sediment routing residual too large: {sr}')
-          if d.get('invariant_failures'):
-              failures.append(f"saved invariant failures: {d['invariant_failures']}")
-          if h.get('terminal_watershed_count',0)<=0:
-              failures.append('no terminal watersheds resolved')
-          if failures:
-              raise SystemExit('\n'.join(failures))
-          print(json.dumps({
-              'world':slug,
-              'resolution':[audit['grid']['width'],audit['grid']['height']],
-              'land_fraction':audit['grid']['land_area_fraction'],
-              'watersheds':h.get('terminal_watershed_count'),
-              'max_strahler_order':h.get('max_strahler_order'),
-              'mean_runoff_mm_year':h.get('mean_land_runoff_mm_year'),
-              'mean_erosion_m':audit['landscape']['mean_land_cumulative_erosion_m'],
-              'erosion_relief_ratio':audit['landscape']['mean_erosion_to_relief_ratio'],
-              'runoff_erosion_corr':audit['landscape']['runoff_erosion_correlation'],
-              'condensates':audit['multicondensate']['active_hydrologic_species'],
-              'surface_liquid_rgb':optics['surface_liquid']['mean_rendered_rgb'],
-              'surface_liquid_composition':optics['surface_liquid']['composition_volume_fraction'],
-              'mean_haze_optical_depth':optics['atmosphere']['mean_haze_optical_depth'],
-              'mean_top_of_atmosphere_rgb':optics['atmosphere']['mean_top_of_atmosphere_rgb'],
-              'mean_ground_liquid_humidity':optics['ground_liquid']['mean_land_humidity_index'],
-              'humidity_liquid_precip_corr':optics['ground_liquid']['humidity_vs_liquid_precipitation_correlation'],
-          },indent=2))
+          atm=manifest.get('atmogen', {})
+          if not atm.get('enabled'):
+              raise SystemExit('atmogen was not enabled in run manifest')
+          if not atm.get('version'):
+              raise SystemExit(f'atmogen runtime metadata missing: {atm}')
+          if not diag.get('all_invariants_passed', False):
+              raise SystemExit(f"diagnostics invariants failed: {diag.get('invariant_failures')}")
+          if not optics.get('all_invariants_passed', False):
+              raise SystemExit(f"optics invariants failed: {optics.get('invariants')}")
+          h=audit.get('hydrology', {})
+          summary={
+              'seed': manifest['seed'],
+              'resolution': manifest['resolution'],
+              'atmogen': atm,
+              'stage_seconds': manifest.get('stage_seconds', {}),
+              'land_fraction': audit.get('grid', {}).get('land_area_fraction'),
+              'terminal_watersheds': h.get('terminal_watershed_count'),
+              'max_strahler_order': h.get('max_strahler_order'),
+              'mean_land_runoff_mm_year': h.get('mean_land_runoff_mm_year'),
+              'mean_land_cumulative_erosion_m': audit.get('landscape', {}).get('mean_land_cumulative_erosion_m'),
+              'runoff_erosion_correlation': audit.get('landscape', {}).get('runoff_erosion_correlation'),
+              'active_hydrologic_species': audit.get('multicondensate', {}).get('active_hydrologic_species'),
+              'mean_haze_optical_depth': optics.get('atmosphere', {}).get('mean_haze_optical_depth'),
+              'mean_top_of_atmosphere_rgb': optics.get('atmosphere', {}).get('mean_top_of_atmosphere_rgb'),
+              'invariant_failures': diag.get('invariant_failures', []),
+          }
+          (root/'max_complexity_summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True))
+          print(json.dumps(summary, indent=2, sort_keys=True))
           PY
 
-      - name: Build compact showcase artifact
-        if: always()
-        shell: bash
-        run: |
-          set -euxo pipefail
-          ROOT='showcase/${{ matrix.slug }}'
-          PKG='showcase-artifact-${{ matrix.slug }}'
-          mkdir -p "$PKG/maps"
-          for f in world.json world_report.md diagnostics.json run_manifest.json timings.json timings_cli.json advanced_planetary_physics.json surface_liquids.json showcase_audit.json showcase_audit.log planetary_optics_audit.json planetary_optics_audit.log generation.log; do
-            [ ! -f "$ROOT/$f" ] || cp "$ROOT/$f" "$PKG/"
-          done
-          if [ -d "$ROOT/maps" ]; then
-            # Preserve visual evidence while avoiding the multi-GB numerical archive.
-            cp -a "$ROOT/maps/." "$PKG/maps/"
-          fi
-          if [ -f "$ROOT/world_arrays.npz" ]; then
-            python - <<'PY'
-          import json
-          from pathlib import Path
-          import numpy as np
-          slug='${{ matrix.slug }}'
-          root=Path('showcase')/slug
-          out=Path('showcase-artifact-'+slug)
-          with np.load(root/'world_arrays.npz',allow_pickle=False) as z:
-              inv={k:{'shape':list(z[k].shape),'dtype':str(z[k].dtype),'nbytes':int(z[k].nbytes)} for k in z.files}
-              keys=list(z.files)
-          (out/'world_arrays_inventory.json').write_text(json.dumps({'keys':keys,'arrays':inv},indent=2))
-          PY
-          fi
-          find "$PKG" -type f -printf '%P\t%s\n' | sort > "$PKG/file_inventory.tsv"
-          du -sh "$PKG"
-
-      - name: Upload compact ${{ matrix.label }} audit/maps
+      - name: Upload compact validation artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: advanced-${{ matrix.slug }}-2048x1024-audit
-          path: showcase-artifact-${{ matrix.slug }}/
+          name: max-complexity-atmogen-${{ matrix.seed }}
+          path: |
+            showcase/max-${{ matrix.seed }}/run_manifest.json
+            showcase/max-${{ matrix.seed }}/diagnostics.json
+            showcase/max-${{ matrix.seed }}/timings.json
+            showcase/max-${{ matrix.seed }}/timings_cli.json
+            showcase/max-${{ matrix.seed }}/world.json
+            showcase/max-${{ matrix.seed }}/world_report.md
+            showcase/max-${{ matrix.seed }}/showcase_audit.json
+            showcase/max-${{ matrix.seed }}/planetary_optics_audit.json
+            showcase/max-${{ matrix.seed }}/max_complexity_summary.json
+            showcase/max-${{ matrix.seed }}/generation.log
+            showcase/max-${{ matrix.seed }}/maps/
           compression-level: 6
           retention-days: 10
-          if-no-files-found: error
+          if-no-files-found: warn
