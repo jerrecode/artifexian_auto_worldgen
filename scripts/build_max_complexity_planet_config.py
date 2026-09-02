@@ -64,6 +64,12 @@ ATMOGEN_REFERENCE = {
     "representative_columns_enabled": True,
     "representative_column_count": 16,
     "representative_feedback_relaxation": 0.25,
+    # High-pressure/high-water columns have a stiffer temperature/phase fixed point
+    # than the Earth reference.  Maximum-complexity validation deliberately uses
+    # conservative under-relaxation and a larger iteration budget rather than
+    # silently accepting a non-converged state.
+    "relaxation": 0.35,
+    "max_iterations": 100,
     "allow_fidelity_fallback": True,
 }
 
@@ -86,12 +92,20 @@ def _merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _apply_profile(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Merge structural tuning but replace physical composition inventories exactly."""
+    out = _merge(base, overlay)
+    astronomy = overlay.get("astronomy", {})
+    for key in ("atmosphere", "surface_volatiles"):
+        if key in astronomy:
+            out.setdefault("astronomy", {})[key] = copy.deepcopy(astronomy[key])
+    return out
+
+
 def build(profile: str, seed: int) -> dict[str, Any]:
     cfg = _load(BASE)
-    if profile == "earth":
-        cfg = _merge(cfg, EARTH_OVERLAY)
-    else:
-        cfg = _merge(cfg, _load(PROFILE_FILES[profile]))
+    overlay = EARTH_OVERLAY if profile == "earth" else _load(PROFILE_FILES[profile])
+    cfg = _apply_profile(cfg, overlay)
     cfg["seed"] = int(seed)
     cfg["atmogen"] = _merge(cfg.get("atmogen", {}), ATMOGEN_REFERENCE)
 
