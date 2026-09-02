@@ -10,6 +10,7 @@ import numpy as np
 from worldgen.atmogen_coupler import (
     annual_stellar_flux_scale,
     cluster_representative_states,
+    solve_representative_columns,
 )
 from worldgen.config import load_config
 from worldgen.fingerprints import stage_source_files
@@ -97,6 +98,52 @@ class AtmogenCouplingTests(unittest.TestCase):
         cfg.atmogen.cloud_particle_geometric_std = 0.99
         with self.assertRaises(ValueError):
             cfg.validate()
+
+    def test_representative_columns_publish_atmogen_cache_identity(self):
+        cfg = load_config(None)
+        cfg.atmogen.enabled = True
+        cfg.atmogen.chemistry_mode = "fixed_species"
+        cfg.atmogen.vertical_layers = 8
+        cfg.atmogen.representative_column_count = 3
+        cfg.validate()
+        grid = SphereGrid(64, 32, 6371.0)
+        astronomy = SimpleNamespace(
+            star={"luminosity_solar": 1.0, "effective_temperature_k": 5772.0},
+            planet={
+                "semimajor_axis_au": 1.0,
+                "radius_earth": 1.0,
+                "surface_gravity_m_s2": 9.80665,
+                "equilibrium_temperature_k": 255.0,
+                "axial_tilt_deg": 23.4,
+                "eccentricity": 0.0,
+                "longitude_periapsis_deg": 103.0,
+            },
+            atmosphere={"surface_pressure_bar": 1.0},
+            interior={"total_internal_heat_flux_w_m2_approx": 0.0},
+            volatile_chemistry={},
+        )
+        climate = SimpleNamespace(
+            annual_temperature_c=15.0 - 0.45 * np.abs(grid.lat)
+        )
+        result = solve_representative_columns(
+            grid=grid,
+            astronomy_result=astronomy,
+            climate_result=climate,
+            world_config=cfg,
+        )
+        diagnostics = result.diagnostics
+        self.assertEqual(diagnostics["column_count"], 3)
+        self.assertEqual(len(diagnostics["column_fingerprints"]), 3)
+        self.assertEqual(
+            diagnostics["unique_column_state_count"],
+            len(set(diagnostics["column_fingerprints"])),
+        )
+        self.assertEqual(len(diagnostics["atmogen_database_sha256"]), 64)
+        for index, summary in enumerate(result.summaries):
+            self.assertEqual(
+                summary["column_state_fingerprint"],
+                diagnostics["column_fingerprints"][index],
+            )
 
 
 if __name__ == "__main__":

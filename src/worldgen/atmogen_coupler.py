@@ -156,11 +156,12 @@ def solve_representative_columns(
     # this is only an input floor to the column solver and is recorded below.
     representative_f = np.maximum(representative_f, 1.0e-6)
     adapter = AtmogenAdapter(world_config)
-    results = adapter.solve_columns(
+    batch = adapter.solve_columns_with_diagnostics(
         astronomy_result,
         initial_surface_temperature_k=representative_t,
         stellar_flux_scale=representative_f,
     )
+    results = batch.results
     solved_t = np.asarray([float(item.atmosphere.temperature_k[0]) for item in results], dtype=float)
     raw_delta = solved_t - representative_t
     limit = float(cfg.representative_feedback_max_abs_k)
@@ -178,11 +179,32 @@ def solve_representative_columns(
         summary["stellar_flux_scale"] = float(representative_f[idx])
         summary["raw_temperature_delta_k"] = float(raw_delta[idx])
         summary["applied_temperature_delta_k"] = float(relaxed_delta[idx])
+        summary["column_state_fingerprint"] = batch.diagnostics.fingerprints[idx]
+        summary["unique_state_index"] = int(
+            batch.diagnostics.unique_state_index[idx]
+        )
+        summary["reused_column_state"] = bool(batch.diagnostics.reused[idx])
         summaries.append(summary)
 
     weights = np.asarray(grid.cell_area_weights, dtype=float)
     diagnostics = {
         "column_count": int(len(results)),
+        "unique_column_state_count": int(batch.diagnostics.unique_state_count),
+        "deduplicated_column_count": int(batch.diagnostics.deduplicated_count),
+        "column_deduplication_ratio": float(
+            batch.diagnostics.deduplication_ratio
+        ),
+        "column_fingerprints": list(batch.diagnostics.fingerprints),
+        "unique_column_fingerprints": list(
+            batch.diagnostics.unique_fingerprints
+        ),
+        "column_fallback_count": int(
+            batch.diagnostics.fallback_column_count
+        ),
+        "column_fallback_event_count": int(
+            batch.diagnostics.fallback_event_count
+        ),
+        "atmogen_database_sha256": batch.diagnostics.database_sha256,
         "forcing_scale_area_mean": float(np.sum(forcing * weights)),
         "temperature_correction_area_mean_c": float(np.sum(correction * weights)),
         "temperature_correction_max_abs_c": float(np.max(np.abs(correction))),

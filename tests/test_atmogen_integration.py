@@ -43,8 +43,8 @@ def test_adapter_replaces_old_greenhouse_authority_and_records_revision():
     assert result.surface.mass_closure_relative < 1e-12
     metadata = atmogen_runtime_metadata()
     assert metadata["compatible_git_revision"] == ATMOGEN_COMPATIBLE_REVISION
-    assert metadata["package_version"] == "0.10.0"
-    assert metadata["api_schema_version"] == 9
+    assert metadata["package_version"] == "0.11.0"
+    assert metadata["api_schema_version"] == 10
     assert metadata["data_schema_version"] == 4
 
 
@@ -71,7 +71,7 @@ def test_standard_fidelity_exposes_nonisothermal_vertical_profile():
     assert temperature[0] > temperature[-1]
     assert np.all(np.diff(pressure) < 0.0)
     assert profile["hydrostatic_relative_residual"] < 2e-12
-    assert atmogen_runtime_metadata()["package_version"] == "0.10.0"
+    assert atmogen_runtime_metadata()["package_version"] == "0.11.0"
 
 
 def test_high_fidelity_worldgen_adapter_uses_water_saturated_profile():

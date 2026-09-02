@@ -12,7 +12,7 @@ import numpy as np
 import atmogen
 
 
-ATMOGEN_COMPATIBLE_REVISION = "bd234ab952e04158bbffa63706793f9add9f4e59"
+ATMOGEN_COMPATIBLE_REVISION = "32f688391c6c24a97d06e406258b320c241ae648"
 
 
 def atmogen_runtime_metadata() -> dict[str, Any]:
@@ -199,6 +199,20 @@ class AtmogenAdapter:
         stellar_flux_scale: np.ndarray,
     ) -> tuple[atmogen.PlanetChemistryResult, ...]:
         """Solve representative geographic columns without duplicating atmogen physics."""
+        return self.solve_columns_with_diagnostics(
+            astronomy_result,
+            initial_surface_temperature_k=initial_surface_temperature_k,
+            stellar_flux_scale=stellar_flux_scale,
+        ).results
+
+    def solve_columns_with_diagnostics(
+        self,
+        astronomy_result,
+        *,
+        initial_surface_temperature_k: np.ndarray,
+        stellar_flux_scale: np.ndarray,
+    ) -> atmogen.ColumnBatchResult:
+        """Solve representative columns with atmogen-owned cache identities."""
         temperatures = np.asarray(
             initial_surface_temperature_k, dtype=float
         ).reshape(-1)
@@ -225,7 +239,7 @@ class AtmogenAdapter:
             )
             for temp, scale in zip(temperatures, scales, strict=True)
         )
-        return atmogen.solve_columns(
+        return atmogen.solve_columns_with_diagnostics(
             atmogen.ColumnBatchInput(
                 columns=columns, star=self.stellar_spectrum(astronomy_result)
             ),
