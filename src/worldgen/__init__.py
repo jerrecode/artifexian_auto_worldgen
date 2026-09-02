@@ -15,10 +15,18 @@ _install_low_speed_tectonics_fix()
 
 
 # Correct the historical Bond-albedo normalization before pipeline_base binds
-# build_astronomy.  This keeps target-temperature orbit solving and Atmogen stellar
+# build_astronomy. This keeps target-temperature orbit solving and Atmogen stellar
 # forcing on one physically consistent radiative-energy convention.
 from .astronomy_radiative_fix import install_astronomy_radiative_fix as _install_astronomy_radiative_fix  # noqa: E402
 _install_astronomy_radiative_fix()
+
+
+# Replace exact circular hotspot/LIP splats, exact-radius geological proximity
+# masks, and tiny-lake continentality halos before the pipeline captures stage
+# functions. The replacement fields remain deterministic and spherical but are
+# anisotropic, lobate, structurally rough, and component-aware.
+from .spatial_naturalism import install_spatial_naturalism_fix as _install_spatial_naturalism_fix  # noqa: E402
+_install_spatial_naturalism_fix()
 
 
 # Install the complete advanced pipeline hierarchy onto the canonical pipeline module.
