@@ -1,0 +1,46 @@
+name: Spatial naturalism regression validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'chatgpt/hydrology-atmogen-planet-suite-20260902'
+    paths:
+      - '.github/workflows/spatial-naturalism-validation.yml'
+      - 'src/worldgen/spatial_naturalism.py'
+      - 'src/worldgen/__init__.py'
+      - 'tests/test_spatial_naturalism.py'
+
+permissions:
+  contents: read
+
+jobs:
+  regressions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      MPLBACKEND: Agg
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_MAX_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install project and tests
+        run: |
+          set -euxo pipefail
+          python -m pip install --disable-pip-version-check -e '.[performance,jit,thermodynamics,render]'
+          python -m pip install --disable-pip-version-check pytest
+          python -m pip check
+      - name: Run spatial naturalism and integration regressions
+        run: |
+          set -euxo pipefail
+          python -m pytest -q \
+            tests/test_spatial_naturalism.py \
+            tests/test_hydrology_atmogen_reliability.py \
+            tests/test_atmogen_integration.py \
+            tests/test_atmogen_coupling.py
