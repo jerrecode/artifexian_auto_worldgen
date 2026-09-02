@@ -1,0 +1,281 @@
+name: Analyze Super-Earth output
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/analyze-super-earth.yml'
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Download completed Super-Earth artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: super-earth-maximal-2048x1024-upscaled-2x
+          path: original
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 33104104269
+
+      - name: Build compact analysis package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ROOT=$(find original -type f -name world_arrays.npz -printf '%h\n' | head -n1)
+          test -n "$ROOT"
+          echo "ROOT=$ROOT" >> "$GITHUB_ENV"
+          mkdir -p analysis-package/maps
+          cp -a "$ROOT/maps/." analysis-package/maps/
+          for f in world.json world_report.md diagnostics.json run_manifest.json timings.json advanced_planetary_physics.json surface_liquids.json features.geojson advanced_planetary_fields.npz surface_liquids.npz; do
+            if [ -f "$ROOT/$f" ]; then cp "$ROOT/$f" analysis-package/; fi
+          done
+          find original -maxdepth 2 -type f -name 'showcase-super-earth.yaml' -exec cp {} analysis-package/ \; || true
+          find original -maxdepth 2 -type f -name 'showcase-super-earth.log' -exec cp {} analysis-package/ \; || true
+
+      - name: Numerical and hydrology audit
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, math, os, warnings
+          from pathlib import Path
+          import numpy as np
+
+          root = Path(os.environ['ROOT'])
+          out = Path('analysis-package')
+          npz_path = root / 'world_arrays.npz'
+
+          def scalar(v):
+              if isinstance(v, np.generic): return v.item()
+              return v
+
+          def finite_stats(a):
+              a = np.asarray(a)
+              info = {
+                  'shape': list(a.shape), 'dtype': str(a.dtype),
+                  'size': int(a.size), 'nbytes': int(a.nbytes),
+              }
+              if a.size == 0: return info
+              if a.dtype.kind in 'biufc':
+                  if a.dtype.kind == 'c':
+                      x = np.abs(a).astype(np.float64, copy=False)
+                  else:
+                      x = a.astype(np.float64, copy=False)
+                  finite = np.isfinite(x)
+                  info['finite_fraction'] = float(finite.mean())
+                  if finite.any():
+                      xf = x[finite]
+                      info.update({
+                          'min': float(np.min(xf)), 'max': float(np.max(xf)),
+                          'mean': float(np.mean(xf)), 'std': float(np.std(xf)),
+                          'nonzero_fraction': float(np.count_nonzero(xf) / xf.size),
+                      })
+                      qs = np.percentile(xf, [0.1,1,5,10,25,50,75,90,95,99,99.9])
+                      info['percentiles'] = {str(q): float(v) for q,v in zip([0.1,1,5,10,25,50,75,90,95,99,99.9], qs)}
+              return info
+
+          arrays = {}
+          data = np.load(npz_path, allow_pickle=False)
+          keys = list(data.files)
+          for k in keys:
+              try:
+                  arrays[k] = finite_stats(data[k])
+              except Exception as e:
+                  arrays[k] = {'error': repr(e)}
+          (out/'world_arrays_inventory.json').write_text(json.dumps({'keys': keys, 'arrays': arrays}, indent=2), encoding='utf-8')
+
+          # Audit auxiliary NPZs too.
+          for fname in ('advanced_planetary_fields.npz','surface_liquids.npz'):
+              p = root/fname
+              if p.exists():
+                  d = np.load(p, allow_pickle=False)
+                  inv = {k: finite_stats(d[k]) for k in d.files}
+                  (out/(p.stem+'_inventory.json')).write_text(json.dumps({'keys':list(d.files),'arrays':inv}, indent=2), encoding='utf-8')
+
+          def find_key(*candidates, contains=()):
+              low = {k.lower(): k for k in keys}
+              for c in candidates:
+                  if c.lower() in low: return low[c.lower()]
+              for k in keys:
+                  lk = k.lower()
+                  if all(s.lower() in lk for s in contains): return k
+              return None
+
+          aliases = {
+              'elevation': find_key('elevation_km','elevation','terrain_elevation_km', contains=('elevation',)),
+              'ocean_depth': find_key('ocean_depth_m','depth_m','ocean_depth', contains=('ocean','depth')),
+              'river_mask': find_key('river_mask','rivers', contains=('river','mask')),
+              'river_width': find_key('river_width_m','river_width','width_m', contains=('river','width')),
+              'stream_order': find_key('stream_order','strahler_order', contains=('stream','order')),
+              'runoff': find_key('runoff_mm_year','runoff', contains=('runoff',)),
+              'precipitation': find_key('precipitation_annual_mm','precipitation_mm_year','precipitation_annual','precipitation', contains=('precipitation','annual')),
+              'flow_accumulation': find_key('flow_accumulation','flow_acc','accumulation', contains=('flow','accum')),
+              'flow_to': find_key('flow_to','flow_receiver','receiver_index', contains=('flow','to')),
+              'erosion': find_key('erosion_m','erosion','fluvial_erosion_m', contains=('erosion',)),
+              'deposition': find_key('deposition_m','deposition','sediment_deposition', contains=('deposition',)),
+              'sediment_flux': find_key('sediment_flux','sediment_flux_norm', contains=('sediment','flux')),
+              'slope': find_key('slope','slope_m_per_m', contains=('slope',)),
+              'lake_mask': find_key('lake_mask','lakes', contains=('lake','mask')),
+          }
+
+          hyd = {'aliases': aliases, 'notes': []}
+          elev = np.asarray(data[aliases['elevation']], dtype=np.float64) if aliases['elevation'] else None
+          depth = np.asarray(data[aliases['ocean_depth']], dtype=np.float64) if aliases['ocean_depth'] else None
+          river = np.asarray(data[aliases['river_mask']]).astype(bool) if aliases['river_mask'] else None
+          runoff = np.asarray(data[aliases['runoff']], dtype=np.float64) if aliases['runoff'] else None
+          precip = np.asarray(data[aliases['precipitation']], dtype=np.float64) if aliases['precipitation'] else None
+          accum = np.asarray(data[aliases['flow_accumulation']], dtype=np.float64) if aliases['flow_accumulation'] else None
+          erosion = np.asarray(data[aliases['erosion']], dtype=np.float64) if aliases['erosion'] else None
+          deposition = np.asarray(data[aliases['deposition']], dtype=np.float64) if aliases['deposition'] else None
+          sedflux = np.asarray(data[aliases['sediment_flux']], dtype=np.float64) if aliases['sediment_flux'] else None
+
+          shape = None
+          for a in (elev, depth, river, runoff, precip, accum):
+              if a is not None and a.ndim >= 2:
+                  shape = a.shape[-2:]
+                  break
+          if shape:
+              H,W = shape
+              # Latitude-weighted spherical area fractions; absolute radius if available from world metadata.
+              lat = np.pi/2 - (np.arange(H)+0.5)*np.pi/H
+              wlat = np.cos(lat)[:,None]
+              weights = np.broadcast_to(wlat,(H,W)).astype(np.float64)
+              weights /= weights.sum()
+              ocean = (depth > 0) if depth is not None and depth.shape[-2:] == shape else (elev < 0 if elev is not None else np.zeros(shape,bool))
+              land = ~ocean
+              hyd['grid']={'height':H,'width':W,'land_area_fraction':float(weights[land].sum()),'ocean_area_fraction':float(weights[ocean].sum())}
+              if river is not None and river.shape[-2:] == shape:
+                  riv = river.reshape(shape)
+                  hyd['river_cells']={
+                      'count_total': int(riv.sum()),
+                      'count_land': int((riv&land).sum()),
+                      'count_ocean': int((riv&ocean).sum()),
+                      'fraction_of_river_cells_underwater': float((riv&ocean).sum()/max(1,riv.sum())),
+                      'fraction_of_land_cells_marked_river': float((riv&land).sum()/max(1,land.sum())),
+                      'area_weighted_land_river_fraction': float(weights[riv&land].sum()/max(1e-30,weights[land].sum())),
+                  }
+                  # contiguous ocean penetration distance in cell counts is not exact geodesic; useful defect signal.
+                  if np.any(riv&ocean):
+                      hyd['notes'].append('River mask contains ocean cells; renderer/hydrology should mask channels at shoreline or explicitly distinguish submarine channels.')
+              # Compute spherical slopes from elevation if available.
+              if elev is not None and elev.shape[-2:] == shape:
+                  # Radius defaults to Earth if metadata lookup fails; only relative slope diagnostics depend weakly on radius.
+                  radius_m = 6371000.0
+                  try:
+                      worldj=json.loads((root/'world.json').read_text())
+                      astro=worldj.get('astronomy',{})
+                      for cand in ('planet_radius_km','radius_km'):
+                          if cand in astro:
+                              radius_m=float(astro[cand])*1000; break
+                  except Exception: pass
+                  z=elev.reshape(shape)*1000.0
+                  dlat=np.pi/H; dlon=2*np.pi/W
+                  dz_dlat=np.gradient(z,dlat,axis=0,edge_order=1)
+                  dz_dlon=(np.roll(z,-1,axis=1)-np.roll(z,1,axis=1))/(2*dlon)
+                  coslat=np.maximum(np.cos(lat)[:,None],1e-4)
+                  gy=dz_dlat/radius_m; gx=dz_dlon/(radius_m*coslat)
+                  slope=np.hypot(gx,gy)
+                  sl=slope[land]
+                  hyd['slope_land']={
+                      'mean_gradient':float(np.mean(sl)),
+                      'median_gradient':float(np.median(sl)),
+                      'p90_gradient':float(np.percentile(sl,90)),
+                      'p99_gradient':float(np.percentile(sl,99)),
+                      'mean_degrees':float(np.degrees(np.arctan(np.mean(sl)))),
+                      'p99_degrees':float(np.degrees(np.arctan(np.percentile(sl,99)))),
+                  }
+                  if river is not None:
+                      rm=river.reshape(shape)&land
+                      if rm.any():
+                          hyd['river_slope']={'median_gradient':float(np.median(slope[rm])),'p90_gradient':float(np.percentile(slope[rm],90))}
+                  # save a compact derived slope field for local inspection
+                  np.savez_compressed(out/'derived_hydrology_fields.npz', slope_gradient=slope.astype(np.float32), land_mask=land, ocean_mask=ocean)
+
+              # Correlation diagnostics over land, sampled to bound memory.
+              fields={'precipitation':precip,'runoff':runoff,'flow_accumulation':accum,'erosion':erosion,'deposition':deposition,'sediment_flux':sedflux}
+              usable={k:np.asarray(v).reshape(shape) for k,v in fields.items() if v is not None and np.asarray(v).shape[-2:]==shape and np.asarray(v).ndim==2}
+              names=list(usable)
+              if names:
+                  idx=np.flatnonzero(land.ravel())
+                  if idx.size>300000:
+                      idx=idx[np.linspace(0,idx.size-1,300000,dtype=np.int64)]
+                  corr={}
+                  for i,a in enumerate(names):
+                      xa=usable[a].ravel()[idx].astype(np.float64)
+                      for b in names[i+1:]:
+                          xb=usable[b].ravel()[idx].astype(np.float64)
+                          ok=np.isfinite(xa)&np.isfinite(xb)
+                          if ok.sum()>20 and np.std(xa[ok])>0 and np.std(xb[ok])>0:
+                              corr[f'{a}__{b}']=float(np.corrcoef(xa[ok],xb[ok])[0,1])
+                  hyd['land_correlations']=corr
+
+              # Flow-network/basin topology from flattened receiver indices.
+              fk=aliases['flow_to']
+              if fk:
+                  recv=np.asarray(data[fk]).ravel()
+                  N=H*W
+                  if recv.size==N and recv.dtype.kind in 'iu':
+                      recv=recv.astype(np.int64,copy=True)
+                      bad=(recv<0)|(recv>=N)
+                      recv[bad]=np.arange(N,dtype=np.int64)[bad]
+                      parent=recv.copy()
+                      # pointer jumping; 32 iterations spans >4 billion-cell paths if acyclic/self-rooted
+                      for _ in range(32):
+                          new=parent[parent]
+                          if np.array_equal(new,parent): break
+                          parent=new
+                      roots=parent
+                      land_flat=land.ravel(); ocean_flat=ocean.ravel()
+                      land_roots=roots[land_flat]
+                      uniq,cnt=np.unique(land_roots,return_counts=True)
+                      root_ocean=ocean_flat[uniq]
+                      hyd['flow_topology']={
+                          'receiver_invalid_count':int(bad.sum()),
+                          'self_receiver_count':int(np.sum(recv==np.arange(N))),
+                          'land_basin_count':int(uniq.size),
+                          'land_basins_terminating_in_ocean_count':int(root_ocean.sum()),
+                          'land_basins_internal_or_closed_count':int((~root_ocean).sum()),
+                          'largest_basin_cells':int(cnt.max()) if cnt.size else 0,
+                          'median_basin_cells':float(np.median(cnt)) if cnt.size else 0.0,
+                          'p90_basin_cells':float(np.percentile(cnt,90)) if cnt.size else 0.0,
+                          'p99_basin_cells':float(np.percentile(cnt,99)) if cnt.size else 0.0,
+                          'fraction_land_cells_in_largest_basin':float(cnt.max()/max(1,land_flat.sum())) if cnt.size else 0.0,
+                      }
+                      # Catch flow receivers that point from land directly into non-coastal deep ocean.
+                      land_idx=np.flatnonzero(land_flat)
+                      to=recv[land_idx]
+                      into_ocean=ocean_flat[to]
+                      hyd['flow_topology']['land_cells_routing_directly_to_ocean']=int(into_ocean.sum())
+                      # Basin-size distribution compact CSV.
+                      order=np.argsort(cnt)[::-1]
+                      with (out/'basin_sizes.csv').open('w') as f:
+                          f.write('rank,root_index,cells,terminates_in_ocean\n')
+                          for rank,j in enumerate(order[:10000],1):
+                              f.write(f'{rank},{int(uniq[j])},{int(cnt[j])},{int(root_ocean[j])}\n')
+                  else:
+                      hyd['notes'].append(f'flow_to exists but shape/dtype is not a flattened receiver graph: shape={list(np.asarray(data[fk]).shape)} dtype={data[fk].dtype}')
+
+          (out/'hydrology_audit.json').write_text(json.dumps(hyd, indent=2), encoding='utf-8')
+          print(json.dumps(hyd, indent=2))
+          PY
+
+      - name: Inventory maps and package size
+        shell: bash
+        run: |
+          set -euxo pipefail
+          find analysis-package -maxdepth 2 -type f -printf '%p\t%s\n' | sort > analysis-package/file_inventory.tsv
+          du -sh analysis-package
+
+      - name: Upload compact Super-Earth analysis package
+        uses: actions/upload-artifact@v4
+        with:
+          name: super-earth-analysis-package
+          path: analysis-package/
+          compression-level: 6
+          retention-days: 7
+          if-no-files-found: error

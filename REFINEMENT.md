@@ -89,6 +89,7 @@ world-out/
       level_0001/
         index.json
         level_state.json
+        hydrology_refinement.json
         arrays/*.npy
         maps/
           height_grayscale_16bit.png
@@ -115,6 +116,8 @@ one quarter of its intended magnitude.
 
 After all child cores complete, the level is composed into a full disk-backed dataset. That composed field—not a collection of independently evolving sibling edge states—is the source for the next recursive depth.
 
+Drainage is deliberately handled **after** this composition step. No child tile is allowed to decide its own outlet. The complete refined elevation sphere is Priority-Flooded once and receives one new globally consistent receiver graph, drainage accumulation, channel hierarchy and watershed hierarchy. Thus a section boundary has no special hydrologic meaning.
+
 ## Recursive ancestry
 
 Node IDs preserve their full ancestry. Examples:
@@ -131,9 +134,11 @@ The index for every completed depth retains all child bounds and parent IDs even
 
 Every individual child field is written through a temporary file, flushed, fsynced, and atomically renamed. A node receives its completion marker only after all of its fields have been written.
 
-The level is marked complete only after bottom-up composition and its full-level index succeed. `manifest.json` advances `deepest_complete_level` only after that point.
+The level is marked complete only after bottom-up composition, global refined-hydrology recomputation, and its full-level index succeed. `manifest.json` advances `deepest_complete_level` only after that point.
 
 With the default `--resume`, restarting after interruption reuses already completed node fields. The remaining node fields and composition continue from the incomplete depth. Use `--no-resume` to deliberately recompute existing refinement payloads.
+
+Older completed refinement trees created before refined hydrology existed are migrated lazily: before such a level becomes the parent of a deeper refinement, its drainage topology is rebuilt from its already-composed elevation and inherited forcing arrays.
 
 The original simulation-stage checkpoint system remains separate and continues to handle interrupted base-world generation.
 
@@ -147,11 +152,11 @@ worldgen generate ... --progress-detail -vv
 
 Detailed stage progress includes process start time, current-stage runtime, observed mean stage duration, total elapsed time, ETA, and estimated finish clock time.
 
-Refinement progress is hierarchy-aware. It reports the current absolute refinement depth, recursive node path, node number, field name, current-level completion, action-duration moving average, elapsed time, estimated remaining recursive work, and estimated finish time. Verbose progress events can also be written to the normal text or JSONL log.
+Refinement progress is hierarchy-aware. It reports the current absolute refinement depth, recursive node path, node number, field name, current-level completion, action-duration moving average, elapsed time, estimated remaining recursive work, and estimated finish time. The global drainage rebuild emits its own `refined_hydrology_start` and `refined_hydrology_done` events. Verbose progress events can also be written to the normal text or JSONL log.
 
 ## Full-relief grayscale height map
 
-Initial generation now writes a 16-bit grayscale height map by default when PNG output is enabled:
+Initial generation writes a 16-bit grayscale height map when PNG output is enabled:
 
 ```text
 maps/02b_height_grayscale_16bit.png
@@ -166,25 +171,43 @@ The JSON sidecar records the physical minimum and maximum elevation represented 
 
 ## What is actually refined today
 
-The engine distinguishes three operations.
+The engine distinguishes four operations.
 
-**Inherited continuous fields** are spherically interpolated from the complete parent level. This includes climate scalars, ocean/climate vector fields, hydrological scalar diagnostics, suitability fields, and similar maps.
+**Inherited continuous forcing fields** are spherically interpolated from the complete parent level. This includes climate scalars, runoff/baseflow forcing, ocean/climate vector fields, suitability fields, and similar globally solved maps.
 
-**Categorical/discrete fields** are sampled with spherical nearest-neighbour semantics. This avoids creating nonsensical fractional plate IDs, rock classes, boolean masks, or integer class codes.
+**Categorical/discrete inherited fields** are sampled with spherical nearest-neighbour semantics. This avoids creating nonsensical fractional plate IDs, rock classes, boolean masks, or integer class codes.
 
 **Refinement kernels** may add genuinely new sub-grid state. The first implemented kernel synthesizes deterministic, globally continuous spherical relief on `elevation_km`; `ocean_depth_m` is then derived from that refined complete elevation/bathymetry field rather than independently interpolated.
 
-This architecture is intentionally extensible: later local kernels can regenerate soil, ecology, erosion, groundwater, weather events, resource exposure, rendering detail, and other processes after their dependencies are made tile-safe.
+**Topology-derived hydrology** is not interpolated at all. Once the refined sphere is fully composed, the engine recomputes:
 
-## Important scientific limitation
+- Priority-Flood filled elevation;
+- flattened `flow_to` receiver addresses for the new raster;
+- flow accumulation and drainage area;
+- mean/discharge and bankfull indices;
+- resolved channel classes and river masks;
+- Strahler stream order and width proxy;
+- depression-derived lake mask;
+- unique terminal-outlet basin IDs;
+- three nested sub-basin levels;
+- exorheic/internal drainage classification;
+- great-circle distance to outlet;
+- topographic wetness index;
+- height above nearest drainage (HAND);
+- sub-grid drainage-density proxy;
+- meander/sinuosity proxies.
 
-Refinement is not equivalent to rerunning the complete world model at the final global resolution.
+Because the recomputation is performed on the complete composed level, the result is deterministic and independent of the chosen `--refine-sections` partition for a fixed refined elevation/forcing state.
 
-Tectonic plate history, atmosphere, barotropic/global ocean circulation, global drainage topology, and other non-local problems have dependencies spanning arbitrarily large distances. Solving each child independently would generate exactly the section artifacts this system is designed to prevent.
+## Scientific boundary of refinement
 
-Therefore globally coupled fields are currently inherited from their already solved parent state while safe sub-grid kernels operate locally with halos. Additional physics should be moved into refinement only when its boundary conditions, conservation laws, and dependency radius are explicit.
+Refinement is still not equivalent to rerunning the complete atmosphere-ocean-tectonic world model at the final global resolution.
 
-`flow_to` is specifically omitted at refined depths. It stores flattened receiver indices tied to one raster resolution and cannot be meaningfully interpolated. A future hydrology refinement backend should rebuild drainage receivers from the refined elevation while using coarse/global basin and outlet constraints.
+Tectonic plate history, atmospheric circulation and global ocean circulation have non-local dependencies and are inherited from their previously solved parent/global state. Solving those independently inside child rectangles would generate exactly the section artifacts this system is designed to prevent.
+
+Drainage is different: once the complete refined topography exists, its non-local dependency can be solved globally over that complete sphere. Therefore the receiver graph and watershed hierarchy are now recomputed at every completed refined depth rather than inherited or interpolated.
+
+The refined hydrology currently uses the refined elevation plus inherited/interpolated runoff, precipitation, baseflow and storminess forcing. It does **not** rerun the climate circulation or groundwater PDE at the fine resolution. The global land water-balance model and the multicomponent condensate partition remain parent/global forcing unless a future high-resolution climate/groundwater backend is explicitly invoked.
 
 Passing software tests verifies implementation invariants, not physical validation of every newly synthesized sub-grid feature.
 
@@ -204,6 +227,6 @@ The number of leaf sections grows with branching factor `B = sections_x * sectio
 leaf_nodes_L = B^L
 ```
 
-Peak RAM is instead primarily controlled by the size of one expanded section and one field or small field stack, because target full-level arrays are composed through memory-mapped files. Disk usage still grows rapidly and should be planned before attempting very deep refinement.
+Most interpolated fields retain the section-bounded working-set behavior. The refined drainage solve is intentionally a **global O(N) topology stage**, because a correct watershed may span the entire world. It therefore adds full-level working arrays for elevation/fill, receiver addresses and graph accumulators. This is a fundamental dependency cost, not a tile-size artifact.
 
-For efficient deep refinement, choose enough sections that a child working set remains comfortably below physical RAM and avoid retaining redundant section payloads unless they are needed for analysis.
+For very deep refinement, disk-backed field composition remains bounded by section size, while the global drainage stage becomes the principal RAM constraint. Future out-of-core Priority-Flood/receiver backends can reduce that constraint without changing the public refinement contract.
