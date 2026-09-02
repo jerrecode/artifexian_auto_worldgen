@@ -39,6 +39,7 @@ jobs:
       - name: Install worldgen, atmogen and validation backends
         run: |
           python -m pip install --disable-pip-version-check -e '.[performance,jit,thermodynamics,render]'
+          python -m pip install --disable-pip-version-check pytest
           python -m pip check
           python - <<'PY'
           import json
@@ -109,8 +110,8 @@ jobs:
           atm=manifest.get('atmogen', {})
           if not atm.get('enabled'):
               raise SystemExit('atmogen was not enabled in run manifest')
-          if not atm.get('version'):
-              raise SystemExit(f'atmogen runtime metadata missing: {atm}')
+          if not atm.get('package_version') or int(atm.get('api_schema_version', 0)) < 11:
+              raise SystemExit(f'atmogen runtime metadata missing/incompatible: {atm}')
           if not diag.get('all_invariants_passed', False):
               raise SystemExit(f"diagnostics invariants failed: {diag.get('invariant_failures')}")
           if not optics.get('all_invariants_passed', False):
