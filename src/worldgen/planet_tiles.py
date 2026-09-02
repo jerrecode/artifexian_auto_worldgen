@@ -33,7 +33,7 @@ from .topology import (
 
 
 CUBE_FACES = ("px", "nx", "py", "ny", "pz", "nz")
-_TILE_SCHEMA_VERSION = 1
+_TILE_SCHEMA_VERSION = 2
 _OMITTED_FIELDS = {"flow_to"}
 
 
@@ -341,15 +341,27 @@ class PlanetTilePyramid:
         *,
         spec: TilePyramidSpec | None = None,
         planet_radius_m: float | None = None,
+        source_level: int | None = None,
     ) -> None:
         self.world_root = Path(world_root).expanduser().resolve()
         self.spec = (spec or TilePyramidSpec()).validate()
-        self.source_path = self.world_root / "world_arrays.npz"
-        if not self.source_path.exists():
+        self.base_source_path = self.world_root / "world_arrays.npz"
+        if not self.base_source_path.exists():
             raise FileNotFoundError(
-                f"{self.source_path} does not exist; generate the base world with NPZ output first"
+                f"{self.base_source_path} does not exist; generate the base world with NPZ output first"
             )
-        self.root = self.world_root / "tiles" / "cubesphere_v1"
+        self.source_level = 0
+        self.source_kind = "base_npz"
+        self.source_path = self.base_source_path
+        self._source_arrays_dir: Path | None = None
+        self._source_index: dict[str, object] | None = None
+        self._select_source(source_level)
+        cache_root = self.world_root / "tiles" / "cubesphere_v1"
+        self.root = (
+            cache_root
+            if self.source_level == 0
+            else cache_root / f"refinement_level_{self.source_level:04d}"
+        )
         self.root.mkdir(parents=True, exist_ok=True)
         self.manifest_path = self.root / "tileset.json"
         self._source_sha256: str | None = None
@@ -361,6 +373,62 @@ class PlanetTilePyramid:
         if not math.isfinite(self._planet_radius_m) or self._planet_radius_m <= 0:
             raise ValueError("planet radius must be finite and positive")
         self._ensure_manifest()
+
+    def _select_source(self, requested_level: int | None) -> None:
+        """Select the complete deepest refinement by default.
+
+        Refinement levels are already globally composed static ``.npy`` maps.  The
+        older tile path nevertheless always sampled ``world_arrays.npz``, making
+        successful refinement invisible to every later LOD/precompute operation.
+        """
+        manifest_path = self.world_root / "refinement" / "manifest.json"
+        manifest: dict[str, object] | None = None
+        if manifest_path.exists():
+            try:
+                loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"unreadable refinement manifest: {manifest_path}") from exc
+            if not isinstance(loaded, dict):
+                raise RuntimeError(f"invalid refinement manifest: {manifest_path}")
+            manifest = loaded
+
+        if requested_level is None:
+            level = int(manifest.get("deepest_complete_level", 0)) if manifest else 0
+        else:
+            level = int(requested_level)
+        if level < 0:
+            raise ValueError("source_level must be >= 0")
+        if level == 0:
+            return
+        if manifest is None:
+            raise ValueError(
+                f"refinement source level {level} was requested but no refinement manifest exists"
+            )
+        record = manifest.get("levels", {}).get(str(level)) if isinstance(manifest.get("levels"), dict) else None
+        if not isinstance(record, dict) or record.get("complete") is not True:
+            raise ValueError(f"refinement source level {level} is not complete")
+        index_path = self.world_root / str(
+            record.get("index", f"refinement/levels/level_{level:04d}/index.json")
+        )
+        if not index_path.exists():
+            raise FileNotFoundError(f"refinement source index does not exist: {index_path}")
+        try:
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"unreadable refinement source index: {index_path}") from exc
+        if index.get("complete") is not True or int(index.get("level", -1)) != level:
+            raise RuntimeError(f"refinement source index is not a complete level {level}: {index_path}")
+        arrays_dir = index_path.parent / "arrays"
+        for required in ("lat", "lon", "elevation_km"):
+            if not (arrays_dir / f"{required}.npy").exists():
+                raise FileNotFoundError(
+                    f"refinement source level {level} lacks required array {required!r}"
+                )
+        self.source_level = level
+        self.source_kind = "refinement_level"
+        self.source_path = index_path
+        self._source_arrays_dir = arrays_dir
+        self._source_index = index
 
     @property
     def planet_radius_m(self) -> float:
@@ -423,18 +491,69 @@ class PlanetTilePyramid:
         return self._root_seed
 
     def _source_metadata(self) -> tuple[tuple[int, int], tuple[str, ...]]:
+        if self.source_kind == "refinement_level":
+            assert self._source_index is not None and self._source_arrays_dir is not None
+            resolution = self._source_index.get("resolution")
+            entries = self._source_index.get("entries")
+            if not (
+                isinstance(resolution, list)
+                and len(resolution) == 2
+                and isinstance(entries, dict)
+            ):
+                raise RuntimeError(f"invalid refinement source index: {self.source_path}")
+            fields = tuple(
+                sorted(
+                    name
+                    for name, entry in entries.items()
+                    if isinstance(name, str)
+                    and isinstance(entry, dict)
+                    and not entry.get("omitted_at_refined_levels")
+                    and (self._source_arrays_dir / f"{name}.npy").exists()
+                )
+            )
+            self._source_shape = (int(resolution[1]), int(resolution[0]))
+            return self._source_shape, fields
         if self._source_shape is not None:
-            with np.load(self.source_path, allow_pickle=False) as z:
+            with np.load(self.base_source_path, allow_pickle=False) as z:
                 return self._source_shape, tuple(sorted(z.files))
-        with np.load(self.source_path, allow_pickle=False) as z:
+        with np.load(self.base_source_path, allow_pickle=False) as z:
             if "lat" not in z or "lon" not in z:
                 raise ValueError("world_arrays.npz must contain lat and lon")
             self._source_shape = (int(len(z["lat"])), int(len(z["lon"])))
             return self._source_shape, tuple(sorted(z.files))
 
+    def _load_source_array(self, name: str) -> np.ndarray:
+        if self.source_kind == "refinement_level":
+            assert self._source_arrays_dir is not None
+            path = self._source_arrays_dir / f"{name}.npy"
+            if not path.exists():
+                raise KeyError(f"source field {name!r} is not present in refinement level {self.source_level}")
+            return np.load(path, mmap_mode="r", allow_pickle=False)
+        with np.load(self.base_source_path, allow_pickle=False) as z:
+            if name not in z:
+                raise KeyError(f"source field {name!r} is not present in world_arrays.npz")
+            return np.asarray(z[name])
+
     def _source_hash(self) -> str:
         if self._source_sha256 is None:
-            self._source_sha256 = _file_sha256(self.source_path)
+            if self.source_kind == "base_npz":
+                self._source_sha256 = _file_sha256(self.base_source_path)
+            else:
+                assert self._source_arrays_dir is not None
+                _shape, fields = self._source_metadata()
+                digest = hashlib.sha256()
+                digest.update(b"worldgen-refinement-source-v1\0")
+                digest.update(self.source_path.read_bytes())
+                for name in fields:
+                    path = self._source_arrays_dir / f"{name}.npy"
+                    stat = path.stat()
+                    digest.update(name.encode("utf-8"))
+                    digest.update(b"\0")
+                    digest.update(str(int(stat.st_size)).encode("ascii"))
+                    digest.update(b"\0")
+                    digest.update(str(int(stat.st_mtime_ns)).encode("ascii"))
+                    digest.update(b"\0")
+                self._source_sha256 = digest.hexdigest()
         return self._source_sha256
 
     def _ensure_manifest(self) -> None:
@@ -447,6 +566,9 @@ class PlanetTilePyramid:
             "tile_size": int(self.spec.tile_size),
             "terrain_vertex_shape": [int(self.spec.tile_size) + 1, int(self.spec.tile_size) + 1],
             "planet_radius_m": self.planet_radius_m,
+            "source_kind": self.source_kind,
+            "source_level": int(self.source_level),
+            "source_path": str(self.source_path.relative_to(self.world_root)),
             "source_resolution": [shape[1], shape[0]],
             "source_sha256": self._source_hash(),
             "source_fields": list(fields),
@@ -460,7 +582,7 @@ class PlanetTilePyramid:
                 "semantics": "each level halves characteristic metres per sample; high levels are generated lazily",
             },
             "limitations": [
-                "global coupled physics is inherited from world_arrays.npz rather than rerun independently per tile",
+                "global coupled physics is inherited from the selected complete global source rather than rerun independently per tile",
                 "high-frequency elevation is deterministic spectral sub-grid relief, not yet a local fluvial/landslide simulation",
                 "flow_to is omitted because global raster receiver indices are invalid in a tile address space",
             ],
@@ -546,10 +668,9 @@ class PlanetTilePyramid:
         source_name = "elevation_km" if field == "elevation_m" else field
         (h, w), source_fields = self._source_metadata()
         if source_name not in source_fields:
-            raise KeyError(f"source field {source_name!r} is not present in world_arrays.npz")
+            raise KeyError(f"source field {source_name!r} is not present in selected source level {self.source_level}")
         sy, sx = self._source_coordinates(geom)
-        with np.load(self.source_path, allow_pickle=False) as z:
-            values = np.asarray(z[source_name])
+        values = self._load_source_array(source_name)
         mode = "nearest" if values.dtype.kind in "biuUSO" else "linear"
         sampled = self._sample_array(values, sy=sy, sx=sx, source_shape=(h, w), mode=mode)
         if field == "elevation_m":
@@ -561,10 +682,10 @@ class PlanetTilePyramid:
     def _elevation_detail_amplitude_m(self) -> float:
         if self.spec.elevation_detail_strength <= 0:
             return 0.0
-        with np.load(self.source_path, allow_pickle=False) as z:
-            if "elevation_km" not in z:
-                return 0.0
-            elevation = np.asarray(z["elevation_km"], dtype=np.float64)
+        try:
+            elevation = np.asarray(self._load_source_array("elevation_km"), dtype=np.float64)
+        except KeyError:
+            return 0.0
         finite = elevation[np.isfinite(elevation)]
         if finite.size == 0:
             return 0.0

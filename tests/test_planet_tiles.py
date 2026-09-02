@@ -4,6 +4,7 @@ import json
 
 import numpy as np
 
+from worldgen.refinement import RefinementEngine, RefinementSpec
 from worldgen.planet_tiles import (
     PlanetTilePyramid,
     TileKey,
@@ -163,3 +164,39 @@ def test_tileset_records_world_fingerprint_and_lod_contract(tmp_path):
     assert len(manifest["source_sha256"]) == 64
     assert manifest["lod"]["root_meters_per_sample_approx"] > 0
     assert "flow_to" in manifest["omitted_fields"]
+
+
+def test_tiles_default_to_deepest_complete_full_world_refinement(tmp_path):
+    _write_world(tmp_path)
+    RefinementEngine(
+        tmp_path,
+        spec=RefinementSpec(
+            scale=2,
+            sections_y=2,
+            sections_x=2,
+            halo_cells=2,
+            elevation_detail_strength=0.4,
+        ),
+    ).refine(2)
+
+    refined = PlanetTilePyramid(
+        tmp_path,
+        spec=TilePyramidSpec(tile_size=16, elevation_detail_strength=0.0),
+    )
+    assert refined.source_kind == "refinement_level"
+    assert refined.source_level == 2
+    assert refined._source_metadata()[0] == (64, 128)
+    refined_manifest = json.loads(refined.manifest_path.read_text(encoding="utf-8"))
+    assert refined_manifest["source_level"] == 2
+    assert refined_manifest["source_resolution"] == [128, 64]
+    assert "refinement_level_0002" in str(refined.manifest_path)
+
+    base = PlanetTilePyramid(
+        tmp_path,
+        spec=TilePyramidSpec(tile_size=16, elevation_detail_strength=0.0),
+        source_level=0,
+    )
+    assert base.source_kind == "base_npz"
+    assert base.source_level == 0
+    assert base._source_metadata()[0] == (16, 32)
+    assert base.manifest_path != refined.manifest_path

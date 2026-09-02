@@ -6,7 +6,11 @@ import time
 import numpy as np
 import pytest
 
-from worldgen.refinement import RefinementEngine, RefinementSpec
+from worldgen.refinement import (
+    RefinementEngine,
+    RefinementSpec,
+    _partition_invariant_spherical_detail,
+)
 from worldgen.topology import spherical_resize
 
 
@@ -74,6 +78,25 @@ def test_refinement_composes_children_to_exact_spherical_parent_resample_without
     index = json.loads((level / "index.json").read_text(encoding="utf-8"))
     assert "flow_to" in index["omitted_fields"]
     assert (level / "maps" / "height_grayscale_16bit.png").exists()
+    latest = json.loads((tmp_path / "refinement" / "latest.json").read_text(encoding="utf-8"))
+    assert latest["level"] == 1
+    assert latest["resolution"] == [32, 16]
+    assert latest["arrays"]["elevation_km"].endswith("level_0001/arrays/elevation_km.npy")
+    assert (tmp_path / latest["heightmap_full_relief"]).exists()
+    assert (tmp_path / "maps" / "refinement_latest.json").exists()
+
+
+def test_partition_invariant_detail_preserves_unit_rms_strength():
+    h, w = 128, 256
+    lat = 90.0 - (np.arange(h, dtype=float)[:, None] + 0.5) * 180.0 / h
+    lon = -180.0 + (np.arange(w, dtype=float)[None, :] + 0.5) * 360.0 / w
+    lat, lon = np.broadcast_arrays(lat, lon)
+    detail = _partition_invariant_spherical_detail(
+        lat, lon, seed=123, frequency=h / 5.0
+    )
+    # The seam-safe normalizer must retain the intended relief strength.  The
+    # regressed sum-of-weights divisor produced about 0.23 here.
+    assert 0.80 < float(np.std(detail)) < 1.20
 
 
 def test_repeated_invocation_creates_sections_of_sections(tmp_path):

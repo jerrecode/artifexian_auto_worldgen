@@ -135,6 +135,24 @@ def _atomic_save_npy(path: Path, array: np.ndarray) -> None:
             pass
 
 
+def _atomic_copy_file(source: Path, target: Path) -> None:
+    """Publish a stable alias without exposing a partially copied product."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    tmp = Path(tmp_name)
+    try:
+        with source.open("rb") as src, os.fdopen(fd, "wb") as dst:
+            shutil.copyfileobj(src, dst, length=4 * 1024 * 1024)
+            dst.flush()
+            os.fsync(dst.fileno())
+        os.replace(tmp, target)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _spatial_axes(shape: tuple[int, ...], height: int, width: int) -> tuple[int, int] | None:
     if len(shape) >= 2 and tuple(shape[-2:]) == (height, width):
         return len(shape) - 2, len(shape) - 1
@@ -720,7 +738,7 @@ class RefinementEngine:
         level_state["complete"] = True
         level_state["seconds"] = time.perf_counter() - level_t0
         _atomic_write_json(target_dir / "level_state.json", level_state)
-        manifest["levels"][str(target_level)] = {
+        level_record = {
             "resolution": [target_width, target_height],
             "node_count": len(nodes),
             "complete": True,
@@ -728,6 +746,8 @@ class RefinementEngine:
             "index": str(self._level_index_path(target_level).relative_to(self.world_root)),
             "heightmap": str((target_dir / "maps" / "height_grayscale_16bit.png").relative_to(self.world_root)),
         }
+        manifest["levels"][str(target_level)] = level_record
+        manifest["latest"] = self._publish_latest_level(target_level, index)
         manifest["deepest_complete_level"] = target_level
         self._save_manifest(manifest)
         if not self.spec.keep_sections:
@@ -842,6 +862,55 @@ class RefinementEngine:
             seconds=time.perf_counter() - t0,
         )
         return index
+
+    def _publish_latest_level(
+        self, target_level: int, index: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Expose the deepest complete full-world arrays and map at stable paths.
+
+        The authoritative arrays remain the composed per-level ``.npy`` files; the
+        manifest provides stable random-access pointers without duplicating what may
+        be hundreds of gigabytes.  The comparatively small PNG height product is
+        atomically copied to ``maps/`` so ordinary map browsing shows the refined
+        world instead of the unchanged base render.
+        """
+        level_dir = self._level_dir(target_level)
+        arrays = {
+            name: str((level_dir / "arrays" / f"{name}.npy").relative_to(self.world_root))
+            for name, entry in sorted(index["entries"].items())
+            if not entry.get("omitted_at_refined_levels")
+            and (level_dir / "arrays" / f"{name}.npy").exists()
+        }
+        source_height = level_dir / "maps" / "height_grayscale_16bit.png"
+        source_height_meta = level_dir / "maps" / "height_grayscale_16bit.json"
+        latest_height = self.world_root / "maps" / "02c_height_refined_latest_16bit.png"
+        latest_height_meta = self.world_root / "maps" / "02c_height_refined_latest_16bit.json"
+        if source_height.exists():
+            _atomic_copy_file(source_height, latest_height)
+        if source_height_meta.exists():
+            _atomic_copy_file(source_height_meta, latest_height_meta)
+
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            "level": int(target_level),
+            "resolution": list(map(int, index["resolution"])),
+            "index": str(self._level_index_path(target_level).relative_to(self.world_root)),
+            "arrays": arrays,
+            "heightmap_full_relief": (
+                str(latest_height.relative_to(self.world_root)) if source_height.exists() else None
+            ),
+            "storage_semantics": (
+                "arrays are complete composed full-world static files; section payloads are not required"
+            ),
+        }
+        _atomic_write_json(self.refine_root / "latest.json", payload)
+        _atomic_write_json(self.world_root / "maps" / "refinement_latest.json", payload)
+        return {
+            "level": int(target_level),
+            "resolution": list(map(int, index["resolution"])),
+            "manifest": str((self.refine_root / "latest.json").relative_to(self.world_root)),
+            "heightmap": payload["heightmap_full_relief"],
+        }
 
     def refine(self, levels: int = 1) -> dict[str, Any]:
         if int(levels) < 1:

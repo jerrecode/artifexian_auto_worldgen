@@ -79,6 +79,13 @@ Generate the physically coupled base world normally. NPZ output must be enabled:
 worldgen --out world-out ...
 ```
 
+If `world-out` contains complete recursive refinement levels, `worldgen-tiles`
+automatically selects the deepest complete composed level as its global source. It
+loads the level's static `.npy` arrays directly and does not require the old manual
+step of repacking them into another `world_arrays.npz` file. Use `--source-level 0`
+to deliberately tile the original base world, or `--source-level N` to select a
+specific complete refinement depth.
+
 Initialize the tile manifest without generating any terrain tile:
 
 ```bash
@@ -139,7 +146,9 @@ world-out/
   world.json
   tiles/
     cubesphere_v1/
-      tileset.json
+      tileset.json                 # base-world source
+      refinement_level_0002/       # separate cache when level 2 is authoritative
+        tileset.json
       fields/
         elevation_m/
           z10/
@@ -161,6 +170,10 @@ world-out/
 No sibling, parent, child, other face, or complete zoom-level raster is implicitly
 materialized when one tile is requested.
 
+Base and refined sources use separate persistent cache namespaces. Refining a world
+therefore cannot silently reuse coarse base tiles, and retaining the base cache does
+not block or overwrite the refined one.
+
 `tileset.json` fingerprints `world_arrays.npz` and records the complete tile
 specification. Reopening an existing cache with a different source world or tile
 specification is rejected rather than silently mixing incompatible terrain.
@@ -170,7 +183,8 @@ specification is rejected rather than silently mixing incompatible terrain.
 ### Global simulation remains authoritative
 
 The expensive coupled planetary simulation is intentionally solved globally at a
-tractable resolution. Its results provide the low-frequency boundary state:
+tractable resolution. Its base result—or, by default, its deepest complete composed
+refinement—provides the low-frequency boundary state:
 
 - tectonic plates, crust type/age/stress;
 - global topography and ocean state;

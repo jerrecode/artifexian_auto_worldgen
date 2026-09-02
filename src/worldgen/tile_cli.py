@@ -67,6 +67,12 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--detail-hurst", type=float, default=0.65, help="Fractal amplitude falloff exponent")
     p.add_argument("--detail-harmonics", type=int, default=6, help="Spherical waves evaluated per detail band")
     p.add_argument("--planet-radius-m", type=float, default=None, help="Override radius discovery from world.json")
+    p.add_argument(
+        "--source-level",
+        type=int,
+        default=None,
+        help="Global refinement level to sample; default uses the deepest complete level (0 forces base NPZ)",
+    )
 
     request = p.add_mutually_exclusive_group()
     request.add_argument("--tile", type=_tile_address, help="Generate one explicit FACE/Z/X/Y tile")
@@ -251,6 +257,7 @@ def main(argv: list[str] | None = None) -> int:
             args.world,
             spec=spec,
             planet_radius_m=args.planet_radius_m,
+            source_level=args.source_level,
         )
     except (OSError, ValueError, RuntimeError) as exc:
         parser.error(str(exc))
@@ -260,6 +267,9 @@ def main(argv: list[str] | None = None) -> int:
         "tileset": str(pyramid.manifest_path),
         "planet_radius_m": pyramid.planet_radius_m,
         "tile_size": pyramid.spec.tile_size,
+        "source_kind": pyramid.source_kind,
+        "source_level": pyramid.source_level,
+        "source_resolution": list(reversed(pyramid._source_metadata()[0])),
     }
 
     if args.precompute_depth is not None:

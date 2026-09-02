@@ -138,8 +138,7 @@ def _field_bytes_per_tile(pyramid: PlanetTilePyramid, field: str) -> int:
             # The generator will raise a useful error later.  Keep planning
             # conservative rather than forcing a full source load here.
             return n * n * 8
-        with np.load(pyramid.source_path, allow_pickle=False) as z:
-            a = np.asarray(z[source_name])
+        a = np.asarray(pyramid._load_source_array(source_name))
         if a.ndim >= 2 and tuple(a.shape[-2:]) == (h, w):
             multiplier = int(np.prod(a.shape[:-2], dtype=np.int64)) if a.ndim > 2 else 1
         elif a.ndim >= 2 and tuple(a.shape[:2]) == (h, w):

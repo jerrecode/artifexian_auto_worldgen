@@ -27,6 +27,20 @@ worldgen generate --out world-out --refine --refine-levels 3
 
 The hierarchy is persistent. A later `--refine` invocation starts from the deepest completely composed level rather than returning to the original coarse world.
 
+Every completed depth is also published through stable discovery products:
+
+```text
+world-out/refinement/latest.json
+world-out/maps/refinement_latest.json
+world-out/maps/02c_height_refined_latest_16bit.png
+world-out/maps/02c_height_refined_latest_16bit.json
+```
+
+The manifest points to every composed full-world `.npy` array at the deepest level;
+those arrays are not copied or repacked. The stable PNG is atomically replaced so a
+map browser no longer keeps showing the original base-resolution elevation after a
+successful refinement.
+
 ## Refinement controls
 
 ```text
@@ -92,6 +106,12 @@ A child section is **not** simulated against an isolated cropped parent array. F
 Each child is evaluated on an expanded halo and only its core is retained. Longitude is periodic. Latitude crossings reflect through the pole and shift longitude by 180 degrees. Tangent-vector components receive a sign reversal when their raster basis is reflected through a pole.
 
 Deterministic elevation detail is evaluated from global spherical coordinates rather than from a random generator restarted independently in each child. Consequently changing the section layout does not introduce a different random seam pattern.
+
+Its amplitude uses a deterministic expected-RMS normalization derived from the
+random-phase harmonic basis. It therefore retains the configured relief strength
+without using tile-local statistics. This avoids both seams and the earlier
+amplitude regression where partition-safe normalization reduced new relief to about
+one quarter of its intended magnitude.
 
 After all child cores complete, the level is composed into a full disk-backed dataset. That composed field—not a collection of independently evolving sibling edge states—is the source for the next recursive depth.
 

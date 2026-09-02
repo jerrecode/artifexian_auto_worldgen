@@ -40,18 +40,25 @@ def _partition_invariant_spherical_detail(
     xyz = np.stack((c * np.cos(lon), c * np.sin(lon), np.sin(lat)), axis=-1)
     rng = np.random.default_rng(seed)
     detail = np.zeros(lat.shape, dtype=np.float64)
-    total_weight = 0.0
-    for octave, weight in enumerate((1.0, 0.55, 0.30)):
+    weights = (1.0, 0.55, 0.30)
+    harmonics = 4
+    for octave, weight in enumerate(weights):
         freq = float(frequency) * (2.0**octave)
-        for _ in range(4):
+        for _ in range(harmonics):
             axis = rng.normal(size=3)
             axis /= max(float(np.linalg.norm(axis)), 1e-12)
             phase = float(rng.uniform(0.0, 2.0 * np.pi))
             detail += weight * np.sin(
                 freq * np.tensordot(xyz, axis, axes=([-1], [0])) + phase
             )
-            total_weight += weight
-    return detail / max(total_weight, 1e-12)
+    # A previous seam-safety correction divided by the sum of all harmonic
+    # weights.  That is an amplitude average, not an RMS normalization, and it
+    # unintentionally reduced newly resolved relief to about 23% of the requested
+    # strength.  For independent random-phase sinusoids Var(sin)=1/2, so this
+    # deterministic expected-RMS divisor preserves the old unit-scale relief while
+    # remaining independent of the geographic subsection being evaluated.
+    expected_rms = np.sqrt(0.5 * harmonics * sum(weight * weight for weight in weights))
+    return detail / max(float(expected_rms), 1e-12)
 
 
 _core._spherical_detail = _partition_invariant_spherical_detail
