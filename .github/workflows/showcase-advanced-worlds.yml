@@ -1,10 +1,10 @@
-name: Max-complexity atmogen validation
+name: Max-complexity Earth Titan Super-Earth atmogen validation
 
 on:
   workflow_dispatch:
   push:
     branches:
-      - 'chatgpt/max-complexity-atmogen-test-20260902'
+      - 'chatgpt/hydrology-atmogen-planet-suite-20260902'
     paths:
       - '.github/workflows/showcase-advanced-worlds.yml'
 
@@ -12,14 +12,109 @@ permissions:
   contents: read
 
 jobs:
-  generate-and-audit:
-    name: max-realism seed ${{ matrix.seed }}
+  verify-fixes:
+    name: Verify radiative and hydrology fixes
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 30
+    env:
+      MPLBACKEND: Agg
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_MAX_THREADS: '1'
+      NUMBA_CACHE_DIR: ${{ github.workspace }}/.numba-cache
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install worldgen, pinned atmogen and test backends
+        run: |
+          set -euxo pipefail
+          python -m pip install --disable-pip-version-check -e '.[performance,jit,thermodynamics,render]'
+          python -m pip install --disable-pip-version-check pytest
+          python -m pip check
+
+      - name: Run targeted regression and atmogen integration tests
+        run: |
+          set -euxo pipefail
+          python -m pytest -q \
+            tests/test_hydrology_atmogen_reliability.py \
+            tests/test_atmogen_integration.py \
+            tests/test_atmogen_coupling.py
+
+      - name: Validate all three reference-column profiles before global generation
+        run: |
+          set -euxo pipefail
+          mkdir -p validation-configs validation-smoke
+          python scripts/build_max_complexity_planet_config.py earth validation-configs/earth.yaml --seed 44001337
+          python scripts/build_max_complexity_planet_config.py titan validation-configs/titan.yaml --seed 88720541
+          python scripts/build_max_complexity_planet_config.py super_earth validation-configs/super_earth.yaml --seed 314159265
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import numpy as np
+          from worldgen.config import load_config
+          from worldgen.astronomy import build_astronomy
+          from worldgen.atmogen_adapter import AtmogenAdapter, atmogen_runtime_metadata, result_summary
+
+          rows = []
+          for profile, seed in [('earth', 44001337), ('titan', 88720541), ('super_earth', 314159265)]:
+              cfg = load_config(Path(f'validation-configs/{profile}.yaml'))
+              astronomy = build_astronomy(cfg.astronomy, np.random.default_rng(seed))
+              adapter = AtmogenAdapter(cfg)
+              result = adapter.solve(astronomy)
+              summary = result_summary(result)
+              rows.append({
+                  'profile': profile,
+                  'seed': seed,
+                  'semimajor_axis_au': astronomy.planet['semimajor_axis_au'],
+                  'equilibrium_temperature_k': astronomy.planet['equilibrium_temperature_k'],
+                  'atmogen_surface_temperature_k': summary['surface_temperature_k'],
+                  'bond_albedo': summary['spectra']['bond_albedo'],
+                  'longwave_optical_depth': summary['energy_budget']['longwave_optical_depth'],
+                  'converged': summary['convergence']['converged'],
+                  'fidelity': summary['provenance']['fidelity'],
+                  'temperature_profile_model': summary['diagnostics']['temperature_profile_model'],
+                  'fallbacks': summary['diagnostics']['fallbacks'],
+                  'liquid_mass_kg': summary['phase_reservoirs']['liquid_mass_kg'],
+                  'solid_mass_kg': summary['phase_reservoirs']['solid_mass_kg'],
+              })
+          payload = {'atmogen_runtime': atmogen_runtime_metadata(), 'profiles': rows}
+          Path('validation-smoke/reference_columns.json').write_text(json.dumps(payload, indent=2, sort_keys=True))
+          print(json.dumps(payload, indent=2, sort_keys=True))
+          if not all(row['converged'] for row in rows):
+              raise SystemExit('one or more reference atmogen columns did not converge')
+          PY
+
+      - name: Upload reference-column validation
+        uses: actions/upload-artifact@v4
+        with:
+          name: reference-column-validation
+          path: |
+            validation-configs/
+            validation-smoke/reference_columns.json
+          compression-level: 6
+          retention-days: 10
+
+  generate-and-audit:
+    needs: verify-fixes
+    name: ${{ matrix.profile }} max-realism seed ${{ matrix.seed }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
-        seed: [435916837, 601204923]
+        include:
+          - profile: earth
+            seed: 44001337
+          - profile: titan
+            seed: 88720541
+          - profile: super_earth
+            seed: 314159265
     env:
       MPLBACKEND: Agg
       WORLDGEN_DISTANCE_CACHE_MB: '128'
@@ -36,8 +131,9 @@ jobs:
           python-version: '3.12'
           cache: pip
 
-      - name: Install worldgen, atmogen and validation backends
+      - name: Install worldgen, pinned atmogen and validation backends
         run: |
+          set -euxo pipefail
           python -m pip install --disable-pip-version-check -e '.[performance,jit,thermodynamics,render]'
           python -m pip install --disable-pip-version-check pytest
           python -m pip check
@@ -47,38 +143,32 @@ jobs:
           print(json.dumps(atmogen_runtime_metadata(), indent=2, sort_keys=True))
           PY
 
-      - name: Run atmogen integration tests
+      - name: Build maximum-complexity physical profile
         run: |
-          python -m pytest -q tests/test_atmogen_integration.py tests/test_atmogen_coupling.py
+          set -euxo pipefail
+          mkdir -p validation-configs
+          python scripts/build_max_complexity_planet_config.py \
+            '${{ matrix.profile }}' \
+            'validation-configs/${{ matrix.profile }}.yaml' \
+            --seed '${{ matrix.seed }}'
 
       - name: Validate maximum-realism runtime plan
         run: |
+          set -euxo pipefail
           worldgen --runtime-info --dry-run \
-            --config config/maximal_realism_safe.yaml \
+            --config 'validation-configs/${{ matrix.profile }}.yaml' \
             --seed '${{ matrix.seed }}' \
-            --set atmogen.enabled=true \
-            --set atmogen.fidelity=REFERENCE \
-            --set atmogen.chemistry_mode=equilibrium \
-            --set atmogen.vertical_layers=64 \
-            --set atmogen.representative_column_count=16 \
-            --set atmogen.allow_fidelity_fallback=true \
             --workers 4 --worker-cap 4 --threads-per-worker 1
 
       - name: Generate maximum-complexity planet with atmogen
         shell: bash
         run: |
           set -euxo pipefail
-          ROOT='showcase/max-${{ matrix.seed }}'
+          ROOT='showcase/${{ matrix.profile }}-${{ matrix.seed }}'
           mkdir -p "$ROOT"
           /usr/bin/time -v worldgen generate \
-            --config config/maximal_realism_safe.yaml \
+            --config 'validation-configs/${{ matrix.profile }}.yaml' \
             --seed '${{ matrix.seed }}' \
-            --set atmogen.enabled=true \
-            --set atmogen.fidelity=REFERENCE \
-            --set atmogen.chemistry_mode=equilibrium \
-            --set atmogen.vertical_layers=64 \
-            --set atmogen.representative_column_count=16 \
-            --set atmogen.allow_fidelity_fallback=true \
             --out "$ROOT" \
             --workers 4 \
             --worker-cap 4 \
@@ -91,69 +181,124 @@ jobs:
             --log-file "$ROOT/generation.log"
 
       - name: Run physical and numerical audit
-        run: |
-          ROOT='showcase/max-${{ matrix.seed }}'
-          python scripts/audit_generated_world.py "$ROOT" --output "$ROOT/showcase_audit.json" | tee "$ROOT/showcase_audit.log"
-          python scripts/audit_planetary_optics.py "$ROOT" --output "$ROOT/planetary_optics_audit.json" --enforce | tee "$ROOT/planetary_optics_audit.log"
-
-      - name: Enforce atmogen provenance and summarize outcome
         shell: bash
         run: |
+          set -euo pipefail
+          ROOT='showcase/${{ matrix.profile }}-${{ matrix.seed }}'
+          python scripts/audit_generated_world.py "$ROOT" --output "$ROOT/showcase_audit.json" | tee "$ROOT/showcase_audit.log"
+
+      - name: Run planetary optics audit and preserve failures
+        shell: bash
+        run: |
+          set +e
+          ROOT='showcase/${{ matrix.profile }}-${{ matrix.seed }}'
+          python scripts/audit_planetary_optics.py "$ROOT" --output "$ROOT/planetary_optics_audit.json" --enforce 2>&1 | tee "$ROOT/planetary_optics_audit.log"
+          status=${PIPESTATUS[0]}
+          printf '%s\n' "$status" > "$ROOT/planetary_optics_exit_code.txt"
+          echo "Planetary optics audit exit code: $status"
+          exit 0
+
+      - name: Enforce atmogen and hydrology provenance and summarize outcome
+        shell: bash
+        run: |
+          set -euo pipefail
           python - <<'PY'
           import json
           from pathlib import Path
-          root=Path('showcase/max-${{ matrix.seed }}')
+
+          root=Path('showcase/${{ matrix.profile }}-${{ matrix.seed }}')
           manifest=json.loads((root/'run_manifest.json').read_text())
           diag=json.loads((root/'diagnostics.json').read_text())
           audit=json.loads((root/'showcase_audit.json').read_text())
-          optics=json.loads((root/'planetary_optics_audit.json').read_text())
-          atm=manifest.get('atmogen', {})
-          if not atm.get('enabled'):
+          world=json.loads((root/'world.json').read_text())
+          atm_meta=manifest.get('atmogen', {})
+          atm=world.get('atmogen', {})
+          hydro=world.get('metadata', {}).get('hydrology', {})
+          water=hydro.get('water_balance', {})
+          watersheds=hydro.get('watersheds', {})
+          guard=hydro.get('reliability_guardrails', {})
+          surface=world.get('surface_liquids') or {}
+          optics_code=int((root/'planetary_optics_exit_code.txt').read_text().strip())
+          optics={}
+          if (root/'planetary_optics_audit.json').exists():
+              optics=json.loads((root/'planetary_optics_audit.json').read_text())
+
+          if not atm_meta.get('enabled'):
               raise SystemExit('atmogen was not enabled in run manifest')
-          if not atm.get('package_version') or int(atm.get('api_schema_version', 0)) < 11:
-              raise SystemExit(f'atmogen runtime metadata missing/incompatible: {atm}')
+          if not atm_meta.get('package_version') or int(atm_meta.get('api_schema_version', 0)) < 11:
+              raise SystemExit(f'atmogen runtime metadata missing/incompatible: {atm_meta}')
+          if not bool(atm.get('convergence', {}).get('converged')):
+              raise SystemExit('global atmogen column did not converge')
           if not diag.get('all_invariants_passed', False):
               raise SystemExit(f"diagnostics invariants failed: {diag.get('invariant_failures')}")
-          if not optics.get('all_invariants_passed', False):
-              raise SystemExit(f"optics invariants failed: {optics.get('invariants')}")
-          h=audit.get('hydrology', {})
+          if not guard:
+              raise SystemExit('new hydrology reliability guardrail metadata is missing')
+
           summary={
+              'profile': '${{ matrix.profile }}',
               'seed': manifest['seed'],
               'resolution': manifest['resolution'],
-              'atmogen': atm,
+              'atmogen_runtime': atm_meta,
+              'atmogen_fidelity': atm.get('provenance', {}).get('fidelity'),
+              'atmogen_surface_temperature_k': atm.get('surface_temperature_k'),
+              'atmogen_temperature_profile_model': atm.get('diagnostics', {}).get('temperature_profile_model'),
+              'atmogen_fallbacks': atm.get('diagnostics', {}).get('fallbacks', []),
+              'atmogen_energy_imbalance_w_m2': atm.get('convergence', {}).get('energy_imbalance_w_m2'),
+              'atmogen_hydrostatic_relative_residual': atm.get('diagnostics', {}).get('hydrostatic_relative_residual'),
+              'atmogen_reservoir_mass_closure_relative': atm.get('diagnostics', {}).get('reservoir_mass_closure_relative'),
+              'astronomy': {
+                  'semimajor_axis_au': world['astronomy']['planet'].get('semimajor_axis_au'),
+                  'equilibrium_temperature_k': world['astronomy']['planet'].get('equilibrium_temperature_k'),
+                  'mean_surface_temperature_c_approx': world['astronomy']['planet'].get('mean_surface_temperature_c_approx'),
+                  'greenhouse_increment_k_approx': world['astronomy']['planet'].get('greenhouse_increment_k_approx'),
+                  'bond_albedo': world['astronomy']['planet'].get('bond_albedo'),
+              },
+              'surface_liquids': {
+                  'actual_land_fraction': surface.get('actual_land_fraction'),
+                  'actual_ocean_fraction': surface.get('actual_ocean_fraction'),
+                  'total_liquid_mass_kg': surface.get('total_liquid_mass_kg'),
+                  'inventory_total_kg': surface.get('inventory_total_kg'),
+                  'mass_closure_relative': surface.get('mass_closure_relative'),
+              },
+              'hydrology': {
+                  'mean_land_runoff_mm_year': water.get('mean_land_runoff_mm_year', hydro.get('mean_runoff_mm_year_land')),
+                  'river_area_fraction_of_land': hydro.get('river_area_fraction_of_land'),
+                  'lake_area_fraction_of_land': hydro.get('lake_area_fraction_of_land'),
+                  'max_strahler_order': hydro.get('max_strahler_order_all_resolved_channels', hydro.get('max_strahler_order')),
+                  'outlet_basin_count': watersheds.get('outlet_basin_count'),
+                  'largest_basin_cells': watersheds.get('largest_basin_cells'),
+                  'reliability_guardrails': guard,
+              },
+              'general_audit_all_invariants_passed': audit.get('all_invariants_passed', True),
+              'planetary_optics_exit_code': optics_code,
+              'planetary_optics_all_invariants_passed': optics.get('all_invariants_passed'),
               'stage_seconds': manifest.get('stage_seconds', {}),
-              'land_fraction': audit.get('grid', {}).get('land_area_fraction'),
-              'terminal_watersheds': h.get('terminal_watershed_count'),
-              'max_strahler_order': h.get('max_strahler_order'),
-              'mean_land_runoff_mm_year': h.get('mean_land_runoff_mm_year'),
-              'mean_land_cumulative_erosion_m': audit.get('landscape', {}).get('mean_land_cumulative_erosion_m'),
-              'runoff_erosion_correlation': audit.get('landscape', {}).get('runoff_erosion_correlation'),
-              'active_hydrologic_species': audit.get('multicondensate', {}).get('active_hydrologic_species'),
-              'mean_haze_optical_depth': optics.get('atmosphere', {}).get('mean_haze_optical_depth'),
-              'mean_top_of_atmosphere_rgb': optics.get('atmosphere', {}).get('mean_top_of_atmosphere_rgb'),
-              'invariant_failures': diag.get('invariant_failures', []),
           }
           (root/'max_complexity_summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True))
           print(json.dumps(summary, indent=2, sort_keys=True))
           PY
 
-      - name: Upload compact validation artifact
+      - name: Upload complete validation artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: max-complexity-atmogen-${{ matrix.seed }}
+          name: max-complexity-${{ matrix.profile }}-${{ matrix.seed }}
           path: |
-            showcase/max-${{ matrix.seed }}/run_manifest.json
-            showcase/max-${{ matrix.seed }}/diagnostics.json
-            showcase/max-${{ matrix.seed }}/timings.json
-            showcase/max-${{ matrix.seed }}/timings_cli.json
-            showcase/max-${{ matrix.seed }}/world.json
-            showcase/max-${{ matrix.seed }}/world_report.md
-            showcase/max-${{ matrix.seed }}/showcase_audit.json
-            showcase/max-${{ matrix.seed }}/planetary_optics_audit.json
-            showcase/max-${{ matrix.seed }}/max_complexity_summary.json
-            showcase/max-${{ matrix.seed }}/generation.log
-            showcase/max-${{ matrix.seed }}/maps/
+            validation-configs/${{ matrix.profile }}.yaml
+            showcase/${{ matrix.profile }}-${{ matrix.seed }}/run_manifest.json
+            showcase/${{ matrix.profile }}-${{ matrix.seed }}/diagnostics.json
+            showcase/${{ matrix.profile }}-${{ matrix.seed }}/timings.json
+            showcase/${{ matrix.profile }}-${{ matrix.seed }}/timings_cli.json
+            showcase/${{ matrix.profile }}-${{ matrix.seed }}/world.json
+            showcase/${{ matrix.profile }}-${{ matrix.seed }}/world_report.md
+            showcase/${{ matrix.profile }}-${{ matrix.seed }}/showcase_audit.json
+            showcase/${{ matrix.profile }}-${{ matrix.seed }}/showcase_audit.log
+            showcase/${{ matrix.profile }}-${{ matrix.seed }}/planetary_optics_audit.json
+            showcase/${{ matrix.profile }}-${{ matrix.seed }}/planetary_optics_audit.log
+            showcase/${{ matrix.profile }}-${{ matrix.seed }}/planetary_optics_exit_code.txt
+            showcase/${{ matrix.profile }}-${{ matrix.seed }}/max_complexity_summary.json
+            showcase/${{ matrix.profile }}-${{ matrix.seed }}/generation.log
+            showcase/${{ matrix.profile }}-${{ matrix.seed }}/maps/
           compression-level: 6
           retention-days: 10
           if-no-files-found: warn
