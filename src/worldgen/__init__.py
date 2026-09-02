@@ -14,6 +14,13 @@ from .tectonics_low_speed import install_low_speed_tectonics_fix as _install_low
 _install_low_speed_tectonics_fix()
 
 
+# Correct the historical Bond-albedo normalization before pipeline_base binds
+# build_astronomy.  This keeps target-temperature orbit solving and Atmogen stellar
+# forcing on one physically consistent radiative-energy convention.
+from .astronomy_radiative_fix import install_astronomy_radiative_fix as _install_astronomy_radiative_fix  # noqa: E402
+_install_astronomy_radiative_fix()
+
+
 # Install the complete advanced pipeline hierarchy onto the canonical pipeline module.
 # Import order is deliberate: each layer subclasses the preceding public behavior,
 # ending with drainage-rerouted secondary geomorphology. Existing imports from
