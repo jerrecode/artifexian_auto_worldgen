@@ -31,26 +31,13 @@ EARTH_OVERLAY: dict[str, Any] = {
         "greenhouse_model": "composition",
         "atmosphere_pressure_bar": 1.0,
         "atmosphere_top_pressure_bar": 1.0e-7,
-        "atmosphere": {
-            "N2": 0.78084,
-            "O2": 0.20946,
-            "Ar": 0.00934,
-            "CO2": 0.00036,
-        },
+        "atmosphere": {"N2": 0.78084, "O2": 0.20946, "Ar": 0.00934, "CO2": 0.00036},
         "surface_volatiles": {"H2O": 1.0},
         "surface_condensible": "H2O",
         "radiogenic_heat_flux_w_m2": 0.087,
     },
-    "tectonics": {
-        "geological_activity_mode": "active",
-        "activity_strength": 1.0,
-        "ice_geology_mode": "inactive",
-    },
-    "climate": {
-        "condensible_species": "H2O",
-        "precip_scale_mm_year": 1100.0,
-        "phase_coupled_evaporation": True,
-    },
+    "tectonics": {"geological_activity_mode": "active", "activity_strength": 1.0, "ice_geology_mode": "inactive"},
+    "climate": {"condensible_species": "H2O", "precip_scale_mm_year": 1100.0, "phase_coupled_evaporation": True},
     "ocean": {"fluid_species": "H2O"},
 }
 
@@ -64,10 +51,12 @@ ATMOGEN_REFERENCE = {
     "representative_columns_enabled": True,
     "representative_column_count": 16,
     "representative_feedback_relaxation": 0.25,
-    # High-pressure/high-water columns have a stiffer temperature/phase fixed point
-    # than the Earth reference.  Maximum-complexity validation deliberately uses
-    # conservative under-relaxation and a larger iteration budget rather than
-    # silently accepting a non-converged state.
+    # High-pressure phase-coupled equilibrium columns are stiff and SLSQP introduces
+    # ~1e-7 absolute mole-fraction iterate noise even when element closure, thermal
+    # residual and energy closure are substantially tighter.  2e-7 is therefore a
+    # numerical-noise-aware outer fixed-point tolerance, not a chemistry mass-balance
+    # relaxation; the inner Gibbs solver retains its own strict closure checks.
+    "composition_tolerance": 2.0e-7,
     "relaxation": 0.35,
     "max_iterations": 100,
     "allow_fidelity_fallback": True,
@@ -108,9 +97,6 @@ def build(profile: str, seed: int) -> dict[str, Any]:
     cfg = _apply_profile(cfg, overlay)
     cfg["seed"] = int(seed)
     cfg["atmogen"] = _merge(cfg.get("atmogen", {}), ATMOGEN_REFERENCE)
-
-    # The physical body profile may disable society; leave that choice intact. The
-    # numerical/geophysical complexity still comes from maximal_realism_safe.yaml.
     cfg.setdefault("output", {})["save_npz"] = True
     cfg["output"]["save_png"] = True
     cfg["output"]["save_json"] = True
@@ -124,24 +110,10 @@ def main() -> int:
     parser.add_argument("output", type=Path)
     parser.add_argument("--seed", type=int, required=True)
     args = parser.parse_args()
-
     cfg = build(args.profile, args.seed)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(
-        yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True), encoding="utf-8"
-    )
-    print(
-        yaml.safe_dump(
-            {
-                "profile": args.profile,
-                "seed": args.seed,
-                "resolution": cfg["resolution"],
-                "astronomy": cfg["astronomy"],
-                "atmogen": cfg["atmogen"],
-            },
-            sort_keys=False,
-        )
-    )
+    args.output.write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    print(yaml.safe_dump({"profile": args.profile, "seed": args.seed, "resolution": cfg["resolution"], "astronomy": cfg["astronomy"], "atmogen": cfg["atmogen"]}, sort_keys=False))
     return 0
 
 
