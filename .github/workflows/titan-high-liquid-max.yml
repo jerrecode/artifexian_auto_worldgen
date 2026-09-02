@@ -1,0 +1,131 @@
+name: Titan high-liquid maximum-complexity world
+
+on:
+  push:
+    branches:
+      - 'chatgpt/hydrology-atmogen-planet-suite-20260902'
+    paths:
+      - '.github/workflows/titan-high-liquid-max.yml'
+
+permissions:
+  contents: read
+
+env:
+  MPLBACKEND: Agg
+  WORLDGEN_DISTANCE_CACHE_MB: 128
+  OMP_NUM_THREADS: 1
+  OPENBLAS_NUM_THREADS: 1
+  MKL_NUM_THREADS: 1
+  NUMEXPR_MAX_THREADS: 1
+  NUMBA_CACHE_DIR: ${{ github.workspace }}/.numba-cache
+
+jobs:
+  generate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install maximum-realism dependencies
+        run: |
+          set -euxo pipefail
+          python -m pip install --disable-pip-version-check -e '.[performance,jit,thermodynamics,render]'
+          python -m pip check
+
+      - name: Build high-liquid Titan maximum-complexity config
+        run: |
+          set -euxo pipefail
+          mkdir -p validation-configs
+          python scripts/build_max_complexity_planet_config.py titan validation-configs/titan_high_liquid.yaml --seed 88720541
+          python - <<'PY'
+          from pathlib import Path
+          import yaml
+          p=Path('validation-configs/titan_high_liquid.yaml')
+          cfg=yaml.safe_load(p.read_text())
+          # Deliberately wetter than real Titan per requested scenario. The ethane
+          # inventory is chosen from the generated Titan hypsometry to target a
+          # broad ~30-45% equipotential surface-liquid coverage rather than a few
+          # isolated polar lakes.
+          cfg['astronomy']['surface_volatiles'] = {'CH4': 0.0010, 'C2H6': 0.0090}
+          cfg['astronomy']['surface_condensible'] = 'CH4'
+          cfg['output']['save_npz'] = True
+          cfg['output']['save_png'] = True
+          cfg['output']['save_json'] = True
+          cfg['output']['save_report'] = True
+          p.write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True))
+          print(yaml.safe_dump({'surface_volatiles':cfg['astronomy']['surface_volatiles'], 'resolution':cfg['resolution'], 'atmogen':cfg['atmogen']}, sort_keys=False))
+          PY
+          worldgen --runtime-info --dry-run --config validation-configs/titan_high_liquid.yaml --seed 88720541 --workers 4 --worker-cap 4 --threads-per-worker 1
+
+      - name: Generate maximum-complexity high-liquid Titan
+        shell: bash --noprofile --norc -e -o pipefail {0}
+        run: |
+          set -euxo pipefail
+          ROOT='showcase/titan-high-liquid-88720541'
+          mkdir -p "$ROOT"
+          /usr/bin/time -v worldgen generate \
+            --config validation-configs/titan_high_liquid.yaml \
+            --seed 88720541 \
+            --out "$ROOT" \
+            --workers 4 --worker-cap 4 --threads-per-worker 1 \
+            --memory-per-worker-mb 1400 \
+            --checkpoint-dir "$ROOT/checkpoints" --checkpoint-max-gb 24 \
+            --timings-json "$ROOT/timings_cli.json" \
+            --progress-detail -vv --log-file "$ROOT/generation.log"
+
+      - name: Validate requested wet surface and numerical invariants
+        run: |
+          set -euxo pipefail
+          ROOT='showcase/titan-high-liquid-88720541'
+          python scripts/audit_generated_world.py "$ROOT" --output "$ROOT/showcase_audit.json" | tee "$ROOT/showcase_audit.log"
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          root=Path('showcase/titan-high-liquid-88720541')
+          world=json.loads((root/'world.json').read_text())
+          diag=json.loads((root/'diagnostics.json').read_text())
+          surface=world.get('surface_liquids') or {}
+          ocean=float(surface.get('actual_ocean_fraction', 0.0))
+          if not diag.get('all_invariants_passed', False):
+              raise SystemExit(f"scientific invariants failed: {diag.get('invariant_failures')}")
+          if ocean < 0.20:
+              raise SystemExit(f"high-liquid Titan is still too dry: ocean fraction={ocean:.6f}")
+          if ocean > 0.65:
+              raise SystemExit(f"high-liquid Titan became excessively oceanic: ocean fraction={ocean:.6f}")
+          summary={
+              'actual_ocean_fraction': ocean,
+              'actual_land_fraction': float(surface.get('actual_land_fraction', 1.0-ocean)),
+              'total_liquid_mass_kg': surface.get('total_liquid_mass_kg'),
+              'total_liquid_volume_m3': surface.get('total_liquid_volume_m3'),
+              'surface_temperature_k': (world.get('atmogen') or {}).get('surface_temperature_k'),
+              'vertical_layers': ((world.get('config') or {}).get('atmogen') or {}).get('vertical_layers'),
+              'resolution': [1536, 768],
+          }
+          (root/'requested_profile_summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True))
+          print(json.dumps(summary, indent=2, sort_keys=True))
+          PY
+
+      - name: Upload complete high-liquid Titan world
+        uses: actions/upload-artifact@v4
+        with:
+          name: max-complexity-titan-high-liquid-88720541
+          path: |
+            validation-configs/titan_high_liquid.yaml
+            showcase/titan-high-liquid-88720541/run_manifest.json
+            showcase/titan-high-liquid-88720541/diagnostics.json
+            showcase/titan-high-liquid-88720541/timings.json
+            showcase/titan-high-liquid-88720541/timings_cli.json
+            showcase/titan-high-liquid-88720541/world.json
+            showcase/titan-high-liquid-88720541/world_report.md
+            showcase/titan-high-liquid-88720541/showcase_audit.json
+            showcase/titan-high-liquid-88720541/showcase_audit.log
+            showcase/titan-high-liquid-88720541/requested_profile_summary.json
+            showcase/titan-high-liquid-88720541/generation.log
+            showcase/titan-high-liquid-88720541/maps/
+          compression-level: 6
+          retention-days: 10
