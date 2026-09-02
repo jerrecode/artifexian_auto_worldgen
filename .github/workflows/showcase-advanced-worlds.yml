@@ -68,6 +68,7 @@ jobs:
               adapter = AtmogenAdapter(cfg)
               result = adapter.solve(astronomy)
               summary = result_summary(result)
+              convergence = summary['convergence']
               rows.append({
                   'profile': profile,
                   'seed': seed,
@@ -76,7 +77,11 @@ jobs:
                   'atmogen_surface_temperature_k': summary['surface_temperature_k'],
                   'bond_albedo': summary['spectra']['bond_albedo'],
                   'longwave_optical_depth': summary['energy_budget']['longwave_optical_depth'],
-                  'converged': summary['convergence']['converged'],
+                  'converged': convergence['converged'],
+                  'iterations': convergence['iterations'],
+                  'temperature_relative_residual': convergence['temperature_relative_residual'],
+                  'composition_absolute_residual': convergence['composition_absolute_residual'],
+                  'energy_imbalance_w_m2': convergence['energy_imbalance_w_m2'],
                   'fidelity': summary['provenance']['fidelity'],
                   'temperature_profile_model': summary['diagnostics']['temperature_profile_model'],
                   'fallbacks': summary['diagnostics']['fallbacks'],
@@ -91,6 +96,7 @@ jobs:
           PY
 
       - name: Upload reference-column validation
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: reference-column-validation
@@ -99,6 +105,7 @@ jobs:
             validation-smoke/reference_columns.json
           compression-level: 6
           retention-days: 10
+          if-no-files-found: warn
 
   generate-and-audit:
     needs: verify-fixes
