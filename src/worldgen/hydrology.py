@@ -26,10 +26,11 @@ from .hydrology_advanced import (
 from .hydrology_reliability import (
     channel_hierarchy_discharge_guarded,
     enforce_hydrology_guardrails,
-    flow_directions_multidirection,
     lake_mask_volume_guarded,
     priority_flood_closed_aware,
 )
+from .hydrology_natural_routing import flow_directions_continuous_local
+from .watershed_naturalism import build_watershed_hierarchy_natural
 from .multicondensate_water_balance import build_multicondensate_water_balance
 
 
@@ -72,16 +73,19 @@ for _result_cls in (WaterBalanceResult, AdvancedHydrologyResult):
 
 
 # Install deterministic optimized/conservative backends into the shared equations.
-# The closed-aware flood leaves genuine endorheic minima intact when there is no
-# ocean, and the dense angular receiver stencil removes the strong raster-direction
-# bias seen in maximum-complexity runs.  Lake and channel classifiers then enforce
-# strict occupied-area and accumulated-discharge semantics.
+# The routing backend uses a dense multi-scale look-ahead field to estimate a
+# continuous downslope direction but always selects an immediately adjacent receiver.
+# This avoids the multi-cell graph jumps that can imprint striped/blocky watershed
+# labels.  Watershed products are then derived globally from the complete drainage
+# DAG, aggregate tiny coastal outlet catchments into major drainage systems, and use
+# a scale-resolved channel mask for HAND instead of every raster rill.
 _base._priority_flood = priority_flood_closed_aware
-_base._flow_directions = flow_directions_multidirection
+_base._flow_directions = flow_directions_continuous_local
 _base._lake_mask = lake_mask_volume_guarded
 _base._runoff_mm = runoff_mm_advanced
 _base._transport_sediment = transport_sediment_topological
 _advanced._channel_hierarchy = channel_hierarchy_discharge_guarded
+_advanced.build_watershed_hierarchy = build_watershed_hierarchy_natural
 
 from .hydrology_base import *  # noqa: F401,F403,E402
 
@@ -101,8 +105,9 @@ def build_hydrology(
     )
     enforce_hydrology_guardrails(result, terrain, cfg)
     result.metadata["routing_reliability_model"] = (
-        "closed-basin-aware Priority-Flood + dense primitive-direction steepest "
-        "descent + discharge-gated channels + strict lake-area budget"
+        "closed-basin-aware Priority-Flood + continuous multi-scale look-ahead with "
+        "strictly local receivers + discharge-gated channels + strict lake-area "
+        "budget + global major-basin watershed hierarchy"
     )
     return result
 
