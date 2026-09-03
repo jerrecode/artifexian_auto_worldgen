@@ -1,0 +1,210 @@
+name: Regenerate max-detail worlds with reformed watersheds
+
+on:
+  push:
+    branches:
+      - 'chatgpt/hydrology-atmogen-planet-suite-20260902'
+    paths:
+      - '.github/workflows/regenerate-reformed-worlds.yml'
+
+permissions:
+  contents: read
+
+env:
+  MPLBACKEND: Agg
+  WORLDGEN_DISTANCE_CACHE_MB: 128
+  OMP_NUM_THREADS: 1
+  OPENBLAS_NUM_THREADS: 1
+  MKL_NUM_THREADS: 1
+  NUMEXPR_MAX_THREADS: 1
+  NUMBA_CACHE_DIR: ${{ github.workspace }}/.numba-cache
+
+jobs:
+  verify:
+    name: Verify natural routing and watershed reform
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install validation dependencies
+        run: |
+          set -euxo pipefail
+          python -m pip install --disable-pip-version-check -e '.[performance,jit,thermodynamics,render]'
+          python -m pip install pytest
+          python -m pip check
+      - name: Run focused hydrology regressions
+        run: |
+          set -euxo pipefail
+          python -m py_compile src/worldgen/hydrology_natural_routing.py src/worldgen/watershed_naturalism.py src/worldgen/hydrology.py
+          pytest -q \
+            tests/test_watershed_reform.py \
+            tests/test_hydrology_atmogen_reliability.py
+
+  generate:
+    name: ${{ matrix.slug }} seed ${{ matrix.seed }}
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: earth
+            slug: earth
+            seed: 73194211
+          - profile: super_earth
+            slug: super-earth
+            seed: 508271933
+          - profile: titan
+            slug: titan-high-liquid
+            seed: 120398771
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install maximum-realism dependencies
+        run: |
+          set -euxo pipefail
+          python -m pip install --disable-pip-version-check -e '.[performance,jit,thermodynamics,render]'
+          python -m pip check
+
+      - name: Build maximum-complexity physical config
+        run: |
+          set -euxo pipefail
+          mkdir -p validation-configs
+          CFG="validation-configs/${{ matrix.slug }}-${{ matrix.seed }}.yaml"
+          python scripts/build_max_complexity_planet_config.py "${{ matrix.profile }}" "$CFG" --seed "${{ matrix.seed }}"
+          if [ "${{ matrix.profile }}" = "titan" ]; then
+            python - <<'PY'
+          from pathlib import Path
+          import yaml
+          p=Path('validation-configs/titan-high-liquid-120398771.yaml')
+          cfg=yaml.safe_load(p.read_text())
+          # Deliberately wetter-than-real Titan scenario requested by the user.
+          # This inventory was already validated in an earlier full-complexity run
+          # to produce extensive methane/ethane surface seas rather than tiny lakes.
+          cfg['astronomy']['surface_volatiles']={'CH4':0.0010,'C2H6':0.0090}
+          cfg['astronomy']['surface_condensible']='CH4'
+          p.write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True))
+          PY
+          fi
+          worldgen --runtime-info --dry-run --config "$CFG" --seed "${{ matrix.seed }}" --workers 4 --worker-cap 4 --threads-per-worker 1
+
+      - name: Generate full maximum-complexity world
+        shell: bash --noprofile --norc -e -o pipefail {0}
+        run: |
+          set -euxo pipefail
+          ROOT="showcase/${{ matrix.slug }}-${{ matrix.seed }}"
+          CFG="validation-configs/${{ matrix.slug }}-${{ matrix.seed }}.yaml"
+          mkdir -p "$ROOT"
+          /usr/bin/time -v worldgen generate \
+            --config "$CFG" \
+            --seed "${{ matrix.seed }}" \
+            --out "$ROOT" \
+            --workers 4 --worker-cap 4 --threads-per-worker 1 \
+            --memory-per-worker-mb 1400 \
+            --checkpoint-dir "$ROOT/checkpoints" --checkpoint-max-gb 24 \
+            --timings-json "$ROOT/timings_cli.json" \
+            --progress-detail -vv --log-file "$ROOT/generation.log"
+
+      - name: Audit numerical invariants and watershed reform
+        run: |
+          set -euxo pipefail
+          ROOT="showcase/${{ matrix.slug }}-${{ matrix.seed }}"
+          python scripts/audit_generated_world.py "$ROOT" --output "$ROOT/showcase_audit.json" | tee "$ROOT/showcase_audit.log"
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          slug='${{ matrix.slug }}'
+          seed='${{ matrix.seed }}'
+          root=Path(f'showcase/{slug}-{seed}')
+          world=json.loads((root/'world.json').read_text())
+          diag=json.loads((root/'diagnostics.json').read_text())
+          if not diag.get('all_invariants_passed', False):
+              raise SystemExit(f"scientific invariants failed: {diag.get('invariant_failures')}")
+          hydro=(world.get('metadata') or {}).get('hydrology') or {}
+          ws=hydro.get('watersheds') or {}
+          raw=int(ws.get('raw_terminal_outlet_basin_count',0))
+          major=int(ws.get('outlet_basin_count',0))
+          median=float(ws.get('median_basin_cells',0.0))
+          if raw <= 0 or major <= 0:
+              raise SystemExit(f'watershed hierarchy missing: raw={raw}, major={major}')
+          if major >= raw and raw > 8:
+              raise SystemExit(f'watershed reform did not aggregate terminal outlets: raw={raw}, major={major}')
+          if median <= 1.0 and major > 4:
+              raise SystemExit(f'major basin median is still raster-fragmented: {median}')
+          if not str(ws.get('domain_decomposition','')).startswith('none'):
+              raise SystemExit('watershed products are not declared global-DAG products')
+          routing=str(hydro.get('routing_reliability_model',''))
+          if 'strictly local receivers' not in routing:
+              raise SystemExit(f'new routing backend not active: {routing}')
+          surface=world.get('surface_liquids') or {}
+          ocean=float(surface.get('actual_ocean_fraction',0.0))
+          if slug == 'titan-high-liquid' and not (0.20 <= ocean <= 0.65):
+              raise SystemExit(f'high-liquid Titan surface fraction outside target: {ocean:.6f}')
+          summary={
+              'profile':slug,'seed':int(seed),'resolution':[1536,768],
+              'actual_ocean_fraction':ocean,
+              'actual_land_fraction':float(surface.get('actual_land_fraction',1.0-ocean)),
+              'raw_terminal_outlet_basin_count':raw,
+              'major_drainage_basin_count':major,
+              'major_basin_median_cells':median,
+              'major_basin_largest_cells':int(ws.get('largest_basin_cells',0)),
+              'hand_min_drainage_area_km2':ws.get('hand_min_drainage_area_km2'),
+              'routing_reliability_model':routing,
+              'watershed_aggregation_model':ws.get('aggregation_model'),
+              'atmogen_surface_temperature_k':(world.get('atmogen') or {}).get('surface_temperature_k'),
+          }
+          (root/'watershed_reform_summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True))
+          print(json.dumps(summary,indent=2,sort_keys=True))
+          PY
+
+      - name: Assemble requested delivery files
+        run: |
+          set -euxo pipefail
+          ROOT="showcase/${{ matrix.slug }}-${{ matrix.seed }}"
+          D="delivery/${{ matrix.slug }}-${{ matrix.seed }}"
+          mkdir -p "$D/watersheds"
+          cp "$ROOT/maps/02_elevation.png" "$D/terrain_elevation.png"
+          cp "$ROOT/maps/02b_height_grayscale_16bit.png" "$D/height_16bit.png"
+          cp "$ROOT/maps/02b_height_grayscale_16bit.json" "$D/height_16bit_metadata.json"
+          cp "$ROOT/maps/15_true_color.png" "$D/true_color_no_clouds.png"
+          cp "$ROOT/maps/15c2_true_color_clouds.png" "$D/true_color_with_clouds.png"
+          cp "$ROOT/maps/04_temperature_annual.png" "$D/temperature_annual.png"
+          for f in \
+            40_watershed_outlet_basins.png \
+            41_watershed_subbasins.png \
+            42_watershed_subbasins.png \
+            43_watershed_subbasins.png \
+            44_channel_classes.png \
+            45_subgrid_drainage_density.png \
+            46_bankfull_discharge.png \
+            47_groundwater_baseflow.png \
+            48_groundwater_recharge.png \
+            49_topographic_wetness.png \
+            50_height_above_drainage.png; do
+              cp "$ROOT/maps/$f" "$D/watersheds/$f"
+          done
+          cp "$ROOT/watershed_reform_summary.json" "$D/"
+          cp "$ROOT/diagnostics.json" "$D/"
+
+      - name: Upload requested maps and complete world maps
+        uses: actions/upload-artifact@v4
+        with:
+          name: reformed-${{ matrix.slug }}-${{ matrix.seed }}
+          path: |
+            validation-configs/${{ matrix.slug }}-${{ matrix.seed }}.yaml
+            delivery/${{ matrix.slug }}-${{ matrix.seed }}/
+            showcase/${{ matrix.slug }}-${{ matrix.seed }}/world.json
+            showcase/${{ matrix.slug }}-${{ matrix.seed }}/world_report.md
+            showcase/${{ matrix.slug }}-${{ matrix.seed }}/showcase_audit.json
+            showcase/${{ matrix.slug }}-${{ matrix.seed }}/generation.log
+            showcase/${{ matrix.slug }}-${{ matrix.seed }}/maps/
+          compression-level: 6
+          retention-days: 10
