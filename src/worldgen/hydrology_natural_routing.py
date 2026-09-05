@@ -70,6 +70,13 @@ def flow_directions_continuous_local(
     oc = np.asarray(ocean, dtype=bool)
     if elev.ndim != 2 or oc.shape != elev.shape:
         raise ValueError("elevation and ocean must be equal-shaped 2-D arrays")
+    if elev.shape != grid.shape:
+        raise ValueError(f"elevation and ocean shape must match grid shape {grid.shape}")
+    if np.any(~np.isfinite(elev)):
+        raise ValueError("elevation must be finite")
+    tie_value = float(near_tie_fraction)
+    if not np.isfinite(tie_value):
+        raise ValueError("near_tie_fraction must be finite")
     h, w = elev.shape
 
     best_far = np.zeros_like(elev)
@@ -91,7 +98,8 @@ def flow_directions_continuous_local(
         dx_phys = dx * np.asarray(grid.dx_km, float)
         dy_phys = np.full_like(elev, dy * float(grid.dy_km))
         norm = np.maximum(np.hypot(dx_phys, dy_phys), 1.0e-12)
-        ww = np.where(useful, (slope / np.maximum(best_far, 1.0e-30)) ** 2.2, 0.0)
+        normalized_slope = np.maximum(slope, 0.0) / np.maximum(best_far, 1.0e-30)
+        ww = np.where(useful, normalized_slope ** 2.2, 0.0)
         pref_x += ww * dx_phys / norm
         pref_y += ww * dy_phys / norm
         weight_sum += ww
@@ -107,7 +115,7 @@ def flow_directions_continuous_local(
 
     receiver = np.full((h, w), -1, dtype=np.int32)
     best_score = np.full_like(elev, -np.inf)
-    tie = float(np.clip(near_tie_fraction, 0.0, 0.20))
+    tie = float(np.clip(tie_value, 0.0, 0.20))
     active = best_local > 0.0
 
     for dy, dx in _LOCAL:

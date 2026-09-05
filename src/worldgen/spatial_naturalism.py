@@ -65,6 +65,16 @@ def irregular_blob_field(
         raise ValueError("centers_xyz must have shape (n, 3)")
     if sigmas.shape != (len(centers),) or wts.shape != (len(centers),):
         raise ValueError("sigmas_deg and weights must contain one value per center")
+    if np.any(~np.isfinite(centers)):
+        raise ValueError("center vectors must be finite")
+    if len(centers):
+        norms = np.linalg.norm(centers, axis=1)
+        if np.any(~np.isfinite(norms)) or np.any(norms <= 0.0):
+            raise ValueError("center vectors must have finite non-zero magnitude")
+    if np.any(~np.isfinite(sigmas)) or np.any(sigmas <= 0.0):
+        raise ValueError("sigma values must be finite and positive")
+    if np.any(~np.isfinite(wts)):
+        raise ValueError("weight values must be finite")
 
     pts = np.asarray(grid.xyz, dtype=np.float64).reshape(-1, 3)
     out = np.zeros(len(pts), dtype=np.float64)
@@ -173,9 +183,15 @@ def _coherent_mask_texture(mask: np.ndarray, grid: SphereGrid, scale_km: float) 
 def irregular_near(mask: np.ndarray, grid: SphereGrid, km: float) -> np.ndarray:
     """Geological proximity with heterogeneous continuity instead of exact discs."""
     source = np.asarray(mask, dtype=bool)
+    if source.shape != grid.shape:
+        raise ValueError(f"mask shape must match grid shape {grid.shape}, got {source.shape}")
+    radius = float(km)
+    if not np.isfinite(radius) or radius < 0.0:
+        raise ValueError("km must be finite and non-negative")
     if not np.any(source):
         return np.zeros_like(source)
-    radius = max(float(km), 1e-6)
+    if radius == 0.0:
+        return source.copy()
     d = _distance_to(source, grid)
     rough = _coherent_mask_texture(source, grid, radius)
     local_radius = radius * np.clip(1.0 + 0.24 * rough, 0.72, 1.28)
@@ -191,8 +207,19 @@ def major_water_mask(
 ) -> np.ndarray:
     """Keep ocean/large-sea thermal reservoirs and reject tiny lake point sources."""
     w = np.asarray(water, dtype=bool)
+    if w.shape != grid.shape:
+        raise ValueError(f"water shape must match grid shape {grid.shape}, got {w.shape}")
+    global_fraction = float(min_global_fraction)
+    component_fraction = float(min_component_fraction_of_water)
+    if (
+        not np.isfinite(global_fraction)
+        or not np.isfinite(component_fraction)
+        or not 0.0 <= global_fraction <= 1.0
+        or not 0.0 <= component_fraction <= 1.0
+    ):
+        raise ValueError("fraction thresholds must be finite and in [0, 1]")
     total = grid.weighted_fraction(w)
-    if total < float(min_global_fraction) or not np.any(w):
+    if total < global_fraction or not np.any(w):
         return np.zeros_like(w)
     labels, n = grid.ops.connected_components(w)
     if n <= 0:
@@ -202,7 +229,7 @@ def major_water_mask(
         weights=np.asarray(grid.cell_area_weights, float).ravel(),
         minlength=n + 1,
     )
-    threshold = max(float(min_global_fraction), float(min_component_fraction_of_water) * total)
+    threshold = max(global_fraction, component_fraction * total)
     good = areas >= threshold
     good[0] = False
     if not np.any(good[1:]):
@@ -222,7 +249,15 @@ def marine_thermal_distance(
     """Effective marine thermal distance including flow and relief anisotropy."""
     water = np.asarray(water, dtype=bool)
     elev = np.asarray(elevation_km, dtype=float)
-    scale_km = max(float(inland_scale_km), 1.0)
+    if water.shape != grid.shape:
+        raise ValueError(f"water shape must match grid shape {grid.shape}, got {water.shape}")
+    if elev.shape != grid.shape:
+        raise ValueError(f"elevation_km shape must match grid shape {grid.shape}, got {elev.shape}")
+    if np.any(~np.isfinite(elev)):
+        raise ValueError("elevation_km must be finite")
+    scale_km = float(inland_scale_km)
+    if not np.isfinite(scale_km) or scale_km <= 0.0:
+        raise ValueError("inland_scale_km must be finite and positive")
     marine = major_water_mask(grid, water)
 
     if np.any(marine):

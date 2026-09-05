@@ -10,6 +10,33 @@ from .terrain import TerrainResult
 from .noise import hybrid_multifractal, hybrid_noise01, noise_kwargs, CLIMATE_BLEND, NoiseBlend, StaticNoiseFields
 from .topology import prepare_spherical_bilinear_sampler, apply_bilinear_sampler
 from .planetary_physics import canonical_species, phase_code_grid, relative_vapor_capacity, saturation_pressure_bar
+
+
+MIN_MODEL_TEMPERATURE_K = 1.0
+MIN_MODEL_TEMPERATURE_C = MIN_MODEL_TEMPERATURE_K - 273.15
+
+
+def _enforce_physical_temperature_floor(
+    temperature_c: np.ndarray,
+) -> tuple[np.ndarray, int]:
+    """Keep the reduced-order climate state strictly above absolute zero.
+
+    The seasonal/lapse-rate approximation can overshoot on exotic high-relief or
+    weakly heated worlds. Downstream phase thermodynamics require positive Kelvin,
+    so clamp only this impossible tail to the same 1 K numerical floor used by the
+    built-in saturation model. Non-finite values remain hard errors.
+    """
+    out = np.asarray(temperature_c, dtype=np.float64)
+    if not np.isfinite(out).all():
+        raise ValueError("climate temperature field must remain finite")
+    below = out < MIN_MODEL_TEMPERATURE_C
+    count = int(np.count_nonzero(below))
+    if count:
+        out = out.copy()
+        out[below] = MIN_MODEL_TEMPERATURE_C
+    return out, count
+
+
 from .spatial_naturalism import marine_thermal_distance
 
 
@@ -176,6 +203,7 @@ def build_climate(grid: SphereGrid, astronomy: AstronomyResult, terrain: Terrain
     if cfg.months != 12: raise ValueError("Current climate implementation requires 12 months")
     h,w=terrain.land.shape; temp=np.empty((12,h,w),np.float32); precip_raw=np.empty_like(temp); pressure=np.empty_like(temp); wu=np.empty_like(temp); wv=np.empty_like(temp); gwu=np.empty_like(temp); gwv=np.empty_like(temp); humidity=np.empty_like(temp); hfu=np.empty_like(temp); hfv=np.empty_like(temp)
     phase_monthly=np.empty((12,h,w),np.uint8); saturation_monthly=np.empty((12,h,w),np.float32)
+    physical_temperature_floor_count = 0
     correction = np.zeros((h,w), dtype=np.float32) if temperature_correction is None else np.asarray(temperature_correction, dtype=np.float32)
     if correction.shape != (h,w) or np.any(~np.isfinite(correction)):
         raise ValueError("temperature_correction must be a finite array matching the climate grid")
@@ -207,6 +235,8 @@ def build_climate(grid: SphereGrid, astronomy: AstronomyResult, terrain: Terrain
         sst_m=np.asarray(ocean.sst_anomaly_c_monthly[m] if hasattr(ocean,"sst_anomaly_c_monthly") else ocean.sst_anomaly_c,float)
         tm += sst_m*terrain.ocean + smooth_periodic(sst_m,(3.0,5.0))*np.exp(-dist_ocean/520.0)*terrain.land + texture
         tm += correction
+        tm, floor_count = _enforce_physical_temperature_floor(tm)
+        physical_temperature_floor_count += floor_count
         phase_monthly[m]=phase_code_grid(condensible,tm+273.15,surface_pressure)
         saturation_monthly[m]=np.asarray(saturation_pressure_bar(condensible,tm+273.15,backend="builtin"),dtype=np.float32)
         itcz_lat=cfg.seasonal_itcz_shift_fraction*declinations[m]; p,u,v,gu,gv=_pressure_and_winds(grid,tm,terrain.land,ocean.elevation_km,cfg,itcz_lat)
@@ -238,6 +268,9 @@ def build_climate(grid: SphereGrid, astronomy: AstronomyResult, terrain: Terrain
           "atmogen_temperature_correction_applied":bool(temperature_correction is not None),
           "atmogen_temperature_correction_mean_c":float(np.sum(correction*grid.cell_area_weights)),
           "atmogen_temperature_correction_max_abs_c":float(np.max(np.abs(correction))),
+          "minimum_model_temperature_k":float(MIN_MODEL_TEMPERATURE_K),
+          "physical_temperature_floor_cell_month_count":int(physical_temperature_floor_count),
+          "physical_temperature_floor_fraction":float(physical_temperature_floor_count / max(12*h*w, 1)),
           "precipitation_scaling":"spherical area-weighted target + power-tail shaping + tanh extreme soft-cap; no hard clipping","precipitation_extreme_softcap_mm_month":float(cap),"precipitation_softcap_alpha":float(precip_alpha),
           "classification":"Köppen-Geiger-like only for H2O climates; EXO marker for non-water condensables",
           "circulation":"seasonally migrating ITCZ + explicit trade winds/westerlies/polar easterlies + pressure anomalies","orographic_precipitation":"iterative humidity advection with physical upwind elevation gain and lee-side moisture depletion",

@@ -172,6 +172,10 @@ def _tiny_advanced_config() -> WorldConfig:
 
 def test_canonical_pipeline_exports_advanced_planetary_layers_and_final_optics():
     world = WorldPipeline(_tiny_advanced_config(), progress=None).generate()
+    climate_temperature_k = np.asarray(world["climate"].temperature_c, dtype=float) + 273.15
+    assert np.isfinite(climate_temperature_k).all()
+    assert float(np.min(climate_temperature_k)) >= 1.0 - 1.0e-9
+    assert world["climate"].metadata["minimum_model_temperature_k"] == 1.0
     for key in (
         "surface_liquids", "volatile_cycle", "exotic_ocean", "geodynamics",
         "cryogeology", "geomorphic_fluid_parameters", "exotic_geomorphology",
