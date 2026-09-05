@@ -184,8 +184,15 @@ def apply_procedural_erosion(grid, terrain, forcing: ErosionForcing, cfg, *, see
     mask = np.zeros(shape, dtype=np.float64)
 
     octaves = int(cfg.octaves)
+    cos_lat = np.maximum(np.cos(np.deg2rad(np.asarray(grid.lat, dtype=np.float64))), 1.0e-6)
+    dx_km = float(grid.radius_km) * float(grid.dlon_rad) * cos_lat
+    sample_km = np.maximum(float(grid.dy_km), dx_km)
+    executed_octaves = 0
     for octave in range(octaves):
         wavelength = np.asarray(forcing.preferred_scale_km, dtype=np.float64) / (float(cfg.lacunarity) ** octave)
+        resolved = wavelength >= float(cfg.min_samples_per_wavelength) * sample_km
+        if not np.any(resolved & (strength > 1.0e-6)):
+            break
         c, s, coherence = _phase_cell_octave(
             grid,
             wavelength,
@@ -195,6 +202,7 @@ def apply_procedural_erosion(grid, terrain, forcing: ErosionForcing, cfg, *, see
             seed=int(seed),
             octave=octave,
         )
+        coherence = coherence * resolved
         profile = _rounded_profile(c, ridge_round, crease_round)
         mask = 1.0 - (1.0 - mask) * (1.0 - np.clip(coherence * detail, 0.0, 1.0))
         visible = mask * profile + (1.0 - mask) * float(cfg.fade_target_strength) * target
@@ -228,6 +236,7 @@ def apply_procedural_erosion(grid, terrain, forcing: ErosionForcing, cfg, *, see
         norm = np.hypot(new_s, new_e)
         direction_s = np.divide(new_s, np.maximum(norm, 1.0e-12))
         direction_e = np.divide(new_e, np.maximum(norm, 1.0e-12))
+        executed_octaves += 1
 
     active = strength > 1.0e-6
     if bool(cfg.zero_mean_displacement) and np.any(active):
@@ -240,7 +249,9 @@ def apply_procedural_erosion(grid, terrain, forcing: ErosionForcing, cfg, *, see
 
     metadata = {
         "model": "seamless 3-D phase-cell procedural erosion with environment forcing and recursive tangent-line steering",
-        "octaves": octaves,
+        "octaves_requested": octaves,
+        "octaves_executed": executed_octaves,
+        "min_samples_per_wavelength": float(cfg.min_samples_per_wavelength),
         "lacunarity": float(cfg.lacunarity),
         "gain": float(cfg.gain),
         "cell_scale": float(cfg.cell_scale),
