@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import worldgen.procedural_erosion as procedural_erosion_module
+
 from worldgen.config import ProceduralErosionConfig
 from worldgen.erosion_forcing import ErosionForcing
 from worldgen.grid import SphereGrid
@@ -373,3 +375,47 @@ def test_phase_cell_chunk_rows_reject_invalid_values(chunk_rows):
             octave=0,
             chunk_rows=chunk_rows,
         )
+
+
+def test_streamed_phase_geometry_matches_reference_helpers_exactly():
+    grid = SphereGrid(64, 32, 6371.0)
+    south = np.sin(np.deg2rad(grid.lat)) + 0.25 * np.cos(np.deg2rad(grid.lon))
+    east = np.cos(np.deg2rad(grid.lat)) - 0.15 * np.sin(np.deg2rad(grid.lon))
+
+    normal, perpendicular = procedural_erosion_module._phase_geometry_rows(
+        grid, south, east
+    )
+    assert np.array_equal(normal, procedural_erosion_module._unit_positions(grid))
+    assert np.array_equal(
+        perpendicular,
+        procedural_erosion_module._tangent_perpendicular(grid, south, east),
+    )
+
+
+def test_high_level_phase_chunking_streams_geometry_in_bounded_rows(monkeypatch):
+    grid = SphereGrid(64, 32, 6371.0)
+    terrain = _terrain(grid)
+    cfg = ProceduralErosionConfig(
+        enabled=True,
+        octaves=3,
+        base_amplitude_m=12.0,
+        slope_reference=0.002,
+        phase_chunk_rows=7,
+    )
+    row_counts: list[int] = []
+    original = procedural_erosion_module._phase_geometry_rows
+
+    def counted_geometry(target_grid, south, east, row_slice=None):
+        row_counts.append(int(np.asarray(south).shape[0]))
+        return original(target_grid, south, east, row_slice)
+
+    monkeypatch.setattr(
+        procedural_erosion_module, "_phase_geometry_rows", counted_geometry
+    )
+    result = apply_procedural_erosion(grid, terrain, _forcing(grid), cfg, seed=9917)
+
+    assert result.metadata["octaves_executed"] >= 2
+    assert result.metadata["spherical_geometry_chunked_with_phase"] is True
+    assert row_counts
+    assert max(row_counts) <= 7
+    assert sum(row_counts) == grid.shape[0] * result.metadata["octaves_executed"]
