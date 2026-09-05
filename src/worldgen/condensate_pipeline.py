@@ -25,7 +25,10 @@ def install_multicondensate_hydrology(
     can be rebuilt from the same climate/shoreline before outputs are written.
     """
     c = pipeline.cfg
-    if str(getattr(c.astronomy, "greenhouse_model", "legacy")) != "composition":
+    atmogen_enabled = bool(getattr(getattr(c, "atmogen", None), "enabled", False))
+    composition_enabled = str(getattr(c.astronomy, "greenhouse_model", "legacy")) == "composition"
+    surface_volatiles = getattr(c.astronomy, "surface_volatiles", None)
+    if not surface_volatiles or not (atmogen_enabled or composition_enabled):
         return world
     tag = f"_{suffix}" if suffix else ""
     hcfg = c.hydrology if hydrology_cfg is None else hydrology_cfg
