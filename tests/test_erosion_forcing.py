@@ -598,3 +598,23 @@ def test_empty_surface_liquid_inventory_keeps_marine_scaling_neutral():
     )
     assert forcing.metadata["marine_fluid_dominant_species"] == "none"
     assert forcing.metadata["marine_fluid_mechanical_factor"] == 1.0
+
+
+def test_standing_liquid_rejects_partition_total_mass_inconsistency():
+    grid, terrain, ocean, climate, hydrology, geology, astronomy = _forcing_fixture(
+        land=False,
+    )
+    inconsistent = _surface_liquid_fixture({"H2O": 4.0e17, "CH4": 1.0e17})
+    inconsistent.total_liquid_mass_kg = 9.0e17
+    with pytest.raises(ValueError, match="inconsistent with partition"):
+        build_erosion_forcing(
+            grid,
+            terrain,
+            ocean,
+            climate,
+            hydrology,
+            geology,
+            astronomy,
+            ProceduralErosionConfig(enabled=True),
+            surface_liquids=inconsistent,
+        )
