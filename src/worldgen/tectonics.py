@@ -8,6 +8,7 @@ from .config import ResolutionConfig, TectonicsConfig, NoiseConfig
 from .grid import SphereGrid, normalize01, smooth_periodic, distance_to
 from .noise import hybrid_multifractal, noise_kwargs, TECTONIC_BLEND, NoiseBlend
 from .topology import spherical_resize
+from .spatial_naturalism import irregular_blob_field
 
 
 @dataclass(slots=True)
@@ -566,18 +567,14 @@ def _resize(a: np.ndarray, shape: tuple[int,int], order: int = 1) -> np.ndarray:
     return spherical_resize(a, shape, order=0 if order == 0 else 1)
 
 
-def _blob_field(grid: SphereGrid, centers_xyz: np.ndarray, sigmas_deg: np.ndarray, weights: np.ndarray) -> np.ndarray:
-    pts = grid.xyz.reshape(-1, 3)
-    out = np.zeros(len(pts), dtype=np.float64)
-    chunk = 65536
-    for k, c in enumerate(centers_xyz):
-        sigma = np.deg2rad(sigmas_deg[k])
-        for i in range(0, len(pts), chunk):
-            dots = np.clip(pts[i:i+chunk] @ c, -1, 1)
-            ang = np.arccos(dots)
-            out[i:i+chunk] += weights[k] * np.exp(-0.5 * (ang/max(sigma,1e-6))**2)
-    return out.reshape(grid.height, grid.width)
-
+def _blob_field(
+    grid: SphereGrid,
+    centers_xyz: np.ndarray,
+    sigmas_deg: np.ndarray,
+    weights: np.ndarray,
+) -> np.ndarray:
+    """Build deterministic anisotropic/lobate hotspot and LIP provinces."""
+    return irregular_blob_field(grid, centers_xyz, sigmas_deg, weights)
 
 def generate_tectonics(grid: SphereGrid, cfg: TectonicsConfig, res: ResolutionConfig, rng: np.random.Generator, noise_cfg: NoiseConfig | None = None) -> TectonicResult:
     macro0 = random_unit_vectors(rng, cfg.plate_count)
@@ -696,6 +693,7 @@ def generate_tectonics(grid: SphereGrid, cfg: TectonicsConfig, res: ResolutionCo
         'boundary_deformation_iterations': int(cfg.boundary_deformation_iterations),
         'strain_boundary_warp_deg': float(cfg.strain_boundary_warp_deg),
         'noise_model': 'shared hybrid multi-type multifractal with decreasing octave amplitudes and domain warping',
+        'hotspot_lip_footprint_model': 'anisotropic lobate spherical provinces with deterministic multi-scale rough margins',
         'subplate_speeds_cm_yr_current': (np.linalg.norm(actual,axis=1)*grid.radius_km/10.0).round(4).tolist(),
         'model_note': 'Hierarchical deforming subplate kinematics with coupled Euler motions, stress memory, split/fuse events, collision nudging and multi-scale warped boundaries. Reduced-order model; not a mantle-convection PDE solver.'
     }

@@ -10,6 +10,7 @@ from .ocean import OceanResult
 from .climate import ClimateResult
 from .hydrology import HydrologyResult
 from .geology import GeologyResult
+from .spatial_naturalism import irregular_near
 
 
 @dataclass(slots=True)
@@ -23,7 +24,8 @@ class ResourceResult:
 
 
 def _near(mask: np.ndarray, grid: SphereGrid, km: float) -> np.ndarray:
-    return distance_to(mask, grid) <= km
+    """Deterministic heterogeneous geodesic proximity envelope."""
+    return irregular_near(mask, grid, km)
 
 
 def _wet_dry_zone(climate: ClimateResult) -> np.ndarray:
@@ -293,5 +295,6 @@ def build_resources(
         "deposit_count": len(deposits), "rule_count": len(specs) + 1,
         "submerged_deposit_count": int(sum(bool(d.get("submerged")) for d in deposits)),
         "note": "Resource maps are fuzzy geological suitability fields; point deposits are seeded samples. Geological existence is separated from preindustrial accessibility.",
+        "proximity_envelope_model": "heterogeneous geodesic reach; no exact-radius geological discs",
     }
     return ResourceResult(fields, deposits, wood.astype(np.float32), sea_salt, technology, meta)

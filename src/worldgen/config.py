@@ -288,6 +288,21 @@ class HydrologyConfig:
     delta_shelf_slope_scale: float = 0.0016
     delta_distributary_texture_strength: float = 0.26
 
+    # Reliability/natural-routing controls.
+    bankfull_storm_multiplier: float = 3.0
+    channel_min_catchment_km2: float = 0.0
+    min_resolved_channel_discharge_m3_s: float = 0.02
+    min_resolved_stream_discharge_m3_s: float = 0.10
+    min_perennial_stream_discharge_m3_s: float = 1.0
+    min_river_discharge_m3_s: float = 10.0
+    min_major_river_discharge_m3_s: float = 100.0
+    max_resolved_river_cell_fraction_land: float = 0.20
+    max_subgrid_drainage_density_km_per_km2: float = 3.2
+    hydrology_fail_river_fraction_land: float = 0.35
+    hydrology_fail_lake_fraction_land: float = 0.10
+    hydrology_fail_largest_basin_fraction_land: float = 0.95
+    subbasin_thresholds_km2: tuple[float, float, float] = (1.0e6, 1.0e5, 1.0e4)
+
 
 @dataclass(slots=True)
 class ProceduralErosionConfig:
@@ -609,10 +624,35 @@ class WorldConfig:
         _integer("hydrology.flow_refresh_interval", h.flow_refresh_interval, minimum=1); _integer("hydrology.flow_refresh_max_interval", h.flow_refresh_max_interval, minimum=1)
         _number("hydrology.flow_refresh_elevation_threshold_m", h.flow_refresh_elevation_threshold_m, minimum=0.0); _fraction("hydrology.flow_refresh_land_change_fraction", h.flow_refresh_land_change_fraction); _number("hydrology.flow_refresh_delta_threshold_m", h.flow_refresh_delta_threshold_m, minimum=0.0)
         _integer("hydrology.sediment_routing_passes", h.sediment_routing_passes, minimum=1); _integer("hydrology.max_river_centerlines", h.max_river_centerlines, minimum=0)
-        for name in ("stream_power_m", "stream_power_n", "min_drainage_area_km2", "max_fluvial_erosion_m_per_iteration", "meander_slope_scale", "delta_max_depth_m", "delta_spread_cells", "lake_min_depth_m", "lake_min_catchment_km2"):
+        for name in (
+            "stream_power_m", "stream_power_n", "min_drainage_area_km2",
+            "max_fluvial_erosion_m_per_iteration", "meander_slope_scale",
+            "delta_max_depth_m", "delta_spread_cells", "lake_min_depth_m",
+            "lake_min_catchment_km2", "bankfull_storm_multiplier",
+            "channel_min_catchment_km2", "min_resolved_channel_discharge_m3_s",
+            "min_resolved_stream_discharge_m3_s", "min_perennial_stream_discharge_m3_s",
+            "min_river_discharge_m3_s", "min_major_river_discharge_m3_s",
+            "max_subgrid_drainage_density_km_per_km2",
+        ):
             _number(f"hydrology.{name}", getattr(h, name), minimum=0.0)
-        for name in ("deposition_strength", "river_meander_strength", "lateral_erosion_fraction", "delta_retention_fraction", "delta_min_outlet_discharge_norm", "lake_area_soft_cap_fraction_land", "tributary_discharge_fraction", "delta_wave_reworking_strength", "delta_tide_reworking_strength", "delta_distributary_texture_strength"):
+        for name in (
+            "deposition_strength", "river_meander_strength", "lateral_erosion_fraction",
+            "delta_retention_fraction", "delta_min_outlet_discharge_norm",
+            "lake_area_soft_cap_fraction_land", "tributary_discharge_fraction",
+            "delta_wave_reworking_strength", "delta_tide_reworking_strength",
+            "delta_distributary_texture_strength", "max_resolved_river_cell_fraction_land",
+            "hydrology_fail_river_fraction_land", "hydrology_fail_lake_fraction_land",
+            "hydrology_fail_largest_basin_fraction_land",
+        ):
             _fraction(f"hydrology.{name}", getattr(h, name))
+        if len(tuple(h.subbasin_thresholds_km2)) != 3:
+            raise ValueError("hydrology.subbasin_thresholds_km2 must contain exactly three thresholds")
+        previous = float("inf")
+        for i, value in enumerate(h.subbasin_thresholds_km2):
+            _number(f"hydrology.subbasin_thresholds_km2[{i}]", value, minimum=0.0, min_inclusive=False)
+            if float(value) >= previous:
+                raise ValueError("hydrology.subbasin_thresholds_km2 must be strictly descending")
+            previous = float(value)
 
         pe = self.procedural_erosion
         _boolean("procedural_erosion.enabled", pe.enabled)

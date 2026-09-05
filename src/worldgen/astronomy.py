@@ -24,6 +24,52 @@ M_EARTH = 5.9722e24
 R_EARTH = 6.371e6
 AU = 1.495978707e11
 G0 = 9.80665
+ZERO_ALBEDO_EQUILIBRIUM_K = 278.5
+
+
+def equilibrium_temperature_k(
+    *, luminosity_solar: float, semimajor_axis_au: float, bond_albedo: float
+) -> float:
+    """Blackbody equilibrium temperature for globally redistributed stellar flux.
+
+    278.5 K is the approximately zero-Bond-albedo equilibrium temperature at
+    one astronomical unit from a one-solar-luminosity star. Therefore albedo enters
+    once through (1 - A)**0.25; no Earth-albedo normalization belongs here.
+    """
+    lum = float(luminosity_solar)
+    a = float(semimajor_axis_au)
+    albedo = float(bond_albedo)
+    if not np.isfinite(lum) or lum < 0.0:
+        raise ValueError("luminosity_solar must be finite and non-negative")
+    if not np.isfinite(a) or a <= 0.0:
+        raise ValueError("semimajor_axis_au must be finite and positive")
+    if not np.isfinite(albedo) or not 0.0 <= albedo < 1.0:
+        raise ValueError("bond_albedo must be finite and in [0, 1)")
+    return float(
+        ZERO_ALBEDO_EQUILIBRIUM_K
+        * max(lum, 0.0) ** 0.25
+        / math.sqrt(a)
+        * (1.0 - albedo) ** 0.25
+    )
+
+
+def semimajor_axis_for_equilibrium_temperature_au(
+    *, luminosity_solar: float, target_temperature_k: float, bond_albedo: float
+) -> float:
+    """Invert equilibrium_temperature_k for orbital distance."""
+    lum = float(luminosity_solar)
+    target = float(target_temperature_k)
+    albedo = float(bond_albedo)
+    if not np.isfinite(lum) or lum < 0.0:
+        raise ValueError("luminosity_solar must be finite and non-negative")
+    if not np.isfinite(target) or target <= 0.0:
+        raise ValueError("target_temperature_k must be finite and positive")
+    if not np.isfinite(albedo) or not 0.0 <= albedo < 1.0:
+        raise ValueError("bond_albedo must be finite and in [0, 1)")
+    return float(
+        math.sqrt(max(lum, 0.0) * (1.0 - albedo))
+        * (ZERO_ALBEDO_EQUILIBRIUM_K / target) ** 2
+    )
 
 
 @dataclass(slots=True)
@@ -125,7 +171,11 @@ def _generate_planetary_system(cfg: AstronomyConfig, home_a: float, star_mass: f
         result.append({"index": i, "kind": kind, "semimajor_axis_au": float(a), "mass_earth": float(mass),
                        "radius_earth_approx": float(radius), "orbital_period_earth_years": float(_kepler_years(a, star_mass)),
                        "stellar_flux_earth": float(flux),
-                       "equilibrium_temperature_k_approx": float(278.5 * flux**0.25 * ((1-cfg.albedo)/0.7)**0.25),
+                       "equilibrium_temperature_k_approx": equilibrium_temperature_k(
+                           luminosity_solar=lum,
+                           semimajor_axis_au=float(a),
+                           bond_albedo=float(cfg.albedo),
+                       ),
                        "inside_frost_line": bool(a < frost), "is_home_or_parent_orbit": bool(abs(a-home_a)<1e-9)})
     for i in range(len(result)-1):
         p1,p2=result[i],result[i+1]; a1,a2=p1["semimajor_axis_au"],p2["semimajor_axis_au"]
@@ -191,12 +241,21 @@ def build_astronomy(cfg: AstronomyConfig, rng: np.random.Generator) -> Astronomy
             target_teq=target_k/max(surface_unit,1e-6)
         else:
             target_teq=max(target_k-cfg.greenhouse_k,100.0)
-        a=math.sqrt(lum*(1-cfg.albedo)/0.7)*(278.5/target_teq)**2; a=float(np.clip(a,hz_inner*1.01,hz_outer*0.99))
+        a=semimajor_axis_for_equilibrium_temperature_au(
+            luminosity_solar=lum,
+            target_temperature_k=target_teq,
+            bond_albedo=float(cfg.albedo),
+        )
+        a=float(np.clip(a,hz_inner*1.01,hz_outer*0.99))
     else:
         a=float(cfg.semimajor_axis_au)
 
     e=float(cfg.eccentricity); year_earth=_kepler_years(a,m); peri=a*(1-e); apo=a*(1+e)
-    teq=278.5*(lum**0.25)/math.sqrt(a)*((1-cfg.albedo)/0.7)**0.25
+    teq=equilibrium_temperature_k(
+        luminosity_solar=lum,
+        semimajor_axis_au=a,
+        bond_albedo=float(cfg.albedo),
+    )
     rp=_rocky_radius_earth(cfg.planet_mass_earth,cfg.planet_density_g_cm3); gravity_g=cfg.planet_mass_earth/rp**2; gravity=gravity_g*G0
     escape_kms=math.sqrt(2*G*cfg.planet_mass_earth*M_EARTH/(rp*R_EARTH))/1000
 
@@ -275,7 +334,8 @@ def build_astronomy(cfg: AstronomyConfig, rng: np.random.Generator) -> Astronomy
             "surface_gravity_g":gravity_g,"surface_gravity_m_s2":gravity,"escape_velocity_km_s":escape_kms,
             "semimajor_axis_au":a,"eccentricity":e,"periapsis_au":peri,"apoapsis_au":apo,"orbital_period_earth_years":year_earth,
             "rotation_hours":cfg.rotation_hours,"axial_tilt_deg":cfg.axial_tilt_deg,"longitude_periapsis_deg":cfg.longitude_periapsis_deg,
-            "equilibrium_temperature_k":teq,"mean_surface_temperature_c_approx":mean_t_c,"greenhouse_increment_k_approx":greenhouse_k,
+            "equilibrium_temperature_k":teq,"radiative_equilibrium_model":"zero_albedo_278.5K_times_(1-A)^0.25",
+            "configured_bond_albedo":float(cfg.albedo),"mean_surface_temperature_c_approx":mean_t_c,"greenhouse_increment_k_approx":greenhouse_k,
             "hill_radius_km":hill,"roche_limit_fluid_km":roche,"star_angular_diameter_deg":star_ang_deg}
     calendar={"local_day_hours":cfg.rotation_hours,"local_year_days":year_local_days,
               "moon_synodic_periods_local_days":[float(x["synodic_period_local_days"]) for x in moons],
