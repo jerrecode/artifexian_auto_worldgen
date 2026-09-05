@@ -56,6 +56,17 @@ def _validated_field(name: str, values: np.ndarray, shape: tuple[int, int]) -> n
     return out
 
 
+def _validated_chunk_rows(chunk_rows: int | None) -> int:
+    if chunk_rows is None:
+        return 0
+    if isinstance(chunk_rows, bool) or not isinstance(chunk_rows, (int, np.integer)):
+        raise TypeError("chunk_rows must be an integer, zero, or None")
+    rows = int(chunk_rows)
+    if rows < 0:
+        raise ValueError("chunk_rows must be non-negative")
+    return rows
+
+
 def _pow_inv(values: np.ndarray, power: np.ndarray | float) -> np.ndarray:
     """Complement-power-complement mapping used by stacked erosion masks."""
     x = np.clip(np.asarray(values, dtype=np.float64), 0.0, 1.0)
@@ -115,6 +126,52 @@ def _tangent_perpendicular(grid, south: np.ndarray, east_component: np.ndarray) 
     return np.divide(perp, np.maximum(pn, 1.0e-15))
 
 
+def _phase_geometry_rows(
+    grid,
+    direction_south: np.ndarray,
+    direction_east: np.ndarray,
+    row_slice: slice | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build only the normal/perpendicular geometry needed by one row chunk.
+
+    Unlike the reference convenience helpers above, this computes latitude and
+    longitude trigonometry once and lets temporary tangent bases die before the
+    phase-cell kernel begins. This keeps high-level chunking memory-bounded.
+    """
+    lat_values = np.asarray(grid.lat, dtype=np.float64)
+    lon_values = np.asarray(grid.lon, dtype=np.float64)
+    if row_slice is not None:
+        lat_values = lat_values[row_slice]
+        lon_values = lon_values[row_slice]
+
+    lat = np.deg2rad(lat_values)
+    lon = np.deg2rad(lon_values)
+    sin_lat = np.sin(lat)
+    cos_lat = np.cos(lat)
+    sin_lon = np.sin(lon)
+    cos_lon = np.cos(lon)
+
+    normal = np.stack(
+        (cos_lat * cos_lon, cos_lat * sin_lon, sin_lat),
+        axis=-1,
+    )
+    east_basis = np.stack((-sin_lon, cos_lon, np.zeros_like(lon)), axis=-1)
+    south_basis = np.stack(
+        (sin_lat * cos_lon, sin_lat * sin_lon, -cos_lat),
+        axis=-1,
+    )
+    direction = (
+        np.asarray(direction_south, dtype=np.float64)[..., None] * south_basis
+        + np.asarray(direction_east, dtype=np.float64)[..., None] * east_basis
+    )
+    dn = np.linalg.norm(direction, axis=-1, keepdims=True)
+    direction = np.divide(direction, np.maximum(dn, 1.0e-15))
+    perpendicular = np.cross(normal, direction)
+    pn = np.linalg.norm(perpendicular, axis=-1, keepdims=True)
+    perpendicular = np.divide(perpendicular, np.maximum(pn, 1.0e-15))
+    return normal, perpendicular
+
+
 def phase_cell_octave_xyz(
     unit_xyz: np.ndarray,
     radius_km: float,
@@ -156,13 +213,7 @@ def phase_cell_octave_xyz(
     if not np.isfinite(norm_parameter) or not 0.0 <= norm_parameter <= 1.0:
         raise ValueError("normalization must be finite and in [0,1]")
 
-    rows = 0
-    if chunk_rows is not None:
-        if isinstance(chunk_rows, bool) or not isinstance(chunk_rows, (int, np.integer)):
-            raise TypeError("chunk_rows must be an integer, zero, or None")
-        rows = int(chunk_rows)
-        if rows < 0:
-            raise ValueError("chunk_rows must be non-negative")
+    rows = _validated_chunk_rows(chunk_rows)
     if rows > 0 and normal.ndim >= 2 and normal.shape[0] > rows:
         output_shape = normal.shape[:-1]
         cosine = np.empty(output_shape, dtype=np.float64)
@@ -253,17 +304,59 @@ def _phase_cell_octave(
     normalization: float,
     chunk_rows: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    return phase_cell_octave_xyz(
-        _unit_positions(grid),
-        float(grid.radius_km),
-        wavelength_km,
-        _tangent_perpendicular(grid, direction_south, direction_east),
-        cell_scale=cell_scale,
-        seed=seed,
-        octave=octave,
-        normalization=normalization,
-        chunk_rows=chunk_rows,
-    )
+    """Evaluate one grid octave while streaming spherical geometry by row chunk."""
+    wavelength = np.asarray(wavelength_km, dtype=np.float64)
+    south = np.asarray(direction_south, dtype=np.float64)
+    east = np.asarray(direction_east, dtype=np.float64)
+    if wavelength.shape != tuple(grid.shape):
+        raise ValueError(
+            f"wavelength_km must have grid shape {grid.shape}, got {wavelength.shape}"
+        )
+    if south.shape != wavelength.shape or east.shape != wavelength.shape:
+        raise ValueError("direction fields must match the wavelength grid shape")
+
+    rows = _validated_chunk_rows(chunk_rows)
+    if rows <= 0 or wavelength.shape[0] <= rows:
+        normal, perpendicular = _phase_geometry_rows(grid, south, east)
+        return phase_cell_octave_xyz(
+            normal,
+            float(grid.radius_km),
+            wavelength,
+            perpendicular,
+            cell_scale=cell_scale,
+            seed=seed,
+            octave=octave,
+            normalization=normalization,
+            chunk_rows=None,
+        )
+
+    cosine = np.empty(wavelength.shape, dtype=np.float64)
+    sine = np.empty_like(cosine)
+    coherence = np.empty_like(cosine)
+    for start in range(0, wavelength.shape[0], rows):
+        stop = min(start + rows, wavelength.shape[0])
+        part = slice(start, stop)
+        normal, perpendicular = _phase_geometry_rows(
+            grid,
+            south[part],
+            east[part],
+            part,
+        )
+        c_part, s_part, q_part = phase_cell_octave_xyz(
+            normal,
+            float(grid.radius_km),
+            wavelength[part],
+            perpendicular,
+            cell_scale=cell_scale,
+            seed=seed,
+            octave=octave,
+            normalization=normalization,
+            chunk_rows=None,
+        )
+        cosine[part] = c_part
+        sine[part] = s_part
+        coherence[part] = q_part
+    return cosine, sine, coherence
 
 def _finalize_displacement(
     delta: np.ndarray,
@@ -585,6 +678,9 @@ def apply_procedural_erosion(
         "cell_scale": float(cfg.cell_scale),
         "phase_normalization": phase_normalization,
         "phase_chunk_rows": int(getattr(cfg, "phase_chunk_rows", 128)),
+        "spherical_geometry_chunked_with_phase": bool(
+            int(getattr(cfg, "phase_chunk_rows", 128)) > 0
+        ),
         "gully_weight": gully_weight,
         "detail_power": detail_power,
         "slope_reference": slope_reference,
