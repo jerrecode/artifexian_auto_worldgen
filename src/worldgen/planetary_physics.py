@@ -314,7 +314,9 @@ def tidal_heating_flux_w_m2(**kwargs: float) -> float:
 
 
 def geological_activity_regime(total_internal_heat_flux_w_m2: float) -> str:
-    q = max(float(total_internal_heat_flux_w_m2), 0.0)
+    q = _finite_nonnegative(
+        "internal heat flux", total_internal_heat_flux_w_m2
+    )
     if q < 0.015: return "geologically_inactive"
     if q < 0.05: return "weak_or_stagnant_lid"
     if q < 0.25: return "active"
