@@ -155,8 +155,11 @@ def _major_basin_aggregation(
     internal_labels: list[int] = []
     exorheic_label = np.zeros(max_raw + 1, dtype=bool)
     for lab in present_labels:
-        members = raw == int(lab)
-        is_exo = bool(np.any(exo_flat[members]))
+        node = int(outlet_for_label[int(lab)])
+        # Every raw terminal catchment has one terminal outlet, and exorheic state
+        # propagates from that outlet to the whole catchment. Reading the outlet is
+        # O(1) per basin instead of rescanning the complete raster per basin.
+        is_exo = bool(node >= 0 and exo_flat[node])
         exorheic_label[int(lab)] = is_exo
         if not is_exo:
             internal_labels.append(int(lab))
