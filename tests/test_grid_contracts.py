@@ -83,7 +83,7 @@ def test_sphere_grid_rejects_invalid_distance_cache_budget(cache_bytes):
 @pytest.mark.parametrize("q", [np.nan, np.inf, -0.01, 1.01])
 def test_weighted_quantile_rejects_invalid_quantile(q):
     grid = SphereGrid(16, 8)
-    with pytest.raises(ValueError, match="q.*finite.*\[0, 1\]"):
+    with pytest.raises(ValueError, match=r"q.*finite.*\[0, 1\]"):
         grid.weighted_quantile(np.arange(128, dtype=float).reshape(grid.shape), q)
 
 
