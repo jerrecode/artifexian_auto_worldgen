@@ -1,11 +1,13 @@
 from dataclasses import asdict
 
 import numpy as np
+import pytest
 
 from worldgen.astronomy import build_astronomy
 from worldgen.atmogen_adapter import (
     ATMOGEN_COMPATIBLE_REVISION,
     AtmogenAdapter,
+    _normalize,
     atmogen_runtime_metadata,
     result_summary,
 )
@@ -169,3 +171,22 @@ def test_atmogen_settings_change_only_dependent_stage_key_inputs():
     assert stage_cache_key("atmogen_column", atm_a, fp) != stage_cache_key(
         "atmogen_column", atm_b, fp
     )
+
+
+
+def test_worldgen_targets_hardened_atmogen_revision():
+    assert ATMOGEN_COMPATIBLE_REVISION == "caf747f24f30e3c015fbcb60661effd08af505bd"
+
+
+@pytest.mark.parametrize(
+    "composition",
+    [
+        {"N2": np.nan},
+        {"N2": np.inf},
+        {"N2": -0.1, "O2": 1.1},
+        {1: 0.5, "1": 0.5},
+    ],
+)
+def test_adapter_normalization_rejects_invalid_or_ambiguous_composition(composition):
+    with pytest.raises(ValueError, match="atmosphere composition"):
+        _normalize(composition)
