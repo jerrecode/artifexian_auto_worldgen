@@ -16,7 +16,7 @@ def _forcing(grid: SphereGrid, strength: float = 1.0) -> ErosionForcing:
     zeros = np.zeros(shape, dtype=np.float32)
     return ErosionForcing(
         strength=ones * strength,
-        preferred_scale_km=ones * 600.0,
+        preferred_scale_km=ones * 4000.0,
         detail=ones * 0.8,
         ridge_valley_target=zeros,
         orientation_south=zeros,
@@ -48,6 +48,7 @@ def test_procedural_erosion_is_deterministic_finite_and_bounded():
     b = apply_procedural_erosion(grid, terrain, _forcing(grid), cfg, seed=1234)
     assert np.array_equal(a.delta_height_m, b.delta_height_m)
     assert np.isfinite(a.delta_height_m).all()
+    assert np.any(np.abs(a.delta_height_m) > 0.0)
     assert float(np.max(np.abs(a.delta_height_m))) <= 35.0 + 1e-6
     assert np.isfinite(a.phase_coherence).all()
     assert np.all((a.phase_coherence >= 0.0) & (a.phase_coherence <= 1.0))
