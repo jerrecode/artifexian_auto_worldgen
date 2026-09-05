@@ -224,36 +224,81 @@ def _rounded_profile(c: np.ndarray, ridge_rounding: np.ndarray, crease_rounding:
     return np.sign(c) * shaped
 
 
-def _bounded_area_zero_mean(
-    values: np.ndarray,
+def _finalize_displacement(
+    delta: np.ndarray,
     active: np.ndarray,
     weights: np.ndarray,
-    limit: float,
-) -> np.ndarray:
-    """Clip while solving a scalar offset that preserves active-cell area mean."""
-    out = np.asarray(values, dtype=np.float64).copy()
-    if not np.any(active):
-        out[...] = 0.0
-        return out
-    lim = max(float(limit), 0.0)
-    if lim == 0.0:
-        out[...] = 0.0
-        return out
-    vals = out[active]
-    w = np.asarray(weights, dtype=np.float64)[active]
-    lo = float(np.min(vals) - lim)
-    hi = float(np.max(vals) + lim)
-    for _ in range(48):
-        mid = 0.5 * (lo + hi)
-        mean = float(np.average(np.clip(vals - mid, -lim, lim), weights=w))
-        if mean > 0.0:
-            lo = mid
+    *,
+    zero_mean: bool,
+    limit_m: float,
+) -> tuple[np.ndarray, dict[str, float | str]]:
+    """Enforce displacement constraints without corrupting the mean invariant.
+
+    With zero-mean morphology enabled, remove the spherical area-weighted mean
+    first and enforce the absolute cap using one uniform scale factor.  Uniform
+    rescaling preserves the relative morphology and keeps an exactly-zero input
+    exactly zero.  Cellwise clipping remains available when zero-mean behavior is
+    explicitly disabled.
+    """
+    out = np.asarray(delta, dtype=np.float64).copy()
+    mask = np.asarray(active, dtype=bool)
+    area = np.asarray(weights, dtype=np.float64)
+    if out.shape != mask.shape or out.shape != area.shape:
+        raise ValueError(
+            "delta, active mask and cell-area weights must have identical shape"
+        )
+    if not np.isfinite(out).all():
+        raise ValueError(
+            "procedural displacement contains non-finite values before constraints"
+        )
+    if not np.isfinite(area).all() or np.any(area < 0.0):
+        raise ValueError("cell-area weights must be finite and non-negative")
+    limit = float(limit_m)
+    if not np.isfinite(limit) or limit < 0.0:
+        raise ValueError("displacement limit must be finite and non-negative")
+
+    out[~mask] = 0.0
+    prelimit_max = float(np.max(np.abs(out[mask]))) if np.any(mask) else 0.0
+    scale_factor = 1.0
+    limiter = "cellwise_clip"
+
+    if np.any(mask) and bool(zero_mean):
+        active_weights = area[mask]
+        weight_sum = float(np.sum(active_weights))
+        if not np.isfinite(weight_sum) or weight_sum <= 0.0:
+            raise ValueError(
+                "active cell-area weights must have a positive finite sum"
+            )
+        weighted_mean = float(
+            np.sum(out[mask] * active_weights) / weight_sum
+        )
+        if weighted_mean != 0.0:
+            out[mask] -= weighted_mean
+
+        centered_max = float(np.max(np.abs(out[mask])))
+        if centered_max > limit and centered_max > 0.0:
+            scale_factor = float(limit / centered_max)
+            out[mask] *= scale_factor
+            limiter = "uniform_rescale"
         else:
-            hi = mid
-    offset = 0.5 * (lo + hi)
-    out[active] = np.clip(vals - offset, -lim, lim)
-    out[~active] = 0.0
-    return out
+            limiter = "none"
+    else:
+        np.clip(out, -limit, limit, out=out)
+
+    out[~mask] = 0.0
+    post_mean = 0.0
+    if np.any(mask):
+        active_weights = area[mask]
+        post_mean = float(
+            np.sum(out[mask] * active_weights) / np.sum(active_weights)
+        )
+
+    return out, {
+        "displacement_limiter": limiter,
+        "displacement_scale_factor": scale_factor,
+        "preconstraint_max_absolute_displacement_m": prelimit_max,
+        "area_weighted_mean_displacement_m": post_mean,
+    }
 
 
 def apply_procedural_erosion(
@@ -473,25 +518,13 @@ def apply_procedural_erosion(
 
     active = strength > 1.0e-6
     limit = float(cfg.max_displacement_m)
-    if bool(cfg.zero_mean_displacement):
-        delta = _bounded_area_zero_mean(
-            delta,
-            active,
-            np.asarray(grid.cell_area_weights, dtype=np.float64),
-            limit,
-        )
-    else:
-        delta[~active] = 0.0
-        delta = np.clip(delta, -limit, limit)
-
-    weighted_mean = 0.0
-    if np.any(active):
-        weighted_mean = float(
-            np.average(
-                delta[active],
-                weights=np.asarray(grid.cell_area_weights, dtype=np.float64)[active],
-            )
-        )
+    delta, constraint_meta = _finalize_displacement(
+        delta,
+        active,
+        np.asarray(grid.cell_area_weights, dtype=np.float64),
+        zero_mean=bool(cfg.zero_mean_displacement),
+        limit_m=limit,
+    )
 
     metadata = {
         "model": (
@@ -518,8 +551,8 @@ def apply_procedural_erosion(
         "max_displacement_m": limit,
         "max_absolute_displacement_m": float(np.max(np.abs(delta))) if delta.size else 0.0,
         "mean_absolute_displacement_m": float(np.mean(np.abs(delta))) if delta.size else 0.0,
-        "area_weighted_mean_displacement_m": weighted_mean,
         "zero_mean_displacement": bool(cfg.zero_mean_displacement),
+        **constraint_meta,
         "mass_semantics": (
             "area-zero-mean geometric displacement when enabled; this is a volume "
             "closure constraint for the procedural layer, not grain-resolved sediment "
