@@ -46,6 +46,47 @@ def _hash01(ix: np.ndarray, iy: np.ndarray, iz: np.ndarray, seed: int, salt: int
     return mantissa.astype(np.float64) * (1.0 / 9007199254740992.0)
 
 
+
+def _validated_field(name: str, values: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    out = np.asarray(values, dtype=np.float64)
+    if out.shape != shape:
+        raise ValueError(f"{name} must have shape {shape}, got {out.shape}")
+    if not np.isfinite(out).all():
+        raise ValueError(f"{name} must contain only finite values")
+    return out
+
+
+def _pow_inv(values: np.ndarray, power: np.ndarray | float) -> np.ndarray:
+    """Complement-power-complement mapping used by stacked erosion masks."""
+    x = np.clip(np.asarray(values, dtype=np.float64), 0.0, 1.0)
+    p = np.maximum(np.asarray(power, dtype=np.float64), 0.0)
+    return 1.0 - np.power(1.0 - x, p)
+
+
+def _ease_out(values: np.ndarray) -> np.ndarray:
+    x = np.clip(np.asarray(values, dtype=np.float64), 0.0, 1.0)
+    inv = 1.0 - x
+    return 1.0 - inv * inv
+
+
+def _smooth_start(values: np.ndarray, smoothing: np.ndarray) -> np.ndarray:
+    """Quadratic onset transitioning to a linear ramp without a derivative jump."""
+    t = np.maximum(np.asarray(values, dtype=np.float64), 0.0)
+    s = np.maximum(np.asarray(smoothing, dtype=np.float64), 0.0)
+    safe = np.maximum(s, 1.0e-12)
+    curved = 0.5 * t * t / safe
+    linear = t - 0.5 * s
+    smoothed = np.where(t >= s, linear, curved)
+    return np.where(s <= 1.0e-12, t, smoothed)
+
+
+def _slope_mask(slope_ratio: np.ndarray, onset: float, rounding: np.ndarray) -> np.ndarray:
+    o = max(float(onset), 0.0)
+    scaled = np.maximum(np.asarray(slope_ratio, dtype=np.float64), 0.0) * o
+    smoothing = np.clip(np.asarray(rounding, dtype=np.float64), 0.0, 1.0) * o
+    return _ease_out(_smooth_start(scaled, smoothing))
+
+
 def _unit_positions(grid) -> np.ndarray:
     lat = np.deg2rad(np.asarray(grid.lat, dtype=np.float64))
     lon = np.deg2rad(np.asarray(grid.lon, dtype=np.float64))
@@ -83,12 +124,21 @@ def phase_cell_octave_xyz(
     cell_scale: float,
     seed: int,
     octave: int,
+    normalization: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Evaluate one seamless 3-D phase-cell octave on arbitrary planet positions."""
+    """Evaluate one seamless 3-D phase-cell octave on arbitrary planet positions.
+
+    normalization is in [0, 1]. One preserves the former full phase-vector
+    normalization; lower values retain amplitude information in low-coherence
+    regions. The high-level advanced filter uses 0.5 by default.
+    """
     normal = np.asarray(unit_xyz, dtype=np.float64)
     perp = np.asarray(perpendicular_xyz, dtype=np.float64)
     if normal.shape != perp.shape or normal.shape[-1] != 3:
         raise ValueError("unit_xyz and perpendicular_xyz must have identical (...,3) shape")
+    norm_parameter = float(normalization)
+    if not np.isfinite(norm_parameter) or not 0.0 <= norm_parameter <= 1.0:
+        raise ValueError("normalization must be finite and in [0,1]")
     pn = np.linalg.norm(perp, axis=-1, keepdims=True)
     perp = np.divide(perp, np.maximum(pn, 1.0e-15))
     xyz = normal * float(radius_km)
@@ -133,8 +183,13 @@ def phase_cell_octave_xyz(
                 wsum += w
 
     magnitude = np.hypot(csum, ssum)
-    cosine = np.divide(csum, np.maximum(magnitude, 1.0e-12))
-    sine = np.divide(ssum, np.maximum(magnitude, 1.0e-12))
+    denominator = np.maximum(
+        magnitude,
+        (1.0 - norm_parameter) * np.maximum(wsum, 1.0e-12),
+    )
+    denominator = np.maximum(denominator, 1.0e-12)
+    cosine = csum / denominator
+    sine = ssum / denominator
     coherence = np.divide(magnitude, np.maximum(wsum, 1.0e-12))
     return cosine, sine, np.clip(coherence, 0.0, 1.0)
 
@@ -167,32 +222,171 @@ def _rounded_profile(c: np.ndarray, ridge_rounding: np.ndarray, crease_rounding:
     return np.sign(c) * shaped
 
 
-def apply_procedural_erosion(grid, terrain, forcing: ErosionForcing, cfg, *, seed: int) -> ProceduralErosionResult:
-    shape = terrain.elevation_km.shape
-    direction_s = np.asarray(forcing.orientation_south, dtype=np.float64).copy()
-    direction_e = np.asarray(forcing.orientation_east, dtype=np.float64).copy()
-    strength = np.asarray(forcing.strength, dtype=np.float64)
-    detail = np.asarray(forcing.detail, dtype=np.float64)
-    target = np.asarray(forcing.ridge_valley_target, dtype=np.float64)
-    ridge_round = np.asarray(forcing.ridge_rounding, dtype=np.float64)
-    crease_round = np.asarray(forcing.crease_rounding, dtype=np.float64)
+def _bounded_area_zero_mean(
+    values: np.ndarray,
+    active: np.ndarray,
+    weights: np.ndarray,
+    limit: float,
+) -> np.ndarray:
+    """Clip while solving a scalar offset that preserves active-cell area mean."""
+    out = np.asarray(values, dtype=np.float64).copy()
+    if not np.any(active):
+        out[...] = 0.0
+        return out
+    lim = max(float(limit), 0.0)
+    if lim == 0.0:
+        out[...] = 0.0
+        return out
+    vals = out[active]
+    w = np.asarray(weights, dtype=np.float64)[active]
+    lo = float(np.min(vals) - lim)
+    hi = float(np.max(vals) + lim)
+    for _ in range(48):
+        mid = 0.5 * (lo + hi)
+        mean = float(np.average(np.clip(vals - mid, -lim, lim), weights=w))
+        if mean > 0.0:
+            lo = mid
+        else:
+            hi = mid
+    offset = 0.5 * (lo + hi)
+    out[active] = np.clip(vals - offset, -lim, lim)
+    out[~active] = 0.0
+    return out
+
+
+def apply_procedural_erosion(
+    grid,
+    terrain,
+    forcing: ErosionForcing,
+    cfg,
+    *,
+    seed: int,
+) -> ProceduralErosionResult:
+    """Apply the environment-conditioned spherical advanced phase-cell filter."""
+    elevation = np.asarray(terrain.elevation_km, dtype=np.float64)
+    shape = elevation.shape
+    if shape != tuple(grid.shape):
+        raise ValueError(f"terrain elevation must have grid shape {grid.shape}, got {shape}")
+    if not np.isfinite(elevation).all():
+        raise ValueError("terrain elevation must contain only finite values")
+
+    strength = np.clip(_validated_field("forcing.strength", forcing.strength, shape), 0.0, None)
+    preferred_scale = _validated_field(
+        "forcing.preferred_scale_km", forcing.preferred_scale_km, shape
+    )
+    if np.any(preferred_scale <= 0.0):
+        raise ValueError("forcing.preferred_scale_km must be positive")
+    environmental_detail = np.clip(
+        _validated_field("forcing.detail", forcing.detail, shape), 0.0, 1.0
+    )
+    target = np.clip(
+        _validated_field("forcing.ridge_valley_target", forcing.ridge_valley_target, shape),
+        -1.0,
+        1.0,
+    )
+    fallback_s = _validated_field(
+        "forcing.orientation_south", forcing.orientation_south, shape
+    )
+    fallback_e = _validated_field(
+        "forcing.orientation_east", forcing.orientation_east, shape
+    )
+    fallback_norm = np.hypot(fallback_s, fallback_e)
+    fallback_s = np.divide(
+        fallback_s, np.maximum(fallback_norm, 1.0e-12), out=np.zeros_like(fallback_s)
+    )
+    fallback_e = np.divide(
+        fallback_e, np.maximum(fallback_norm, 1.0e-12), out=np.ones_like(fallback_e)
+    )
+    ridge_round = np.clip(
+        _validated_field("forcing.ridge_rounding", forcing.ridge_rounding, shape), 0.0, 1.0
+    )
+    crease_round = np.clip(
+        _validated_field("forcing.crease_rounding", forcing.crease_rounding, shape), 0.0, 1.0
+    )
 
     delta = np.zeros(shape, dtype=np.float64)
     coherence_max = np.zeros(shape, dtype=np.float64)
     ridge_map = np.zeros(shape, dtype=np.float64)
     crease_map = np.zeros(shape, dtype=np.float64)
-    mask = np.zeros(shape, dtype=np.float64)
+
+    slope_s, slope_e = grid.ops.metric_gradient(elevation)
+    slope_length = np.hypot(slope_s, slope_e)
+    slope_reference = max(float(getattr(cfg, "slope_reference", 0.08)), 1.0e-12)
+    slope_ratio = slope_length / slope_reference
+
+    actual_s = slope_s / slope_reference
+    actual_e = slope_e / slope_reference
+    actual_norm = np.hypot(actual_s, actual_e)
+    unit_s = np.divide(
+        actual_s,
+        np.maximum(actual_norm, 1.0e-12),
+        out=-fallback_s.copy(),
+        where=actual_norm > 1.0e-12,
+    )
+    unit_e = np.divide(
+        actual_e,
+        np.maximum(actual_norm, 1.0e-12),
+        out=-fallback_e.copy(),
+        where=actual_norm > 1.0e-12,
+    )
+    assumed_slope = max(float(getattr(cfg, "assumed_slope", 0.70)), 0.0)
+    assumed_blend = float(np.clip(getattr(cfg, "assumed_slope_blend", 1.0), 0.0, 1.0))
+    gully_s = (1.0 - assumed_blend) * actual_s + assumed_blend * assumed_slope * unit_s
+    gully_e = (1.0 - assumed_blend) * actual_e + assumed_blend * assumed_slope * unit_e
+
+    initial_rounding = np.where(target >= 0.0, ridge_round, crease_round)
+    initial_rounding *= max(float(getattr(cfg, "rounding_initial_multiplier", 0.10)), 0.0)
+    combi_mask = _slope_mask(
+        slope_ratio,
+        float(getattr(cfg, "initial_onset", 1.25)),
+        initial_rounding,
+    )
+    ridge_map_combi_mask = _ease_out(
+        slope_ratio * max(float(getattr(cfg, "ridge_map_initial_onset", 2.8)), 0.0)
+    )
+    fade_target = target.copy()
+    ridge_map_fade_target = target.copy()
+    rounding_multiplier = 1.0
 
     octaves = int(cfg.octaves)
-    cos_lat = np.maximum(np.cos(np.deg2rad(np.asarray(grid.lat, dtype=np.float64))), 1.0e-6)
+    cos_lat = np.maximum(
+        np.cos(np.deg2rad(np.asarray(grid.lat, dtype=np.float64))), 1.0e-6
+    )
     dx_km = float(grid.radius_km) * float(grid.dlon_rad) * cos_lat
     sample_km = np.maximum(float(grid.dy_km), dx_km)
     executed_octaves = 0
+
+    phase_normalization = float(getattr(cfg, "phase_normalization", 0.5))
+    gully_weight = float(getattr(cfg, "gully_weight", 0.5))
+    if not 0.0 < gully_weight <= 1.0:
+        raise ValueError("cfg.gully_weight must be in (0,1]")
+    detail_power = max(float(getattr(cfg, "detail_power", 1.5)), 0.0)
+    fade_target_strength = float(cfg.fade_target_strength)
+    steering_strength = float(cfg.steering_strength)
+    rounding_octave_multiplier = max(
+        float(getattr(cfg, "rounding_octave_multiplier", 2.0)), 0.0
+    )
+
     for octave in range(octaves):
-        wavelength = np.asarray(forcing.preferred_scale_km, dtype=np.float64) / (float(cfg.lacunarity) ** octave)
+        wavelength = preferred_scale / (float(cfg.lacunarity) ** octave)
         resolved = wavelength >= float(cfg.min_samples_per_wavelength) * sample_km
         if not np.any(resolved & (strength > 1.0e-6)):
             break
+
+        gully_norm = np.hypot(gully_s, gully_e)
+        direction_s = np.divide(
+            gully_s,
+            np.maximum(gully_norm, 1.0e-12),
+            out=-fallback_s.copy(),
+            where=gully_norm > 1.0e-12,
+        )
+        direction_e = np.divide(
+            gully_e,
+            np.maximum(gully_norm, 1.0e-12),
+            out=-fallback_e.copy(),
+            where=gully_norm > 1.0e-12,
+        )
+
         c, s, coherence = _phase_cell_octave(
             grid,
             wavelength,
@@ -201,65 +395,134 @@ def apply_procedural_erosion(grid, terrain, forcing: ErosionForcing, cfg, *, see
             cell_scale=float(cfg.cell_scale),
             seed=int(seed),
             octave=octave,
+            normalization=phase_normalization,
         )
         coherence = coherence * resolved
-        profile = _rounded_profile(c, ridge_round, crease_round)
-        mask = 1.0 - (1.0 - mask) * (1.0 - np.clip(coherence * detail, 0.0, 1.0))
-        visible = mask * profile + (1.0 - mask) * float(cfg.fade_target_strength) * target
+        c = c * resolved
+        s = s * resolved
 
-        spectral_detail = 0.70 + 0.30 * detail * (octave / max(octaves - 1, 1))
+        profile = c
+        faded_profile = (
+            combi_mask * (gully_weight * profile)
+            + (1.0 - combi_mask) * fade_target_strength * fade_target
+        )
+        spectral_detail = 0.70 + 0.30 * environmental_detail * (
+            octave / max(octaves - 1, 1)
+        )
         amplitude = (
             float(cfg.base_amplitude_m)
             * (float(cfg.gain) ** octave)
             * strength
             * spectral_detail
+            / gully_weight
         )
-        delta += amplitude * visible
-        coherence_max = np.maximum(coherence_max, coherence)
-        ridge_map = np.maximum(ridge_map, np.clip(profile, 0.0, 1.0) * coherence)
-        crease_map = np.maximum(crease_map, np.clip(-profile, 0.0, 1.0) * coherence)
+        delta += amplitude * faded_profile
 
-        # Recursive line-field steering: orientation is axial, so a signed phase
-        # perturbation rotates the local tangent direction without introducing a
-        # downhill/uphill sign discontinuity.
-        turn = (
-            float(cfg.steering_strength)
+        coherence_max = np.maximum(coherence_max, coherence)
+        ridge_map = np.maximum(
+            ridge_map, np.clip(profile, 0.0, 1.0) * coherence * combi_mask
+        )
+        crease_map = np.maximum(
+            crease_map, np.clip(-profile, 0.0, 1.0) * coherence * combi_mask
+        )
+
+        # Straight-gully steering follows the sign of the phase derivative rather
+        # than its sinusoidal magnitude; the additive lateral component is the
+        # spherical analogue of the advanced filter's recursive internal slope.
+        side_s = -direction_e
+        side_e = direction_s
+        steer = (
+            steering_strength
             * np.sign(s)
             * coherence
-            * detail
+            * environmental_detail
             * (float(cfg.gain) ** octave)
+            * gully_weight
         )
-        ct = np.cos(turn)
-        st = np.sin(turn)
-        new_s = direction_s * ct - direction_e * st
-        new_e = direction_s * st + direction_e * ct
-        norm = np.hypot(new_s, new_e)
-        direction_s = np.divide(new_s, np.maximum(norm, 1.0e-12))
-        direction_e = np.divide(new_e, np.maximum(norm, 1.0e-12))
+        gully_s += steer * side_s
+        gully_e += steer * side_e
+
+        sloping = np.abs(s)
+        rounding_for_octave = np.where(profile >= 0.0, ridge_round, crease_round)
+        rounding_for_octave *= rounding_multiplier
+        new_mask = _slope_mask(
+            sloping,
+            float(getattr(cfg, "octave_onset", 1.25)),
+            rounding_for_octave,
+        )
+        local_detail_power = detail_power * (0.45 + 0.55 * environmental_detail)
+        combi_mask = _pow_inv(combi_mask, local_detail_power) * new_mask
+
+        ridge_map_fade_target = (
+            (1.0 - ridge_map_combi_mask) * ridge_map_fade_target
+            + ridge_map_combi_mask * profile
+        )
+        new_ridge_mask = _ease_out(
+            sloping * max(float(getattr(cfg, "ridge_map_octave_onset", 1.5)), 0.0)
+        )
+        ridge_map_combi_mask *= new_ridge_mask
+        fade_target = faded_profile
+        rounding_multiplier *= rounding_octave_multiplier
         executed_octaves += 1
 
+    ridge_signal = ridge_map_fade_target * (1.0 - ridge_map_combi_mask)
+    ridge_map = np.maximum(ridge_map, np.clip(ridge_signal, 0.0, 1.0))
+    crease_map = np.maximum(crease_map, np.clip(-ridge_signal, 0.0, 1.0))
+
     active = strength > 1.0e-6
-    if bool(cfg.zero_mean_displacement) and np.any(active):
-        weights = np.asarray(grid.cell_area_weights, dtype=np.float64)
-        mean = float(np.average(delta[active], weights=weights[active]))
-        delta[active] -= mean
-    delta[~active] = 0.0
     limit = float(cfg.max_displacement_m)
-    delta = np.clip(delta, -limit, limit)
+    if bool(cfg.zero_mean_displacement):
+        delta = _bounded_area_zero_mean(
+            delta,
+            active,
+            np.asarray(grid.cell_area_weights, dtype=np.float64),
+            limit,
+        )
+    else:
+        delta[~active] = 0.0
+        delta = np.clip(delta, -limit, limit)
+
+    weighted_mean = 0.0
+    if np.any(active):
+        weighted_mean = float(
+            np.average(
+                delta[active],
+                weights=np.asarray(grid.cell_area_weights, dtype=np.float64)[active],
+            )
+        )
 
     metadata = {
-        "model": "seamless 3-D phase-cell procedural erosion with environment forcing and recursive tangent-line steering",
+        "model": (
+            "seamless 3-D phase-cell procedural erosion with partial phase "
+            "normalization, stacked slope masks and environment forcing"
+        ),
+        "algorithm_lineage": (
+            "spherical NumPy adaptation of the advanced phase-cell/Phacelle "
+            "erosion-filter principles described by Runevision"
+        ),
         "octaves_requested": octaves,
         "octaves_executed": executed_octaves,
         "min_samples_per_wavelength": float(cfg.min_samples_per_wavelength),
         "lacunarity": float(cfg.lacunarity),
         "gain": float(cfg.gain),
         "cell_scale": float(cfg.cell_scale),
+        "phase_normalization": phase_normalization,
+        "gully_weight": gully_weight,
+        "detail_power": detail_power,
+        "slope_reference": slope_reference,
+        "assumed_slope": assumed_slope,
+        "assumed_slope_blend": assumed_blend,
         "base_amplitude_m": float(cfg.base_amplitude_m),
         "max_displacement_m": limit,
         "max_absolute_displacement_m": float(np.max(np.abs(delta))) if delta.size else 0.0,
         "mean_absolute_displacement_m": float(np.mean(np.abs(delta))) if delta.size else 0.0,
+        "area_weighted_mean_displacement_m": weighted_mean,
         "zero_mean_displacement": bool(cfg.zero_mean_displacement),
+        "mass_semantics": (
+            "area-zero-mean geometric displacement when enabled; this is a volume "
+            "closure constraint for the procedural layer, not grain-resolved sediment "
+            "mass conservation"
+        ),
     }
     return ProceduralErosionResult(
         delta_height_m=np.asarray(delta, np.float32),
@@ -267,7 +530,7 @@ def apply_procedural_erosion(grid, terrain, forcing: ErosionForcing, cfg, *, see
         ridge_map=np.asarray(ridge_map, np.float32),
         crease_map=np.asarray(crease_map, np.float32),
         effective_strength=np.asarray(strength, np.float32),
-        effective_scale_km=np.asarray(forcing.preferred_scale_km, np.float32),
+        effective_scale_km=np.asarray(preferred_scale, np.float32),
         metadata=metadata,
     )
 
