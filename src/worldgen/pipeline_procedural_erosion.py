@@ -10,6 +10,7 @@ import numpy as np
 from . import pipeline_base as _base
 from .appearance_advanced import attenuate_deep_bathymetry
 from .appearance_planetary import apply_composition_aware_appearance
+from .atmogen_coupler import solve_representative_columns
 from .condensate_pipeline import install_multicondensate_hydrology
 from .erosion_forcing import build_erosion_forcing
 from .pipeline_geomorphology import WorldPipeline as _GeomorphologyWorldPipeline
@@ -35,7 +36,7 @@ class WorldPipeline(_GeomorphologyWorldPipeline):
                 terrain,
                 c.ocean,
                 c.terrain,
-                self.rng("procedural-erosion-ocean"),
+                self.rng("ocean-stationary"),
                 previous_climate.wind_u,
                 previous_climate.wind_v,
                 c.noise,
@@ -51,11 +52,42 @@ class WorldPipeline(_GeomorphologyWorldPipeline):
                 ocean,
                 c.climate,
                 c.terrain,
-                self.rng("procedural-erosion-climate"),
+                self.rng("climate-stationary"),
                 c.noise,
                 None,
             ),
         )
+        if bool(c.atmogen.enabled) and bool(c.atmogen.representative_columns_enabled):
+            columns = self._stage(
+                "atmogen_columns_post_procedural_erosion",
+                lambda: solve_representative_columns(
+                    grid=grid,
+                    astronomy_result=world["astronomy"],
+                    climate_result=climate,
+                    world_config=c,
+                    terrain_result=terrain,
+                ),
+            )
+            climate = self._stage(
+                "climate_post_procedural_erosion_atmogen_corrected",
+                lambda: _base.build_climate(
+                    grid,
+                    world["astronomy"],
+                    terrain,
+                    ocean,
+                    c.climate,
+                    c.terrain,
+                    self.rng("climate-stationary"),
+                    c.noise,
+                    None,
+                    temperature_correction=columns.temperature_correction_c,
+                ),
+            )
+            world["atmogen_representative_columns"] = {
+                "diagnostics": dict(columns.diagnostics),
+                "summaries": columns.summaries,
+            }
+
         geology = self._stage(
             "geology_post_procedural_erosion",
             lambda: _base.build_geology(
@@ -64,7 +96,7 @@ class WorldPipeline(_GeomorphologyWorldPipeline):
                 terrain,
                 ocean,
                 climate,
-                self.rng("procedural-erosion-geology"),
+                self.rng("geology-stationary"),
                 c.noise,
                 None,
             ),
@@ -90,7 +122,7 @@ class WorldPipeline(_GeomorphologyWorldPipeline):
                 climate,
                 hydrology,
                 c.weather,
-                self.rng("procedural-erosion-weather"),
+                self.rng("weather"),
             ),
         )
         appearance = self._stage(
@@ -117,7 +149,7 @@ class WorldPipeline(_GeomorphologyWorldPipeline):
                 hydrology,
                 geology,
                 c.resources,
-                self.rng("procedural-erosion-resources"),
+                self.rng("resources"),
             ),
         )
         society = self._stage(
@@ -130,7 +162,7 @@ class WorldPipeline(_GeomorphologyWorldPipeline):
                 resources,
                 weather,
                 c.society,
-                self.rng("procedural-erosion-society"),
+                self.rng("society"),
                 appearance,
             ),
         )
