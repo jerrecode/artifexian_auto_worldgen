@@ -199,6 +199,7 @@ class WorldPipeline(_GeomorphologyWorldPipeline):
                 cfg,
                 condensate_hydrology=world.get("condensate_hydrology"),
                 cryogeology=world.get("cryogeology"),
+                surface_liquids=world.get("surface_liquids"),
             ),
         )
         result = self._stage(
@@ -369,6 +370,7 @@ class WorldPipeline(_GeomorphologyWorldPipeline):
         return report + "\n\n## Environment-conditioned procedural erosion\n\n" + (
             f"- Seamless 3-D phase-cell octaves executed: {m['octaves_executed']} of {m['octaves_requested']}; maximum absolute displacement {m['max_absolute_displacement_m']:.3f} m.\n"
             f"- Dominant liquid condensate for mechanical scaling: {f['dominant_condensate']}; spherical-mean fluid multiplier {f['fluid_mechanical_factor']:.3f} (range {f['fluid_mechanical_factor_min']:.3f}–{f['fluid_mechanical_factor_max']:.3f}).\n"
+            f"- Standing surface-liquid marine scaling: {f['marine_fluid_dominant_species']} via {f['marine_fluid_property_source']}; marine fluid multiplier {f['marine_fluid_mechanical_factor']:.3f}.\n"
             f"- Canonical dependency recoupling: {bool(self.cfg.procedural_erosion.recouple_after_canonical_pass)}.\n"
             "- The procedural layer supplies deterministic unresolved morphology; physical runoff, sediment routing, glacial/coastal processes and volatile mass conservation remain owned by their dedicated solvers.\n"
         )
