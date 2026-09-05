@@ -17,72 +17,13 @@ import math
 import numpy as np
 
 from .drainage import DrainageGraph
-from .watersheds import WatershedHierarchy
-from .mathops import optional_njit
-
-
-@optional_njit(cache=True)
-def _inherit_downstream_seed_kernel(receiver, order, seed_label, land):
-    out = seed_label.copy()
-    for kk in range(order.size - 1, -1, -1):
-        node = order[kk]
-        if not land[node] or out[node] != 0:
-            continue
-        nxt = receiver[node]
-        if nxt >= 0 and land[nxt]:
-            out[node] = out[nxt]
-    return out
-
-
-@optional_njit(cache=True)
-def _distance_to_outlet_kernel(receiver, order, edge_km, land):
-    out = np.zeros(receiver.size, dtype=np.float64)
-    for kk in range(order.size - 1, -1, -1):
-        node = order[kk]
-        if not land[node]:
-            continue
-        nxt = receiver[node]
-        if nxt >= 0 and land[nxt]:
-            out[node] = edge_km[node] + out[nxt]
-        elif nxt >= 0:
-            out[node] = edge_km[node]
-    return out
-
-
-@optional_njit(cache=True)
-def _hand_kernel(receiver, order, elevation_m, land, channel):
-    reference = np.empty(receiver.size, dtype=np.float64)
-    reference[:] = np.nan
-    for node in range(receiver.size):
-        if channel[node]:
-            reference[node] = elevation_m[node]
-    for kk in range(order.size - 1, -1, -1):
-        node = order[kk]
-        if not land[node] or channel[node]:
-            continue
-        nxt = receiver[node]
-        if nxt >= 0 and land[nxt] and np.isfinite(reference[nxt]):
-            reference[node] = reference[nxt]
-        elif nxt >= 0 and not land[nxt]:
-            reference[node] = 0.0
-    out = np.zeros(receiver.size, dtype=np.float64)
-    for node in range(receiver.size):
-        if land[node] and np.isfinite(reference[node]):
-            d = elevation_m[node] - reference[node]
-            out[node] = d if d > 0.0 else 0.0
-    return out
-
-
-def _edge_length_km(grid, receiver):
-    recv = np.asarray(receiver, np.int64).ravel()
-    src = np.arange(recv.size, dtype=np.int64)
-    good = recv >= 0
-    out = np.zeros(recv.size, dtype=np.float64)
-    if np.any(good):
-        xyz = np.asarray(grid.xyz, float).reshape(-1, 3)
-        dot = np.sum(xyz[src[good]] * xyz[recv[good]], axis=1)
-        out[good] = float(grid.radius_km) * np.arccos(np.clip(dot, -1.0, 1.0))
-    return out
+from .watersheds import (
+    WatershedHierarchy,
+    _distance_to_outlet_kernel,
+    _edge_length_km,
+    _hand_kernel,
+    _inherit_downstream_seed_kernel,
+)
 
 
 def _raw_outlet_labels(graph: DrainageGraph, land: np.ndarray):
@@ -110,7 +51,6 @@ def _major_basin_aggregation(
     raw,
     outlet_nodes,
     land,
-    drainage_area_km2,
     exorheic,
 ):
     """Merge minor coastal outlet catchments into nearby major drainage systems.
@@ -168,19 +108,17 @@ def _major_basin_aggregation(
         mapping[lab] = next_major
         next_major += 1
 
+    label_nodes = outlet_for_label[present_labels]
+    label_components = np.full(present_labels.shape, -1, dtype=np.int32)
+    valid_nodes = label_nodes >= 0
+    label_components[valid_nodes] = comp_flat[label_nodes[valid_nodes]]
+    label_is_exorheic = exorheic_label[present_labels]
+
     for comp in range(1, int(ncomp) + 1):
-        labels = []
-        for lab in present_labels:
-            node = outlet_for_label[lab]
-            if (
-                node >= 0
-                and comp_flat[node] == comp
-                and exorheic_label[int(lab)]
-            ):
-                labels.append(int(lab))
-        if not labels:
+        select = (label_components == comp) & label_is_exorheic
+        labs = present_labels[select].astype(np.int32, copy=False)
+        if labs.size == 0:
             continue
-        labs = np.asarray(labels, dtype=np.int32)
         comp_area = float(np.sum(raw_area[labs]))
         target_n = max(1, int(math.ceil(comp_area / target_anchor_area_km2)))
         target_n = min(target_n, 256)
@@ -279,7 +217,7 @@ def build_watershed_hierarchy_natural(
     lf = np.asarray(land, bool).ravel()
     raw, exorheic, outlet, outlet_nodes = _raw_outlet_labels(graph, land)
     basin, aggregation_meta = _major_basin_aggregation(
-        grid, raw, outlet_nodes, land, drainage_area_km2, exorheic
+        grid, raw, outlet_nodes, land, exorheic
     )
 
     t1, t2, t3 = (max(float(v), 1.0) for v in subbasin_thresholds_km2)
