@@ -116,7 +116,16 @@ def build_erosion_forcing(
     shape = terrain.elevation_km.shape
     land = np.asarray(terrain.land, dtype=bool)
     ocean_mask = np.asarray(terrain.ocean, dtype=bool)
-    rock = np.asarray(getattr(geology, "bedrock_code", geology.rock_code), dtype=np.int64)
+    rock_codes = getattr(geology, "bedrock_code", None)
+    if rock_codes is None:
+        rock_codes = getattr(geology, "rock_code", None)
+    if rock_codes is None:
+        raise ValueError("geology must provide bedrock_code or rock_code for erosion forcing")
+    rock = np.asarray(rock_codes, dtype=np.int64)
+    if rock.shape != shape:
+        raise ValueError(
+            f"geology rock-code field shape {rock.shape} does not match terrain shape {shape}"
+        )
     lith = properties_for_codes(rock)
 
     soil = np.asarray(getattr(hydrology, "soil_water_storage_mm", np.zeros(shape)), dtype=np.float64)
