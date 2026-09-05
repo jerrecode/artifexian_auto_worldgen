@@ -12,7 +12,7 @@ import numpy as np
 import atmogen
 
 
-ATMOGEN_COMPATIBLE_REVISION = "7ef2fc93f784695fff36a7e4dafad7dd6d56c269"
+ATMOGEN_COMPATIBLE_REVISION = "caf747f24f30e3c015fbcb60661effd08af505bd"
 
 
 def atmogen_runtime_metadata() -> dict[str, Any]:
@@ -31,9 +31,20 @@ def atmogen_runtime_metadata() -> dict[str, Any]:
 
 
 def _normalize(values: Mapping[str, float]) -> dict[str, float]:
-    positive = {
-        str(key): float(value) for key, value in values.items() if float(value) > 0
-    }
+    positive: dict[str, float] = {}
+    for raw_key, raw_value in values.items():
+        key = str(raw_key)
+        value = float(raw_value)
+        if not key or not np.isfinite(value) or value < 0.0:
+            raise ValueError(
+                "atmosphere composition entries must be finite and non-negative"
+            )
+        if value > 0.0:
+            if key in positive:
+                raise ValueError(
+                    "duplicate atmosphere composition key after string normalization"
+                )
+            positive[key] = value
     total = sum(positive.values())
     if total <= 0:
         raise ValueError("atmosphere composition must contain a positive amount")
