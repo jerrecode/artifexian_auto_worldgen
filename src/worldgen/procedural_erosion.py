@@ -167,6 +167,73 @@ def _rounded_profile(c: np.ndarray, ridge_rounding: np.ndarray, crease_rounding:
     return np.sign(c) * shaped
 
 
+
+def _finalize_displacement(
+    delta: np.ndarray,
+    active: np.ndarray,
+    weights: np.ndarray,
+    *,
+    zero_mean: bool,
+    limit_m: float,
+) -> tuple[np.ndarray, dict[str, float | str]]:
+    """Apply the displacement cap without violating the configured mean invariant.
+
+    A cellwise clip after mean removal can introduce a new non-zero weighted mean
+    whenever positive and negative extrema saturate asymmetrically. When zero-mean
+    displacement is requested we therefore remove the weighted mean first and,
+    if needed, apply one uniform scale factor to the whole active field. Uniform
+    scaling preserves both the morphology and a zero weighted mean in float64
+    arithmetic while enforcing the same absolute cap.
+    """
+    out = np.asarray(delta, dtype=np.float64).copy()
+    mask = np.asarray(active, dtype=bool)
+    area = np.asarray(weights, dtype=np.float64)
+    if out.shape != mask.shape or out.shape != area.shape:
+        raise ValueError("delta, active mask and cell-area weights must have identical shape")
+    if not np.isfinite(out).all():
+        raise ValueError("procedural displacement contains non-finite values before constraints")
+    if not np.isfinite(area).all() or np.any(area < 0.0):
+        raise ValueError("cell-area weights must be finite and non-negative")
+    if not np.isfinite(limit_m) or limit_m < 0.0:
+        raise ValueError("displacement limit must be finite and non-negative")
+
+    out[~mask] = 0.0
+    scale_factor = 1.0
+    limiter = "cellwise_clip"
+    prelimit_max = float(np.max(np.abs(out[mask]))) if np.any(mask) else 0.0
+
+    if np.any(mask) and zero_mean:
+        active_weights = area[mask]
+        weight_sum = float(np.sum(active_weights))
+        if not np.isfinite(weight_sum) or weight_sum <= 0.0:
+            raise ValueError("active cell-area weights must have a positive finite sum")
+        weighted_mean = float(np.sum(out[mask] * active_weights) / weight_sum)
+        out[mask] -= weighted_mean
+
+        centered_max = float(np.max(np.abs(out[mask])))
+        if centered_max > limit_m and centered_max > 0.0:
+            scale_factor = float(limit_m / centered_max)
+            out[mask] *= scale_factor
+            limiter = "uniform_rescale"
+        else:
+            limiter = "none"
+    else:
+        np.clip(out, -limit_m, limit_m, out=out)
+
+    out[~mask] = 0.0
+    post_mean = 0.0
+    if np.any(mask):
+        active_weights = area[mask]
+        post_mean = float(np.sum(out[mask] * active_weights) / np.sum(active_weights))
+
+    return out, {
+        "displacement_limiter": limiter,
+        "displacement_scale_factor": scale_factor,
+        "preconstraint_max_absolute_displacement_m": prelimit_max,
+        "area_weighted_mean_displacement_m": post_mean,
+    }
+
+
 def apply_procedural_erosion(grid, terrain, forcing: ErosionForcing, cfg, *, seed: int) -> ProceduralErosionResult:
     shape = terrain.elevation_km.shape
     direction_s = np.asarray(forcing.orientation_south, dtype=np.float64).copy()
@@ -239,13 +306,14 @@ def apply_procedural_erosion(grid, terrain, forcing: ErosionForcing, cfg, *, see
         executed_octaves += 1
 
     active = strength > 1.0e-6
-    if bool(cfg.zero_mean_displacement) and np.any(active):
-        weights = np.asarray(grid.cell_area_weights, dtype=np.float64)
-        mean = float(np.average(delta[active], weights=weights[active]))
-        delta[active] -= mean
-    delta[~active] = 0.0
     limit = float(cfg.max_displacement_m)
-    delta = np.clip(delta, -limit, limit)
+    delta, constraint_meta = _finalize_displacement(
+        delta,
+        active,
+        np.asarray(grid.cell_area_weights, dtype=np.float64),
+        zero_mean=bool(cfg.zero_mean_displacement),
+        limit_m=limit,
+    )
 
     metadata = {
         "model": "seamless 3-D phase-cell procedural erosion with environment forcing and recursive tangent-line steering",
@@ -260,6 +328,7 @@ def apply_procedural_erosion(grid, terrain, forcing: ErosionForcing, cfg, *, see
         "max_absolute_displacement_m": float(np.max(np.abs(delta))) if delta.size else 0.0,
         "mean_absolute_displacement_m": float(np.mean(np.abs(delta))) if delta.size else 0.0,
         "zero_mean_displacement": bool(cfg.zero_mean_displacement),
+        **constraint_meta,
     }
     return ProceduralErosionResult(
         delta_height_m=np.asarray(delta, np.float32),
