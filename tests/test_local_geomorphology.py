@@ -5,6 +5,7 @@ import json
 import numpy as np
 
 from worldgen.local_geomorphology import LocalGeomorphologySolver
+from worldgen.local_hydrology import _sample_area_km2
 from worldgen.planet_tiles import PlanetTilePyramid, TileKey, TilePyramidSpec, tile_geometry
 from worldgen.river_constraints import RiverConstraintGenerator
 
@@ -97,6 +98,12 @@ def test_local_geomorphology_is_watertight_mass_accounted_and_river_constrained(
     exported = float(result.metadata["exported_sediment_volume_m3"])
     assert eroded >= 0 and deposited >= 0 and exported >= 0
     assert abs(eroded - deposited - exported) <= max(eroded, 1.0) * 1e-12
+    detail = np.asarray(result.procedural_detail_m, dtype=np.float64)
+    geom = tile_geometry(key, 16)
+    area_m2 = _sample_area_km2(geom.xyz, pyramid.planet_radius_m) * 1.0e6
+    detail_mean = float(np.sum(detail * area_m2) / np.sum(area_m2))
+    assert abs(detail_mean) <= 1.0e-6
+    assert abs(float(result.metadata["procedural_area_weighted_mean_m"])) <= 1.0e-12
     assert result.metadata["procedural_semantics"].startswith("zero-area-mean")
     assert result.metadata["procedural_octaves_executed"] >= 1
 

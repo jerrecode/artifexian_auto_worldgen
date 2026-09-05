@@ -3,20 +3,28 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from worldgen.config import ProceduralErosionConfig
 from worldgen.erosion_forcing import ErosionForcing
 from worldgen.grid import SphereGrid
-from worldgen.procedural_erosion import apply_procedural_erosion
+from worldgen.procedural_erosion import (
+    apply_procedural_erosion,
+    phase_cell_octave_xyz,
+)
 
 
-def _forcing(grid: SphereGrid, strength: float = 1.0) -> ErosionForcing:
+def _forcing(
+    grid: SphereGrid,
+    strength: float = 1.0,
+    preferred_scale_km: float = 4000.0,
+) -> ErosionForcing:
     shape = grid.shape
     ones = np.ones(shape, dtype=np.float32)
     zeros = np.zeros(shape, dtype=np.float32)
     return ErosionForcing(
         strength=ones * strength,
-        preferred_scale_km=ones * 4000.0,
+        preferred_scale_km=ones * preferred_scale_km,
         detail=ones * 0.8,
         ridge_valley_target=zeros,
         orientation_south=zeros,
@@ -35,14 +43,26 @@ def _forcing(grid: SphereGrid, strength: float = 1.0) -> ErosionForcing:
     )
 
 
+def _terrain(grid: SphereGrid):
+    lat = np.deg2rad(grid.lat)
+    lon = np.deg2rad(grid.lon)
+    elevation = (
+        1.8 * np.sin(2.0 * lat)
+        + 0.9 * np.cos(3.0 * lon) * np.cos(lat)
+        + 0.35 * np.sin(5.0 * lon + lat)
+    )
+    return SimpleNamespace(elevation_km=elevation.astype(np.float32))
+
+
 def test_procedural_erosion_is_deterministic_finite_and_bounded():
     grid = SphereGrid(64, 32, 6371.0)
-    terrain = SimpleNamespace(elevation_km=np.zeros(grid.shape, dtype=np.float32))
+    terrain = _terrain(grid)
     cfg = ProceduralErosionConfig(
         enabled=True,
         octaves=3,
         base_amplitude_m=20.0,
         max_displacement_m=35.0,
+        slope_reference=0.002,
     )
     a = apply_procedural_erosion(grid, terrain, _forcing(grid), cfg, seed=1234)
     b = apply_procedural_erosion(grid, terrain, _forcing(grid), cfg, seed=1234)
@@ -52,11 +72,214 @@ def test_procedural_erosion_is_deterministic_finite_and_bounded():
     assert float(np.max(np.abs(a.delta_height_m))) <= 35.0 + 1e-6
     assert np.isfinite(a.phase_coherence).all()
     assert np.all((a.phase_coherence >= 0.0) & (a.phase_coherence <= 1.0))
+    assert np.all((a.ridge_map >= 0.0) & (a.ridge_map <= 1.0))
+    assert np.all((a.crease_map >= 0.0) & (a.crease_map <= 1.0))
 
 
 def test_zero_strength_is_exact_identity():
     grid = SphereGrid(64, 32, 6371.0)
-    terrain = SimpleNamespace(elevation_km=np.zeros(grid.shape, dtype=np.float32))
-    cfg = ProceduralErosionConfig(enabled=True, octaves=2)
+    terrain = _terrain(grid)
+    cfg = ProceduralErosionConfig(enabled=True, octaves=2, slope_reference=0.002)
     result = apply_procedural_erosion(grid, terrain, _forcing(grid, 0.0), cfg, seed=5)
     assert np.count_nonzero(result.delta_height_m) == 0
+
+
+def test_different_seed_changes_resolved_morphology():
+    grid = SphereGrid(64, 32, 6371.0)
+    terrain = _terrain(grid)
+    cfg = ProceduralErosionConfig(
+        enabled=True,
+        octaves=2,
+        base_amplitude_m=12.0,
+        slope_reference=0.002,
+    )
+    a = apply_procedural_erosion(grid, terrain, _forcing(grid), cfg, seed=5)
+    b = apply_procedural_erosion(grid, terrain, _forcing(grid), cfg, seed=6)
+    assert not np.array_equal(a.delta_height_m, b.delta_height_m)
+
+
+def test_partial_phase_normalization_is_bounded_and_monotone():
+    grid = SphereGrid(64, 32, 6371.0)
+    lon = np.deg2rad(grid.lon)
+    east_tangent = np.stack(
+        (-np.sin(lon), np.cos(lon), np.zeros_like(lon)),
+        axis=-1,
+    )
+    wavelength = np.full(grid.shape, 3000.0, dtype=np.float64)
+
+    raw_c, raw_s, raw_q = phase_cell_octave_xyz(
+        grid.xyz,
+        grid.radius_km,
+        wavelength,
+        east_tangent,
+        cell_scale=0.72,
+        seed=77,
+        octave=0,
+        normalization=0.0,
+    )
+    half_c, half_s, half_q = phase_cell_octave_xyz(
+        grid.xyz,
+        grid.radius_km,
+        wavelength,
+        east_tangent,
+        cell_scale=0.72,
+        seed=77,
+        octave=0,
+        normalization=0.5,
+    )
+    full_c, full_s, full_q = phase_cell_octave_xyz(
+        grid.xyz,
+        grid.radius_km,
+        wavelength,
+        east_tangent,
+        cell_scale=0.72,
+        seed=77,
+        octave=0,
+        normalization=1.0,
+    )
+
+    raw_amp = np.hypot(raw_c, raw_s)
+    half_amp = np.hypot(half_c, half_s)
+    full_amp = np.hypot(full_c, full_s)
+    assert np.all(raw_amp <= half_amp + 1e-12)
+    assert np.all(half_amp <= full_amp + 1e-12)
+    assert np.all(full_amp <= 1.0 + 1e-12)
+    assert np.array_equal(raw_q, half_q)
+    assert np.array_equal(half_q, full_q)
+
+
+def test_area_zero_mean_survives_displacement_clipping():
+    grid = SphereGrid(64, 32, 6371.0)
+    terrain = _terrain(grid)
+    cfg = ProceduralErosionConfig(
+        enabled=True,
+        octaves=3,
+        base_amplitude_m=120.0,
+        max_displacement_m=3.0,
+        slope_reference=0.001,
+        zero_mean_displacement=True,
+    )
+    result = apply_procedural_erosion(grid, terrain, _forcing(grid), cfg, seed=123)
+    active = result.effective_strength > 1.0e-6
+    weighted_mean = np.average(
+        result.delta_height_m[active],
+        weights=grid.cell_area_weights[active],
+    )
+    assert abs(float(weighted_mean)) < 2.0e-6
+    assert float(np.max(np.abs(result.delta_height_m))) <= 3.0 + 1e-6
+    assert result.metadata["displacement_limiter"] == "uniform_rescale"
+    assert result.metadata["displacement_scale_factor"] < 1.0
+    assert result.metadata["preconstraint_max_absolute_displacement_m"] > 3.0
+    assert abs(result.metadata["area_weighted_mean_displacement_m"]) < 1.0e-9
+
+
+def test_unresolved_wavelength_is_exact_identity():
+    grid = SphereGrid(64, 32, 6371.0)
+    terrain = _terrain(grid)
+    cfg = ProceduralErosionConfig(
+        enabled=True,
+        octaves=4,
+        min_samples_per_wavelength=5.0,
+        slope_reference=0.001,
+    )
+    result = apply_procedural_erosion(
+        grid,
+        terrain,
+        _forcing(grid, preferred_scale_km=10.0),
+        cfg,
+        seed=42,
+    )
+    assert result.metadata["octaves_executed"] == 0
+    assert np.count_nonzero(result.delta_height_m) == 0
+
+
+def test_nonfinite_forcing_is_rejected_at_public_operator_boundary():
+    grid = SphereGrid(64, 32, 6371.0)
+    terrain = _terrain(grid)
+    forcing = _forcing(grid)
+    forcing.strength[0, 0] = np.nan
+    cfg = ProceduralErosionConfig(enabled=True, slope_reference=0.002)
+    with pytest.raises(ValueError, match="finite"):
+        apply_procedural_erosion(grid, terrain, forcing, cfg, seed=1)
+
+
+@pytest.mark.parametrize("normalization", [-0.01, 1.01, np.nan, np.inf])
+def test_phase_normalization_rejects_invalid_values(normalization):
+    grid = SphereGrid(64, 32, 6371.0)
+    lon = np.deg2rad(grid.lon)
+    east_tangent = np.stack(
+        (-np.sin(lon), np.cos(lon), np.zeros_like(lon)),
+        axis=-1,
+    )
+    with pytest.raises(ValueError, match="normalization"):
+        phase_cell_octave_xyz(
+            grid.xyz,
+            grid.radius_km,
+            np.full(grid.shape, 3000.0),
+            east_tangent,
+            cell_scale=0.72,
+            seed=1,
+            octave=0,
+            normalization=normalization,
+        )
+
+
+def test_default_phase_normalization_preserves_existing_low_level_contract():
+    grid = SphereGrid(64, 32, 6371.0)
+    lon = np.deg2rad(grid.lon)
+    east_tangent = np.stack(
+        (-np.sin(lon), np.cos(lon), np.zeros_like(lon)),
+        axis=-1,
+    )
+    wavelength = np.full(grid.shape, 3000.0, dtype=np.float64)
+    implicit = phase_cell_octave_xyz(
+        grid.xyz,
+        grid.radius_km,
+        wavelength,
+        east_tangent,
+        cell_scale=0.72,
+        seed=99,
+        octave=2,
+    )
+    explicit = phase_cell_octave_xyz(
+        grid.xyz,
+        grid.radius_km,
+        wavelength,
+        east_tangent,
+        cell_scale=0.72,
+        seed=99,
+        octave=2,
+        normalization=1.0,
+    )
+    for a, b in zip(implicit, explicit, strict=True):
+        assert np.array_equal(a, b)
+
+
+@pytest.mark.parametrize(
+    "radius, cell_scale, wavelength_value, message",
+    [
+        (0.0, 0.72, 3000.0, "radius_km"),
+        (6371.0, 0.0, 3000.0, "cell_scale"),
+        (6371.0, 0.72, 0.0, "wavelength_km"),
+        (6371.0, 0.72, np.nan, "wavelength_km"),
+    ],
+)
+def test_phase_cell_public_geometry_contract_rejects_invalid_inputs(
+    radius, cell_scale, wavelength_value, message
+):
+    grid = SphereGrid(64, 32, 6371.0)
+    lon = np.deg2rad(grid.lon)
+    east_tangent = np.stack(
+        (-np.sin(lon), np.cos(lon), np.zeros_like(lon)),
+        axis=-1,
+    )
+    with pytest.raises(ValueError, match=message):
+        phase_cell_octave_xyz(
+            grid.xyz,
+            radius,
+            np.full(grid.shape, wavelength_value),
+            east_tangent,
+            cell_scale=cell_scale,
+            seed=1,
+            octave=0,
+        )

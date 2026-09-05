@@ -319,7 +319,19 @@ class ProceduralErosionConfig:
     max_displacement_m: float = 85.0
     max_local_strength: float = 3.0
     steering_strength: float = 0.34
-    fade_target_strength: float = 0.28
+    fade_target_strength: float = 1.0
+    phase_normalization: float = 0.5
+    gully_weight: float = 0.5
+    detail_power: float = 1.5
+    slope_reference: float = 0.08
+    assumed_slope: float = 0.70
+    assumed_slope_blend: float = 1.0
+    initial_onset: float = 1.25
+    octave_onset: float = 1.25
+    ridge_map_initial_onset: float = 2.8
+    ridge_map_octave_onset: float = 1.5
+    rounding_initial_multiplier: float = 0.10
+    rounding_octave_multiplier: float = 2.0
     zero_mean_displacement: bool = True
     recouple_after_canonical_pass: bool = True
     fluvial_weight: float = 1.0
@@ -669,6 +681,18 @@ class WorldConfig:
         _number("procedural_erosion.max_local_strength", pe.max_local_strength, minimum=0.0)
         _number("procedural_erosion.steering_strength", pe.steering_strength, minimum=0.0)
         _number("procedural_erosion.fade_target_strength", pe.fade_target_strength, minimum=0.0, maximum=1.0)
+        _number("procedural_erosion.phase_normalization", pe.phase_normalization, minimum=0.0, maximum=1.0)
+        _number("procedural_erosion.gully_weight", pe.gully_weight, minimum=0.0, maximum=1.0, min_inclusive=False)
+        _number("procedural_erosion.detail_power", pe.detail_power, minimum=0.0)
+        _number("procedural_erosion.slope_reference", pe.slope_reference, minimum=0.0, min_inclusive=False)
+        _number("procedural_erosion.assumed_slope", pe.assumed_slope, minimum=0.0)
+        _fraction("procedural_erosion.assumed_slope_blend", pe.assumed_slope_blend)
+        _number("procedural_erosion.initial_onset", pe.initial_onset, minimum=0.0)
+        _number("procedural_erosion.octave_onset", pe.octave_onset, minimum=0.0)
+        _number("procedural_erosion.ridge_map_initial_onset", pe.ridge_map_initial_onset, minimum=0.0)
+        _number("procedural_erosion.ridge_map_octave_onset", pe.ridge_map_octave_onset, minimum=0.0)
+        _number("procedural_erosion.rounding_initial_multiplier", pe.rounding_initial_multiplier, minimum=0.0)
+        _number("procedural_erosion.rounding_octave_multiplier", pe.rounding_octave_multiplier, minimum=0.0)
         _boolean("procedural_erosion.zero_mean_displacement", pe.zero_mean_displacement)
         _boolean("procedural_erosion.recouple_after_canonical_pass", pe.recouple_after_canonical_pass)
         for name in ("fluvial_weight", "pluvial_weight", "glacial_weight", "marine_weight", "chemical_weight", "freeze_thaw_weight"):
