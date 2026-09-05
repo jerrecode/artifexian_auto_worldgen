@@ -10,6 +10,7 @@ from .terrain import TerrainResult
 from .noise import hybrid_multifractal, hybrid_noise01, noise_kwargs, CLIMATE_BLEND, NoiseBlend, StaticNoiseFields
 from .topology import prepare_spherical_bilinear_sampler, apply_bilinear_sampler
 from .planetary_physics import canonical_species, phase_code_grid, relative_vapor_capacity, saturation_pressure_bar
+from .spatial_naturalism import marine_thermal_distance
 
 
 @dataclass(slots=True)
@@ -178,7 +179,15 @@ def build_climate(grid: SphereGrid, astronomy: AstronomyResult, terrain: Terrain
     correction = np.zeros((h,w), dtype=np.float32) if temperature_correction is None else np.asarray(temperature_correction, dtype=np.float32)
     if correction.shape != (h,w) or np.any(~np.isfinite(correction)):
         raise ValueError("temperature_correction must be a finite array matching the climate grid")
-    mean_target=astronomy.planet["mean_surface_temperature_c_approx"]; tilt=astronomy.planet["axial_tilt_deg"]; dist_ocean=distance_to(terrain.ocean,grid)
+    mean_target=astronomy.planet["mean_surface_temperature_c_approx"]; tilt=astronomy.planet["axial_tilt_deg"]
+    climate_texture_for_fetch = None if static_noise is None else getattr(static_noise, "climate_texture", None)
+    dist_ocean = marine_thermal_distance(
+        grid,
+        terrain.ocean,
+        ocean.elevation_km,
+        inland_scale_km=float(cfg.inland_thermal_length_km),
+        climate_texture=climate_texture_for_fetch,
+    )
     requested=cfg.condensible_species
     condensible = astronomy.volatile_chemistry.get("active_condensible") if requested == "auto" else requested
     condensible = canonical_species(condensible or "H2O")
@@ -233,5 +242,7 @@ def build_climate(grid: SphereGrid, astronomy: AstronomyResult, terrain: Terrain
           "classification":"Köppen-Geiger-like only for H2O climates; EXO marker for non-water condensables",
           "circulation":"seasonally migrating ITCZ + explicit trade winds/westerlies/polar easterlies + pressure anomalies","orographic_precipitation":"iterative humidity advection with physical upwind elevation gain and lee-side moisture depletion",
           "humidity_transport":"monthly semi-Lagrangian condensable reservoir with spherical pole-crossing transport and wind-carried flux proxies","seasonality":"eccentric-orbit inverse-square forcing + cyclic land/ocean thermal inertia + stationary planetary waves",
-          "orbital_flux_factors":[float(x) for x in orbital_flux],"noise_model":"shared hybrid multi-type multifractal climate/convective texture"}
+          "orbital_flux_factors":[float(x) for x in orbital_flux],"noise_model":"shared hybrid multi-type multifractal climate/convective texture",
+          "marine_thermal_distance_model":"large-water-component geodesic fetch with circulation, relief and climate-texture anisotropy",
+          "tiny_water_continentality_halos_suppressed":True}
     return ClimateResult(temp,precip,pressure,wu,wv,gwu,gwv,humidity,hfu,hfv,annt.astype(np.float32),annp.astype(np.float32),koppen,cont_index.astype(np.float32),cont_class,snow,phase_monthly,saturation_monthly,meta)
