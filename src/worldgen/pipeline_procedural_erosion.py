@@ -186,6 +186,19 @@ class WorldPipeline(_GeomorphologyWorldPipeline):
         grid = world["grid"]
         terrain_before = world["terrain"]
 
+        # The atmogen path deliberately disables the legacy chemistry engine, but it
+        # still needs the mass-conservative spatial condensate bridge for runoff,
+        # freeze/thaw phase state, and local liquid transport properties. Install or
+        # refresh that bridge before erosion forcing is sampled.
+        if world.get("condensate_hydrology") is None:
+            world = install_multicondensate_hydrology(
+                self,
+                world,
+                suffix="pre_procedural_erosion",
+                rebuild_dependents=True,
+            )
+            terrain_before = world["terrain"]
+
         forcing = self._stage(
             "procedural_erosion_forcing",
             lambda: build_erosion_forcing(
@@ -264,17 +277,20 @@ class WorldPipeline(_GeomorphologyWorldPipeline):
         if changed and bool(cfg.recouple_after_canonical_pass):
             if world.get("surface_liquids") is not None:
                 world = self._equilibrate_surface_liquids(world)
-                if world.get("condensate_hydrology") is not None:
-                    world = install_multicondensate_hydrology(
-                        self,
-                        world,
-                        suffix="post_procedural_erosion",
-                        rebuild_dependents=True,
-                    )
-                if world.get("geomorphic_fluid_parameters") is not None:
-                    world = self._build_exotic_layers(world, suffix="post_procedural_erosion")
             else:
                 world = self._recouple_without_dynamic_liquids(world)
+
+            # Recoupling rebuilds climate/hydrology and can invalidate the phase and
+            # precipitation fields sampled above. Reinstall unconditionally; the
+            # installer is a no-op for worlds without an eligible volatile inventory.
+            world = install_multicondensate_hydrology(
+                self,
+                world,
+                suffix="post_procedural_erosion",
+                rebuild_dependents=True,
+            )
+            if world.get("geomorphic_fluid_parameters") is not None:
+                world = self._build_exotic_layers(world, suffix="post_procedural_erosion")
 
         world["procedural_erosion"] = result
         world["procedural_erosion_forcing"] = forcing
