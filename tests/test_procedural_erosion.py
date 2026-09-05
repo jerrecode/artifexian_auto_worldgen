@@ -60,3 +60,27 @@ def test_zero_strength_is_exact_identity():
     cfg = ProceduralErosionConfig(enabled=True, octaves=2)
     result = apply_procedural_erosion(grid, terrain, _forcing(grid, 0.0), cfg, seed=5)
     assert np.count_nonzero(result.delta_height_m) == 0
+
+
+def test_zero_mean_displacement_survives_active_displacement_cap():
+    grid = SphereGrid(64, 32, 6371.0)
+    terrain = SimpleNamespace(elevation_km=np.zeros(grid.shape, dtype=np.float32))
+    cfg = ProceduralErosionConfig(
+        enabled=True,
+        octaves=3,
+        base_amplitude_m=500.0,
+        max_displacement_m=5.0,
+        zero_mean_displacement=True,
+    )
+    result = apply_procedural_erosion(grid, terrain, _forcing(grid), cfg, seed=4321)
+
+    weights = np.asarray(grid.cell_area_weights, dtype=np.float64)
+    weighted_mean = float(
+        np.sum(result.delta_height_m.astype(np.float64) * weights) / np.sum(weights)
+    )
+    assert result.metadata["displacement_limiter"] == "uniform_rescale"
+    assert result.metadata["displacement_scale_factor"] < 1.0
+    assert result.metadata["preconstraint_max_absolute_displacement_m"] > 5.0
+    assert float(np.max(np.abs(result.delta_height_m))) <= 5.0 + 1.0e-6
+    assert abs(weighted_mean) <= 2.0e-7
+    assert abs(float(result.metadata["area_weighted_mean_displacement_m"])) <= 1.0e-12
