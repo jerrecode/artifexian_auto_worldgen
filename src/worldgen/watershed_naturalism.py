@@ -105,7 +105,14 @@ def _raw_outlet_labels(graph: DrainageGraph, land: np.ndarray):
     return labels, exo_code == 2, outlet, outlet_nodes
 
 
-def _major_basin_aggregation(grid, raw, outlet_nodes, land, drainage_area_km2):
+def _major_basin_aggregation(
+    grid,
+    raw,
+    outlet_nodes,
+    land,
+    drainage_area_km2,
+    exorheic,
+):
     """Merge minor coastal outlet catchments into nearby major drainage systems.
 
     Catchment boundaries themselves are never redrawn: whole raw terminal catchments
@@ -140,11 +147,33 @@ def _major_basin_aggregation(grid, raw, outlet_nodes, land, drainage_area_km2):
 
     present_labels = np.flatnonzero(raw_area > 0.0)
     present_labels = present_labels[present_labels > 0]
+    exo_flat = np.asarray(exorheic, bool).ravel()
+
+    # Endorheic terminal basins are physically distinct drainage systems and must
+    # never be merged into a nearby coastal/exorheic group merely because their
+    # outlets are geographically close.
+    internal_labels: list[int] = []
+    exorheic_label = np.zeros(max_raw + 1, dtype=bool)
+    for lab in present_labels:
+        members = raw == int(lab)
+        is_exo = bool(np.any(exo_flat[members]))
+        exorheic_label[int(lab)] = is_exo
+        if not is_exo:
+            internal_labels.append(int(lab))
+
+    for lab in internal_labels:
+        mapping[lab] = next_major
+        next_major += 1
+
     for comp in range(1, int(ncomp) + 1):
         labels = []
         for lab in present_labels:
             node = outlet_for_label[lab]
-            if node >= 0 and comp_flat[node] == comp:
+            if (
+                node >= 0
+                and comp_flat[node] == comp
+                and exorheic_label[int(lab)]
+            ):
                 labels.append(int(lab))
         if not labels:
             continue
@@ -194,7 +223,8 @@ def _major_basin_aggregation(grid, raw, outlet_nodes, land, drainage_area_km2):
         "major_basin_target_anchor_area_km2": float(target_anchor_area_km2),
         "major_basin_hard_anchor_min_km2": float(hard_major_min_km2),
         "major_basin_anchor_counts_by_landmass": anchor_counts,
-        "aggregation_model": "whole-terminal-catchment merge to nearest major outlet on the same connected landmass; boundaries remain true drainage divides",
+        "preserved_endorheic_terminal_basins": int(len(internal_labels)),
+        "aggregation_model": "whole exorheic terminal catchments merge to nearby major coastal outlets on the same connected landmass; endorheic basins remain independent and all boundaries remain true raw drainage divides",
     }
 
 
@@ -246,7 +276,7 @@ def build_watershed_hierarchy_natural(
     lf = np.asarray(land, bool).ravel()
     raw, exorheic, outlet, outlet_nodes = _raw_outlet_labels(graph, land)
     basin, aggregation_meta = _major_basin_aggregation(
-        grid, raw, outlet_nodes, land, drainage_area_km2
+        grid, raw, outlet_nodes, land, drainage_area_km2, exorheic
     )
 
     t1, t2, t3 = (max(float(v), 1.0) for v in subbasin_thresholds_km2)
@@ -285,6 +315,18 @@ def build_watershed_hierarchy_natural(
     major_land = basin[lf]
     major_unique, major_counts = np.unique(major_land[major_land > 0], return_counts=True)
     internal_count = int(np.unique(raw[lf & ~exorheic]).size) if np.any(lf & ~exorheic) else 0
+    land_area = float(np.sum(cell_area[lf]))
+    if major_unique.size and land_area > 0.0:
+        major_area = np.bincount(
+            basin[lf],
+            weights=cell_area[lf],
+            minlength=int(basin.max(initial=0)) + 1,
+        )
+        largest_basin_area_fraction_land = float(
+            np.max(major_area[major_unique]) / land_area
+        )
+    else:
+        largest_basin_area_fraction_land = 0.0
 
     metadata = {
         "basin_semantics": "major natural drainage systems formed by merging whole minor terminal catchments; raw outlet catchments retained diagnostically",
@@ -293,6 +335,7 @@ def build_watershed_hierarchy_natural(
         "raw_terminal_median_basin_cells": float(np.median(raw_counts)) if raw_counts.size else 0.0,
         "endorheic_or_internal_basin_count": internal_count,
         "largest_basin_cells": int(np.max(major_counts)) if major_counts.size else 0,
+        "largest_basin_area_fraction_land": largest_basin_area_fraction_land,
         "median_basin_cells": float(np.median(major_counts)) if major_counts.size else 0.0,
         "subbasin_thresholds_km2": [t1, t2, t3],
         "all_land_assigned": bool(np.all(basin[lf] > 0)) if np.any(lf) else True,
