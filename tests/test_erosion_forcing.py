@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import worldgen.erosion_forcing as erosion_forcing_module
+
 from worldgen.config import ProceduralErosionConfig
 from worldgen.erosion_forcing import build_erosion_forcing
 from worldgen.grid import SphereGrid
@@ -287,6 +289,7 @@ def test_solid_only_condensate_does_not_pollute_liquid_transport_mixture():
     )
 
     assert forcing.metadata["liquid_transport_species"] == []
+    assert forcing.metadata["dominant_condensate"] == "none"
     assert forcing.metadata["fluid_property_source"] == (
         "water_reference+no_liquid_condensate"
     )
@@ -355,3 +358,39 @@ def test_spatial_condensate_transport_rejects_phase_field_shape_mismatch():
             ProceduralErosionConfig(enabled=True),
             condensate_hydrology=condensate,
         )
+
+
+def test_spatial_erosion_requests_compact_atmogen_transport_fields(monkeypatch):
+    grid, terrain, ocean, climate, hydrology, geology, astronomy = _forcing_fixture(
+        land=True,
+        temperature_c=15.0,
+        precipitation_mm_year=1200.0,
+    )
+    condensate = _spatial_condensate_fixture(grid)
+    original = erosion_forcing_module.liquid_mixture_transport_fields
+    observed = {}
+
+    def wrapped_transport_fields(**kwargs):
+        observed["include_mass_fractions"] = kwargs.get("include_mass_fractions")
+        result = original(**kwargs)
+        assert result is not None
+        assert result.mass_fractions == {}
+        return result
+
+    monkeypatch.setattr(
+        erosion_forcing_module,
+        "liquid_mixture_transport_fields",
+        wrapped_transport_fields,
+    )
+    build_erosion_forcing(
+        grid,
+        terrain,
+        ocean,
+        climate,
+        hydrology,
+        geology,
+        astronomy,
+        ProceduralErosionConfig(enabled=True),
+        condensate_hydrology=condensate,
+    )
+    assert observed["include_mass_fractions"] is False

@@ -45,8 +45,8 @@ def test_adapter_replaces_old_greenhouse_authority_and_records_revision():
     assert result.surface.mass_closure_relative < 1e-12
     metadata = atmogen_runtime_metadata()
     assert metadata["compatible_git_revision"] == ATMOGEN_COMPATIBLE_REVISION
-    assert metadata["package_version"] == "0.14.0"
-    assert metadata["api_schema_version"] == 13
+    assert metadata["package_version"] == "0.15.0"
+    assert metadata["api_schema_version"] == 14
     assert metadata["data_schema_version"] == 4
 
 
@@ -73,7 +73,7 @@ def test_standard_fidelity_exposes_nonisothermal_vertical_profile():
     assert temperature[0] > temperature[-1]
     assert np.all(np.diff(pressure) < 0.0)
     assert profile["hydrostatic_relative_residual"] < 2e-12
-    assert atmogen_runtime_metadata()["package_version"] == "0.14.0"
+    assert atmogen_runtime_metadata()["package_version"] == "0.15.0"
 
 
 def test_local_column_elevation_changes_pressure_with_explicit_provenance():
@@ -175,7 +175,7 @@ def test_atmogen_settings_change_only_dependent_stage_key_inputs():
 
 
 def test_worldgen_targets_hardened_atmogen_revision():
-    assert ATMOGEN_COMPATIBLE_REVISION == "401a5026b65f366eb7b67b2932b196e71fe3c341"
+    assert ATMOGEN_COMPATIBLE_REVISION == "a34ba89192537e86419b46494898c1cd9bd6f9ca"
 
 
 @pytest.mark.parametrize(

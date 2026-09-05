@@ -210,7 +210,8 @@ def _fluid_factor(
             species_mass_kg=total_species_mass
         )
         spatial = liquid_mixture_transport_fields(
-            species_mass_kg=liquid_species
+            species_mass_kg=liquid_species,
+            include_mass_fractions=False,
         )
         if global_mixture is not None and spatial is not None:
             fallback = float(
@@ -234,6 +235,7 @@ def _fluid_factor(
     elif unsupported:
         source = "unsupported_liquid_species_water_reference_fallback"
     elif condensate_hydrology is not None:
+        species = "none"
         source = "water_reference+no_liquid_condensate"
 
     if not np.isfinite(factor).all():
