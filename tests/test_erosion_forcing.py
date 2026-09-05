@@ -42,7 +42,7 @@ def test_forcing_uses_runoff_lithology_soil_and_phase_crossings_without_nan():
         height_above_nearest_drainage_m=np.full(shape, 30.0, dtype=np.float32),
         channel_class=np.zeros(shape, dtype=np.uint8),
     )
-    geology = SimpleNamespace(rock_code=np.full(shape, 3, dtype=np.uint8))
+    geology = SimpleNamespace(bedrock_code=np.full(shape, 3, dtype=np.uint8))
     astronomy = SimpleNamespace(planet={"surface_gravity_m_s2": 9.80665})
     cfg = ProceduralErosionConfig(enabled=True)
     forcing = build_erosion_forcing(
@@ -54,3 +54,45 @@ def test_forcing_uses_runoff_lithology_soil_and_phase_crossings_without_nan():
     assert np.any(forcing.freeze_thaw_activity > 0)
     assert np.all(forcing.preferred_scale_km >= cfg.min_wavelength_km)
     assert np.all(forcing.preferred_scale_km <= cfg.max_wavelength_km)
+
+    # Legacy geology objects without the newer bedrock field remain supported.
+    legacy = SimpleNamespace(rock_code=np.full(shape, 3, dtype=np.uint8))
+    forcing_legacy = build_erosion_forcing(
+        grid, terrain, ocean, climate, hydro, legacy, astronomy, cfg
+    )
+    assert np.array_equal(forcing.strength, forcing_legacy.strength)
+
+
+def test_forcing_rejects_missing_or_misshaped_geology_codes():
+    grid = SphereGrid(64, 32, 6371.0)
+    shape = grid.shape
+    terrain = SimpleNamespace(
+        elevation_km=np.zeros(shape, dtype=np.float32),
+        land=np.ones(shape, dtype=bool),
+        ocean=np.zeros(shape, dtype=bool),
+        shelf=np.zeros(shape, dtype=bool),
+    )
+    ocean = SimpleNamespace(current_speed=np.zeros(shape, dtype=np.float32))
+    climate = SimpleNamespace(
+        temperature_c=np.full((12, *shape), 15.0, dtype=np.float32),
+        annual_temperature_c=np.full(shape, 15.0, dtype=np.float32),
+        annual_precipitation_mm=np.zeros(shape, dtype=np.float32),
+        snow_fraction=np.zeros(shape, dtype=np.float32),
+        continentality_index_c=np.zeros(shape, dtype=np.float32),
+    )
+    hydro = SimpleNamespace()
+    astronomy = SimpleNamespace(planet={"surface_gravity_m_s2": 9.80665})
+    cfg = ProceduralErosionConfig(enabled=True)
+
+    for geology in (
+        SimpleNamespace(),
+        SimpleNamespace(bedrock_code=np.zeros((1, 1), dtype=np.uint8)),
+    ):
+        try:
+            build_erosion_forcing(
+                grid, terrain, ocean, climate, hydro, geology, astronomy, cfg
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid geology contract was accepted")
