@@ -136,13 +136,14 @@ def _liquid_species_mass_fields(
                     f"condensate phase fields for {key!r} must be finite and non-negative"
                 )
             phase_depth = liquid + solid
+            condensed = phase_depth > 1.0e-12
             np.divide(
                 liquid,
                 phase_depth,
                 out=phase_depth,
-                where=phase_depth > 1.0e-12,
+                where=condensed,
             )
-            phase_depth[phase_depth <= 1.0e-12] = 0.0
+            phase_depth[~condensed] = 0.0
             annual_liquid_mass_kg_m2 += mass * phase_depth
 
         cell_mass = annual_liquid_mass_kg_m2 * area_m2
