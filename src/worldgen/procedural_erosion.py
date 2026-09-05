@@ -74,21 +74,30 @@ def _tangent_perpendicular(grid, south: np.ndarray, east_component: np.ndarray) 
     return np.divide(perp, np.maximum(pn, 1.0e-15))
 
 
-def _phase_cell_octave(
-    grid,
+def phase_cell_octave_xyz(
+    unit_xyz: np.ndarray,
+    radius_km: float,
     wavelength_km: np.ndarray,
-    direction_south: np.ndarray,
-    direction_east: np.ndarray,
+    perpendicular_xyz: np.ndarray,
     *,
     cell_scale: float,
     seed: int,
     octave: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    xyz = _unit_positions(grid) * float(grid.radius_km)
-    scale = np.maximum(np.asarray(wavelength_km, dtype=np.float64) * float(cell_scale), 1.0e-6)
+    """Evaluate one seamless 3-D phase-cell octave on arbitrary planet positions."""
+    normal = np.asarray(unit_xyz, dtype=np.float64)
+    perp = np.asarray(perpendicular_xyz, dtype=np.float64)
+    if normal.shape != perp.shape or normal.shape[-1] != 3:
+        raise ValueError("unit_xyz and perpendicular_xyz must have identical (...,3) shape")
+    pn = np.linalg.norm(perp, axis=-1, keepdims=True)
+    perp = np.divide(perp, np.maximum(pn, 1.0e-15))
+    xyz = normal * float(radius_km)
+    scale = np.maximum(
+        np.asarray(wavelength_km, dtype=np.float64) * float(cell_scale),
+        1.0e-6,
+    )
     q = xyz / scale[..., None]
     base = np.floor(q).astype(np.int64)
-    perp = _tangent_perpendicular(grid, direction_south, direction_east)
 
     csum = np.zeros(q.shape[:-1], dtype=np.float64)
     ssum = np.zeros_like(csum)
@@ -107,7 +116,11 @@ def _phase_cell_octave(
                 jy = 0.15 + 0.70 * _hash01(ix, iy, iz, seed, salt0 + 2)
                 jz = 0.15 + 0.70 * _hash01(ix, iy, iz, seed, salt0 + 3)
                 anchor = np.stack(
-                    (ix.astype(np.float64) + jx, iy.astype(np.float64) + jy, iz.astype(np.float64) + jz),
+                    (
+                        ix.astype(np.float64) + jx,
+                        iy.astype(np.float64) + jy,
+                        iz.astype(np.float64) + jz,
+                    ),
                     axis=-1,
                 )
                 delta = q - anchor
@@ -120,11 +133,31 @@ def _phase_cell_octave(
                 wsum += w
 
     magnitude = np.hypot(csum, ssum)
-    c = np.divide(csum, np.maximum(magnitude, 1.0e-12))
-    s = np.divide(ssum, np.maximum(magnitude, 1.0e-12))
+    cosine = np.divide(csum, np.maximum(magnitude, 1.0e-12))
+    sine = np.divide(ssum, np.maximum(magnitude, 1.0e-12))
     coherence = np.divide(magnitude, np.maximum(wsum, 1.0e-12))
-    return c, s, np.clip(coherence, 0.0, 1.0)
+    return cosine, sine, np.clip(coherence, 0.0, 1.0)
 
+
+def _phase_cell_octave(
+    grid,
+    wavelength_km: np.ndarray,
+    direction_south: np.ndarray,
+    direction_east: np.ndarray,
+    *,
+    cell_scale: float,
+    seed: int,
+    octave: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    return phase_cell_octave_xyz(
+        _unit_positions(grid),
+        float(grid.radius_km),
+        wavelength_km,
+        _tangent_perpendicular(grid, direction_south, direction_east),
+        cell_scale=cell_scale,
+        seed=seed,
+        octave=octave,
+    )
 
 def _rounded_profile(c: np.ndarray, ridge_rounding: np.ndarray, crease_rounding: np.ndarray) -> np.ndarray:
     a = np.abs(np.asarray(c, dtype=np.float64))
@@ -228,4 +261,4 @@ def apply_procedural_erosion(grid, terrain, forcing: ErosionForcing, cfg, *, see
     )
 
 
-__all__ = ["ProceduralErosionResult", "apply_procedural_erosion"]
+__all__ = ["ProceduralErosionResult", "apply_procedural_erosion", "phase_cell_octave_xyz"]
