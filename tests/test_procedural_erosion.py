@@ -412,7 +412,13 @@ def test_high_level_phase_chunking_streams_geometry_in_bounded_rows(monkeypatch)
     monkeypatch.setattr(
         procedural_erosion_module, "_phase_geometry_rows", counted_geometry
     )
-    result = apply_procedural_erosion(grid, terrain, _forcing(grid), cfg, seed=9917)
+    result = apply_procedural_erosion(
+        grid,
+        terrain,
+        _forcing(grid, preferred_scale_km=8000.0),
+        cfg,
+        seed=9917,
+    )
 
     assert result.metadata["octaves_executed"] >= 2
     assert result.metadata["spherical_geometry_chunked_with_phase"] is True
