@@ -322,6 +322,7 @@ class WorldPipeline(_GeomorphologyWorldPipeline):
                     "erosion_chemical_weathering": np.asarray(forcing.chemical_weathering, np.float32),
                     "erosion_freeze_thaw_activity": np.asarray(forcing.freeze_thaw_activity, np.float32),
                     "erosion_soil_saturation": np.asarray(forcing.soil_saturation, np.float32),
+                    "erosion_fluid_mechanical_factor": np.asarray(forcing.fluid_mechanical_factor, np.float32),
                 }
             )
         return arrays
@@ -367,7 +368,7 @@ class WorldPipeline(_GeomorphologyWorldPipeline):
         f = world["procedural_erosion_forcing"].metadata
         return report + "\n\n## Environment-conditioned procedural erosion\n\n" + (
             f"- Seamless 3-D phase-cell octaves executed: {m['octaves_executed']} of {m['octaves_requested']}; maximum absolute displacement {m['max_absolute_displacement_m']:.3f} m.\n"
-            f"- Dominant condensate for mechanical scaling: {f['dominant_condensate']}; fluid multiplier {f['fluid_mechanical_factor']:.3f}.\n"
+            f"- Dominant liquid condensate for mechanical scaling: {f['dominant_condensate']}; spherical-mean fluid multiplier {f['fluid_mechanical_factor']:.3f} (range {f['fluid_mechanical_factor_min']:.3f}–{f['fluid_mechanical_factor_max']:.3f}).\n"
             f"- Canonical dependency recoupling: {bool(self.cfg.procedural_erosion.recouple_after_canonical_pass)}.\n"
             "- The procedural layer supplies deterministic unresolved morphology; physical runoff, sediment routing, glacial/coastal processes and volatile mass conservation remain owned by their dedicated solvers.\n"
         )

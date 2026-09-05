@@ -12,7 +12,7 @@ import numpy as np
 import atmogen
 
 
-ATMOGEN_COMPATIBLE_REVISION = "caf747f24f30e3c015fbcb60661effd08af505bd"
+ATMOGEN_COMPATIBLE_REVISION = "a34ba89192537e86419b46494898c1cd9bd6f9ca"
 
 
 def atmogen_runtime_metadata() -> dict[str, Any]:
