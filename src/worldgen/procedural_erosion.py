@@ -134,18 +134,30 @@ def phase_cell_octave_xyz(
     """
     normal = np.asarray(unit_xyz, dtype=np.float64)
     perp = np.asarray(perpendicular_xyz, dtype=np.float64)
-    if normal.shape != perp.shape or normal.shape[-1] != 3:
+    if normal.shape != perp.shape or normal.ndim < 1 or normal.shape[-1] != 3:
         raise ValueError("unit_xyz and perpendicular_xyz must have identical (...,3) shape")
+    if not np.isfinite(normal).all() or not np.isfinite(perp).all():
+        raise ValueError("unit_xyz and perpendicular_xyz must contain only finite values")
+    radius = float(radius_km)
+    if not np.isfinite(radius) or radius <= 0.0:
+        raise ValueError("radius_km must be finite and positive")
+    cell = float(cell_scale)
+    if not np.isfinite(cell) or cell <= 0.0:
+        raise ValueError("cell_scale must be finite and positive")
+    wavelength = np.asarray(wavelength_km, dtype=np.float64)
+    if wavelength.shape != normal.shape[:-1]:
+        raise ValueError(
+            f"wavelength_km must have shape {normal.shape[:-1]}, got {wavelength.shape}"
+        )
+    if not np.isfinite(wavelength).all() or np.any(wavelength <= 0.0):
+        raise ValueError("wavelength_km must contain only finite positive values")
     norm_parameter = float(normalization)
     if not np.isfinite(norm_parameter) or not 0.0 <= norm_parameter <= 1.0:
         raise ValueError("normalization must be finite and in [0,1]")
     pn = np.linalg.norm(perp, axis=-1, keepdims=True)
     perp = np.divide(perp, np.maximum(pn, 1.0e-15))
-    xyz = normal * float(radius_km)
-    scale = np.maximum(
-        np.asarray(wavelength_km, dtype=np.float64) * float(cell_scale),
-        1.0e-6,
-    )
+    xyz = normal * radius
+    scale = np.maximum(wavelength * cell, 1.0e-6)
     q = xyz / scale[..., None]
     base = np.floor(q).astype(np.int64)
 
@@ -153,7 +165,7 @@ def phase_cell_octave_xyz(
     ssum = np.zeros_like(csum)
     wsum = np.zeros_like(csum)
     support_r2 = 4.25
-    phase_scale = 2.0 * np.pi * float(cell_scale)
+    phase_scale = 2.0 * np.pi * cell
     salt0 = 0x51ED270B + 0x9E37 * int(octave)
 
     for oz in (-1, 0, 1):
@@ -215,14 +227,6 @@ def _phase_cell_octave(
         octave=octave,
         normalization=normalization,
     )
-
-def _rounded_profile(c: np.ndarray, ridge_rounding: np.ndarray, crease_rounding: np.ndarray) -> np.ndarray:
-    a = np.abs(np.asarray(c, dtype=np.float64))
-    rounding = np.where(c >= 0.0, ridge_rounding, crease_rounding)
-    exponent = 1.0 + 2.5 * np.clip(rounding, 0.0, 1.0)
-    shaped = 1.0 - np.power(np.maximum(1.0 - a, 0.0), exponent)
-    return np.sign(c) * shaped
-
 
 def _finalize_displacement(
     delta: np.ndarray,
