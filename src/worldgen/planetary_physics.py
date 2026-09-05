@@ -22,6 +22,33 @@ M_EARTH = 5.9722e24
 R_EARTH = 6.371e6
 
 
+def _finite_positive(name: str, value: float) -> float:
+    out = float(value)
+    if not math.isfinite(out) or out <= 0.0:
+        raise ValueError(f"{name} must be finite and positive")
+    return out
+
+
+def _finite_nonnegative(name: str, value: float) -> float:
+    out = float(value)
+    if not math.isfinite(out) or out < 0.0:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return out
+
+
+def _positive_temperature_array(temperature_k: np.ndarray | float) -> np.ndarray:
+    t = np.asarray(temperature_k, dtype=np.float64)
+    if np.any(~np.isfinite(t)) or np.any(t <= 0.0):
+        raise ValueError("temperature_k must be finite and positive")
+    return t
+
+
+def _validate_backend(backend: str) -> str:
+    if backend not in {"auto", "builtin", "coolprop"}:
+        raise ValueError("backend must be auto, builtin, or coolprop")
+    return backend
+
+
 @dataclass(slots=True, frozen=True)
 class SpeciesThermo:
     formula: str
@@ -89,7 +116,9 @@ def coolprop_available() -> bool:
 
 
 def _builtin_saturation_pressure_bar(species: str, temperature_k: np.ndarray | float) -> np.ndarray:
-    sp = SPECIES[canonical_species(species)]; t = np.asarray(temperature_k, dtype=np.float64); safe_t = np.maximum(t, 1.0)
+    sp = SPECIES[canonical_species(species)]
+    t = _positive_temperature_array(temperature_k)
+    safe_t = t
     if sp.normal_boiling_temperature_k is not None:
         anchor_t, anchor_p = sp.normal_boiling_temperature_k, 1.01325
     else:
@@ -102,7 +131,9 @@ def _builtin_saturation_pressure_bar(species: str, temperature_k: np.ndarray | f
 
 
 def saturation_pressure_bar(species: str, temperature_k: np.ndarray | float, *, backend: str = "auto") -> np.ndarray | float:
-    key = canonical_species(species); arr = np.asarray(temperature_k)
+    key = canonical_species(species)
+    backend = _validate_backend(backend)
+    arr = _positive_temperature_array(temperature_k)
     if backend in {"auto", "coolprop"} and arr.ndim == 0 and coolprop_available():
         sp = SPECIES[key]
         if sp.coolprop_name is not None:
@@ -127,7 +158,11 @@ def _map_coolprop_phase(text: str) -> str:
 
 
 def phase_at(species: str, temperature_k: float, pressure_bar: float, *, backend: str = "auto") -> str:
-    key = canonical_species(species); sp = SPECIES[key]; t = float(temperature_k); p = max(float(pressure_bar), 0.0)
+    key = canonical_species(species)
+    backend = _validate_backend(backend)
+    sp = SPECIES[key]
+    t = _finite_positive("temperature_k", temperature_k)
+    p = _finite_nonnegative("pressure_bar", pressure_bar)
     if backend in {"auto", "coolprop"} and coolprop_available() and sp.coolprop_name is not None:
         try:
             if t >= sp.triple_temperature_k:
@@ -142,7 +177,10 @@ def phase_at(species: str, temperature_k: float, pressure_bar: float, *, backend
 
 
 def phase_code_grid(species: str, temperature_k: np.ndarray, pressure_bar: float) -> np.ndarray:
-    key = canonical_species(species); sp = SPECIES[key]; t = np.asarray(temperature_k, dtype=np.float64); p = float(pressure_bar)
+    key = canonical_species(species)
+    sp = SPECIES[key]
+    t = _positive_temperature_array(temperature_k)
+    p = _finite_nonnegative("pressure_bar", pressure_bar)
     psat = np.asarray(saturation_pressure_bar(key, t, backend="builtin"), dtype=np.float64); out = np.zeros(t.shape, dtype=np.uint8)
     out[(t < sp.triple_temperature_k) & (p >= psat)] = 2
     out[(t >= sp.triple_temperature_k) & (t < sp.critical_temperature_k) & (p >= psat)] = 1
@@ -167,8 +205,13 @@ def mean_molar_mass_g_mol(composition: Mapping[str, float]) -> float:
 
 
 def greenhouse_optical_depth(composition: Mapping[str, float], pressure_bar: float, *, path_length_factor: float = 1.0) -> dict[str, float]:
-    comp = normalize_composition(composition); p = max(float(pressure_bar), 1e-9); partial = {k: p * v for k, v in comp.items()}
-    pressure_gate = min(1.0, (p / 0.5) ** 0.35); broadening = 1.0 + 0.15 * math.log1p(p); path = float(np.clip(path_length_factor, 0.1, 10.0)) ** 0.45
+    comp = normalize_composition(composition)
+    p = _finite_positive("pressure_bar", pressure_bar)
+    path_factor = _finite_positive("path_length_factor", path_length_factor)
+    partial = {k: p * v for k, v in comp.items()}
+    pressure_gate = min(1.0, (p / 0.5) ** 0.35)
+    broadening = 1.0 + 0.15 * math.log1p(p)
+    path = float(np.clip(path_factor, 0.1, 10.0)) ** 0.45
     terms = {
         "background_collision": 0.04 * p**1.25,
         "CO2": 0.22 * math.sqrt(partial.get("CO2", 0.0) / 4.2e-4) * pressure_gate,
@@ -181,14 +224,16 @@ def greenhouse_optical_depth(composition: Mapping[str, float], pressure_bar: flo
     }
     for key in ("CO2", "H2O", "CH4", "NH3", "SO2", "H2S"): terms[key] *= broadening
     for key in tuple(terms): terms[key] *= path
-    terms["total"] = max(0.0, sum(terms.values())); terms["path_length_factor"] = float(path_length_factor)
+    terms["total"] = max(0.0, sum(terms.values())); terms["path_length_factor"] = path_factor
     return terms
 
 
 def composition_greenhouse_temperature_k(equilibrium_temperature_k: float, composition: Mapping[str, float], pressure_bar: float,
                                          *, path_length_factor: float = 1.0) -> tuple[float, dict[str, float]]:
-    terms = greenhouse_optical_depth(composition, pressure_bar, path_length_factor=path_length_factor); tau = terms["total"]
-    return float(equilibrium_temperature_k) * (1.0 + 0.75 * tau) ** 0.25, terms
+    equilibrium = _finite_positive("equilibrium_temperature_k", equilibrium_temperature_k)
+    terms = greenhouse_optical_depth(composition, pressure_bar, path_length_factor=path_length_factor)
+    tau = terms["total"]
+    return equilibrium * (1.0 + 0.75 * tau) ** 0.25, terms
 
 
 def select_active_condensible(composition: Mapping[str, float], surface_volatiles: Mapping[str, float], temperature_k: float,
@@ -200,17 +245,25 @@ def select_active_condensible(composition: Mapping[str, float], surface_volatile
     simultaneous condensates. Surface ocean/ice inventory outranks atmospheric
     background gases; supercritical species are excluded from automatic selection.
     """
-    if requested != "auto": return canonical_species(requested)
-    comp = normalize_composition(composition); surface: dict[str, float] = {}
+    temperature = _finite_positive("temperature_k", temperature_k)
+    pressure = _finite_positive("pressure_bar", pressure_bar)
+    if requested != "auto":
+        return canonical_species(requested)
+    comp = normalize_composition(composition)
+    surface: dict[str, float] = {}
     for name, inventory in surface_volatiles.items():
-        key = canonical_species(name); amount = float(inventory)
-        if amount > 0: surface[key] = surface.get(key, 0.0) + amount
+        key = canonical_species(name)
+        amount = float(inventory)
+        if not math.isfinite(amount) or amount < 0.0:
+            raise ValueError("surface volatile inventories must be finite and non-negative")
+        if amount > 0:
+            surface[key] = surface.get(key, 0.0) + amount
     if surface:
         best: tuple[float, str] | None = None
         for key, abundance in surface.items():
-            state = phase_at(key, temperature_k, pressure_bar, backend="builtin")
-            psat = float(saturation_pressure_bar(key, temperature_k, backend="builtin"))
-            proximity = abs(math.log10(max(psat, 1e-12) / max(pressure_bar, 1e-12)))
+            state = phase_at(key, temperature, pressure, backend="builtin")
+            psat = float(saturation_pressure_bar(key, temperature, backend="builtin"))
+            proximity = abs(math.log10(max(psat, 1e-12) / pressure))
             phase_bonus = -3.0 if state == "liquid" else (-1.5 if state == "solid" else 0.0)
             score = proximity + phase_bonus - 0.25 * math.log1p(abundance)
             if best is None or score < best[0]: best = (score, key)
@@ -224,8 +277,8 @@ def select_active_condensible(composition: Mapping[str, float], surface_volatile
     for key, frac in comp.items():
         if key not in condensable_candidates or frac <= 1e-6: continue
         sp = SPECIES[key]
-        if temperature_k >= sp.critical_temperature_k: continue
-        psat = float(saturation_pressure_bar(key, temperature_k, backend="builtin")); partial = max(frac * pressure_bar, 1e-12)
+        if temperature >= sp.critical_temperature_k: continue
+        psat = float(saturation_pressure_bar(key, temperature, backend="builtin")); partial = max(frac * pressure, 1e-12)
         score = abs(math.log10(max(psat, 1e-12) / partial)) - 0.15 * math.log1p(frac)
         if best is None or score < best[0]: best = (score, key)
     return None if best is None else best[1]
@@ -239,15 +292,25 @@ def relative_vapor_capacity(species: str, temperature_k: np.ndarray, reference_t
 
 def tidal_heating_power_w(*, satellite_radius_earth: float, primary_mass_earth: float, orbit_km: float, eccentricity: float,
                           love_number_k2: float, quality_factor_q: float) -> float:
-    if quality_factor_q <= 0 or orbit_km <= 0 or primary_mass_earth <= 0: return 0.0
-    a = float(orbit_km) * 1000.0; n = math.sqrt(G * float(primary_mass_earth) * M_EARTH / a**3)
-    r = float(satellite_radius_earth) * R_EARTH; e = max(float(eccentricity), 0.0)
-    return 10.5 * (float(love_number_k2) / float(quality_factor_q)) * n**5 * r**5 / G * e**2
+    radius = _finite_positive("tidal heating satellite_radius_earth", satellite_radius_earth)
+    primary_mass = _finite_positive("tidal heating primary_mass_earth", primary_mass_earth)
+    orbit = _finite_positive("tidal heating orbit_km", orbit_km)
+    eccentricity_value = _finite_nonnegative("tidal heating eccentricity", eccentricity)
+    love = _finite_nonnegative("tidal heating love_number_k2", love_number_k2)
+    quality = _finite_positive("tidal heating quality_factor_q", quality_factor_q)
+    if eccentricity_value >= 1.0:
+        raise ValueError("tidal heating eccentricity must be less than 1")
+    a = orbit * 1000.0
+    n = math.sqrt(G * primary_mass * M_EARTH / a**3)
+    r = radius * R_EARTH
+    return 10.5 * (love / quality) * n**5 * r**5 / G * eccentricity_value**2
 
 
 def tidal_heating_flux_w_m2(**kwargs: float) -> float:
-    power = tidal_heating_power_w(**kwargs); area = 4.0 * math.pi * (float(kwargs["satellite_radius_earth"]) * R_EARTH)**2
-    return power / max(area, 1.0)
+    power = tidal_heating_power_w(**kwargs)
+    radius = _finite_positive("tidal heating satellite_radius_earth", kwargs["satellite_radius_earth"])
+    area = 4.0 * math.pi * (radius * R_EARTH) ** 2
+    return power / area
 
 
 def geological_activity_regime(total_internal_heat_flux_w_m2: float) -> str:
@@ -261,10 +324,16 @@ def geological_activity_regime(total_internal_heat_flux_w_m2: float) -> str:
 
 def atmosphere_diagnostics(*, composition: Mapping[str, float], pressure_bar: float, temperature_k: float,
                            gravity_m_s2: float) -> dict[str, object]:
-    comp = normalize_composition(composition); mw = mean_molar_mass_g_mol(comp); partial = {k: v * pressure_bar for k, v in comp.items()}
-    scale_height_km = R_GAS * max(float(temperature_k), 1.0) / ((mw / 1000.0) * max(float(gravity_m_s2), 1e-9)) / 1000.0
-    density = pressure_bar * 1e5 * (mw / 1000.0) / (R_GAS * max(float(temperature_k), 1.0)); column_mass = pressure_bar * 1e5 / max(float(gravity_m_s2), 1e-9)
-    return {"surface_pressure_bar": float(pressure_bar), "fractions": comp, "partial_pressures_bar": partial,
+    pressure = _finite_positive("pressure_bar", pressure_bar)
+    temperature = _finite_positive("temperature_k", temperature_k)
+    gravity = _finite_positive("gravity_m_s2", gravity_m_s2)
+    comp = normalize_composition(composition)
+    mw = mean_molar_mass_g_mol(comp)
+    partial = {k: v * pressure for k, v in comp.items()}
+    scale_height_km = R_GAS * temperature / ((mw / 1000.0) * gravity) / 1000.0
+    density = pressure * 1e5 * (mw / 1000.0) / (R_GAS * temperature)
+    column_mass = pressure * 1e5 / gravity
+    return {"surface_pressure_bar": pressure, "fractions": comp, "partial_pressures_bar": partial,
             "mean_molar_mass_g_mol": float(mw), "scale_height_km_approx": float(scale_height_km),
             "surface_density_kg_m3_approx": float(density), "atmospheric_column_mass_kg_m2": float(column_mass)}
 
