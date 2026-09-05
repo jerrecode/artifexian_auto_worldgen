@@ -334,7 +334,7 @@ class WorldPipeline(_GeomorphologyWorldPipeline):
         m = result.metadata
         f = world["procedural_erosion_forcing"].metadata
         return report + "\n\n## Environment-conditioned procedural erosion\n\n" + (
-            f"- Seamless 3-D phase-cell octaves: {m['octaves']}; maximum absolute displacement {m['max_absolute_displacement_m']:.3f} m.\n"
+            f"- Seamless 3-D phase-cell octaves executed: {m['octaves_executed']} of {m['octaves_requested']}; maximum absolute displacement {m['max_absolute_displacement_m']:.3f} m.\n"
             f"- Dominant condensate for mechanical scaling: {f['dominant_condensate']}; fluid multiplier {f['fluid_mechanical_factor']:.3f}.\n"
             f"- Canonical dependency recoupling: {bool(self.cfg.procedural_erosion.recouple_after_canonical_pass)}.\n"
             "- The procedural layer supplies deterministic unresolved morphology; physical runoff, sediment routing, glacial/coastal processes and volatile mass conservation remain owned by their dedicated solvers.\n"
