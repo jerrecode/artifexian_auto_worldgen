@@ -109,9 +109,43 @@ def world_diagnostics(world: Mapping[str, Any]) -> dict[str, Any]:
     invariants.append(InvariantResult("climate:nonnegative_precipitation", precip_min >= -1e-8, precip_min, 1e-8))
 
     land_fraction = float(grid.weighted_fraction(terrain.land))
+    liquids = world.get("surface_liquids")
+    if liquids is None:
+        land_fraction_ok = 0.0 < land_fraction < 1.0
+        land_fraction_detail = (
+            "legacy target-land-fraction worlds must retain both emergent land and ocean"
+        )
+    else:
+        liquid_volume_m3 = max(float(getattr(liquids, "total_liquid_volume_m3", 0.0)), 0.0)
+        liquid_mask = np.asarray(
+            getattr(liquids, "liquid_mask", np.zeros(grid.shape, dtype=bool)),
+            dtype=bool,
+        )
+        wet_fraction = float(grid.weighted_fraction(liquid_mask))
+        terrain_ocean = np.asarray(terrain.ocean, dtype=bool)
+        mask_consistent = bool(np.array_equal(liquid_mask, terrain_ocean))
+        invariants.append(InvariantResult(
+            "surface_liquid:wet_mask_matches_terrain_ocean",
+            mask_consistent,
+            int(np.count_nonzero(liquid_mask ^ terrain_ocean)),
+            0.0,
+            "the conserved mobile-liquid mask must be the canonical terrain ocean mask",
+        ))
+        if liquid_volume_m3 > 0.0:
+            land_fraction_ok = bool(np.any(liquid_mask)) and land_fraction < 1.0
+            land_fraction_detail = (
+                "positive mobile-liquid volume requires at least one wet cell; fully oceanic "
+                "worlds are valid when the conserved fill leaves no emergent land"
+            )
+        else:
+            land_fraction_ok = (not np.any(liquid_mask)) and abs(land_fraction - 1.0) <= 1.0e-12
+            land_fraction_detail = (
+                "zero mobile-liquid volume is valid only when no wet cells remain; configured "
+                "volatile mass may be entirely vapor or thermodynamically sequestered as solid"
+            )
     invariants.append(InvariantResult(
-        "terrain:land_fraction_valid", 0.0 < land_fraction < 1.0, land_fraction,
-        detail="configured coupled land/ocean worlds must retain both emergent land and surface liquid",
+        "terrain:land_fraction_valid", land_fraction_ok, land_fraction,
+        detail=land_fraction_detail,
     ))
     reported_land = terrain.metadata.get("actual_land_fraction")
     if reported_land is not None:
@@ -190,7 +224,6 @@ def world_diagnostics(world: Mapping[str, Any]) -> dict[str, Any]:
                 "each routed sediment parcel must be deposited, retained at a sink, or exported",
             ))
 
-    liquids = world.get("surface_liquids")
     if liquids is not None:
         total = max(abs(float(liquids.total_liquid_volume_m3)), 1.0)
         relative_volume_residual = abs(float(liquids.volume_residual_m3)) / total
