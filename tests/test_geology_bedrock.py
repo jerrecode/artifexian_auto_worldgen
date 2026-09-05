@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from worldgen.config import ClimateConfig, NoiseConfig, TerrainConfig, TectonicsConfig
+from worldgen.config import NoiseConfig, ResolutionConfig, TerrainConfig, TectonicsConfig
 from worldgen.geology import build_geology
 from worldgen.grid import SphereGrid
 from worldgen.noise import build_static_noise_fields
@@ -20,7 +20,7 @@ def test_geology_tracks_bedrock_separately_from_offshore_surface_sediment():
     tect = generate_tectonics(
         grid,
         tcfg,
-        type("Resolution", (), {"history_myr": 50, "history_step_myr": 25})(),
+        ResolutionConfig(width=64, height=32, history_myr=50, history_step_myr=25),
         rng("tectonics"),
         NoiseConfig(octaves=4),
     )
