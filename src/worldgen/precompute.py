@@ -175,7 +175,7 @@ def estimate_precompute_bytes(
     if cfg.hydrology:
         per_tile += n * n * (4 + 1 + 4 + 4 + 4 + 1 + 1)
     if cfg.geomorphology:
-        per_tile += n * n * (4 * 4 + 1)
+        per_tile += n * n * (6 * 4 + 1)
     # PNG and vector output sizes are data-dependent.  They are deliberately not
     # included so the estimate is labelled uncompressed-array/mesh payload rather
     # than a false precise disk forecast.
