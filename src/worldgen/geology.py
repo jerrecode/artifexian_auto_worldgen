@@ -26,6 +26,7 @@ ROCK_NAMES = {
 @dataclass(slots=True)
 class GeologyResult:
     rock_code: np.ndarray
+    bedrock_code: np.ndarray
     paleoshallow_sea: np.ndarray
     craton: np.ndarray
     shield: np.ndarray
@@ -81,17 +82,21 @@ def build_geology(
     basin_score = 0.45 * paleo + 0.30 * (terrain.lowland_strength > 0) + 0.25 * near_orogen
     basin = land & (smooth_periodic(basin_score, (2, 3)) > 0.38)
 
-    rock = np.zeros(land.shape, dtype=np.uint8)
-    # Default exposed continental substrate.
-    rock[land] = 3
-    rock[shield] = np.where(lith_texture[shield] < 0.56, 4, 3)
-    rock[platform] = 1
+    # Bedrock is tracked independently from the exposed/surface-material class.
+    # Oceanic crust defaults to basalt while continental crust defaults to granite;
+    # later sediment/alluvium overrides affect rock_code without erasing substrate.
+    bedrock = np.where(tect.continental_crust, 3, 5).astype(np.uint8)
+    bedrock[shield] = np.where(lith_texture[shield] < 0.56, 4, 3)
+    bedrock[platform] = 1
+    rock = bedrock.copy()
 
     # Sedimentary facies; carbonate favored warm former shallow seas, clastic around erosion/basins.
     warm = climate.annual_temperature_c > 12
     carbonate = land & (paleo > 0.50) & warm & (near_orogen < 0.65)
     clastic = basin & ~carbonate
     sediment = land & terrain.lowland_strength.astype(bool) & (climate.annual_precipitation_mm > 700)
+    bedrock[clastic] = 1
+    bedrock[carbonate] = 2
     rock[clastic] = 1
     rock[carbonate] = 2
     rock[sediment & ~carbonate] = 0
@@ -101,25 +106,41 @@ def build_geology(
     active_orogen = land & (dconv < 300)
     andesite = active_orogen & (igneous_texture > 0.42)
     rhyolite = active_orogen & ~andesite
+    bedrock[andesite] = 6
+    bedrock[rhyolite] = 7
     rock[andesite] = 6
     rock[rhyolite] = 7
     metam = land & (tect.paleo_convergence > 0.63) & ~active_orogen
+    bedrock[metam] = 4
     rock[metam] = 4
 
     mafic = land & ((tect.lip_strength > 0.42) | (tect.hotspot_strength > 0.65) |
                     ((tect.paleo_divergence > 0.68) & (tect.rift_age_myr < 180)))
+    bedrock[mafic] = 5
     rock[mafic] = 5
 
     # Greenstone/ultramafic belts: ancient mafic crust in shields, sparse and highly eroded.
     green = shield & (tect.lip_strength > 0.20) & (tect.orogen_age_myr > 250)
     green |= shield & (lith_texture > 0.64) & (igneous_texture < 0.58)
+    bedrock[green] = 8
     rock[green] = 8
 
     metallogenic = normalize01(
         0.55 * np.exp(-dconv / 380.0) + 0.30 * tect.paleo_convergence +
         0.10 * tect.lip_strength + 0.05 * tect.hotspot_strength
     )
-    meta = {"rock_codes": ROCK_NAMES, "paleoshallow_sea_model": "rift+low-continent+shelf likelihood",
-            "noise_model": "shared hybrid multi-type multifractal lithologic fabrics"}
-    return GeologyResult(rock, paleo.astype(np.float32), craton, shield, platform,
+    # Preserve the historical surface-map contract offshore: rock_code=0 denotes
+    # mobile marine sediment/surface cover. bedrock_code retains actual substrate.
+    rock[~land] = 0
+    meta = {
+        "rock_codes": ROCK_NAMES,
+        "bedrock_codes": ROCK_NAMES,
+        "bedrock_surface_material_separated": True,
+        "offshore_surface_material": "unconsolidated_sediment",
+        "oceanic_default_bedrock": "basalt_mafic",
+        "continental_default_bedrock": "granite",
+        "paleoshallow_sea_model": "rift+low-continent+shelf likelihood",
+        "noise_model": "shared hybrid multi-type multifractal lithologic fabrics",
+    }
+    return GeologyResult(rock, bedrock, paleo.astype(np.float32), craton, shield, platform,
                          metallogenic.astype(np.float32), green, basin, meta)
