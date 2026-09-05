@@ -7,6 +7,7 @@ import numpy as np
 from scipy import ndimage
 
 from .config import HydrologyConfig, NoiseConfig
+from .lithology_properties import MECHANICAL_ERODIBILITY, RUNOFF_MULTIPLIER
 from .grid import SphereGrid, normalize01, smooth_periodic
 from .terrain import TerrainResult
 from .ocean import OceanResult
@@ -60,8 +61,8 @@ _FLOW_NEIGHBORS = _FLOOD_NEIGHBORS + [
     (-2,-1),(-2,1),(2,-1),(2,1),(-1,-2),(-1,2),(1,-2),(1,2),
     (-2,0),(2,0),(0,-2),(0,2),
 ]
-_LITH_ERODIBILITY = np.array([1.75, 1.20, 0.82, 0.46, 0.36, 0.55, 0.52, 0.58, 0.40], dtype=float)
-_LITH_RUNOFF = np.array([0.90, 0.88, 0.68, 1.08, 1.12, 0.96, 1.00, 0.96, 1.05], dtype=float)
+_LITH_ERODIBILITY = MECHANICAL_ERODIBILITY
+_LITH_RUNOFF = RUNOFF_MULTIPLIER
 
 
 def _cell_area_km2(grid: SphereGrid) -> np.ndarray:

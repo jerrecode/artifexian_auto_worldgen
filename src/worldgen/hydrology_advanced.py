@@ -20,12 +20,13 @@ import numpy as np
 from . import hydrology_base as _base
 from .drainage import DrainageGraph
 from .grid import SphereGrid, normalize01
+from .lithology_properties import INFILTRATION_FRACTION, SOIL_CAPACITY_MM
 from .surface_evolution import evolve_surface as _policy_evolve_surface
 from .watersheds import WatershedHierarchy, build_watershed_hierarchy
 
 
-_INFILTRATION = np.asarray([0.62, 0.54, 0.80, 0.47, 0.40, 0.52, 0.49, 0.58, 0.44], dtype=float)
-_SOIL_CAPACITY = np.asarray([190., 145., 245., 115., 105., 135., 125., 155., 110.], dtype=float)
+_INFILTRATION = INFILTRATION_FRACTION
+_SOIL_CAPACITY = SOIL_CAPACITY_MM
 _WATER_CACHE: OrderedDict[tuple, "WaterBalanceResult"] = OrderedDict()
 _LAST_SEDIMENT_LEDGER: dict[str, float] = {}
 

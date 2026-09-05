@@ -290,6 +290,31 @@ class HydrologyConfig:
 
 
 @dataclass(slots=True)
+class ProceduralErosionConfig:
+    enabled: bool = False
+    octaves: int = 5
+    lacunarity: float = 2.0
+    gain: float = 0.52
+    cell_scale: float = 0.72
+    base_wavelength_km: float = 420.0
+    min_wavelength_km: float = 18.0
+    max_wavelength_km: float = 1600.0
+    base_amplitude_m: float = 24.0
+    max_displacement_m: float = 85.0
+    max_local_strength: float = 3.0
+    steering_strength: float = 0.34
+    fade_target_strength: float = 0.28
+    zero_mean_displacement: bool = True
+    recouple_after_canonical_pass: bool = True
+    fluvial_weight: float = 1.0
+    pluvial_weight: float = 0.42
+    glacial_weight: float = 0.72
+    marine_weight: float = 0.34
+    chemical_weight: float = 0.18
+    freeze_thaw_weight: float = 0.24
+
+
+@dataclass(slots=True)
 class SimulationConfig:
     earth_system_passes: int = 3
     final_climate_ocean_passes: int = 1
@@ -424,6 +449,7 @@ class WorldConfig:
     ocean: OceanConfig = field(default_factory=OceanConfig)
     climate: ClimateConfig = field(default_factory=ClimateConfig)
     hydrology: HydrologyConfig = field(default_factory=HydrologyConfig)
+    procedural_erosion: ProceduralErosionConfig = field(default_factory=ProceduralErosionConfig)
     simulation: SimulationConfig = field(default_factory=SimulationConfig)
     weather: WeatherConfig = field(default_factory=WeatherConfig)
     resources: ResourcesConfig = field(default_factory=ResourcesConfig)
@@ -587,6 +613,25 @@ class WorldConfig:
         for name in ("deposition_strength", "river_meander_strength", "lateral_erosion_fraction", "delta_retention_fraction", "delta_min_outlet_discharge_norm", "lake_area_soft_cap_fraction_land", "tributary_discharge_fraction", "delta_wave_reworking_strength", "delta_tide_reworking_strength", "delta_distributary_texture_strength"):
             _fraction(f"hydrology.{name}", getattr(h, name))
 
+        pe = self.procedural_erosion
+        _boolean("procedural_erosion.enabled", pe.enabled)
+        _integer("procedural_erosion.octaves", pe.octaves, minimum=1, maximum=10)
+        _number("procedural_erosion.lacunarity", pe.lacunarity, minimum=1.0, min_inclusive=False)
+        _number("procedural_erosion.gain", pe.gain, minimum=0.0, maximum=1.0, min_inclusive=False)
+        _number("procedural_erosion.cell_scale", pe.cell_scale, minimum=0.1, maximum=2.0)
+        _number("procedural_erosion.base_wavelength_km", pe.base_wavelength_km, minimum=0.0, min_inclusive=False)
+        _number("procedural_erosion.min_wavelength_km", pe.min_wavelength_km, minimum=0.0, min_inclusive=False)
+        _number("procedural_erosion.max_wavelength_km", pe.max_wavelength_km, minimum=pe.min_wavelength_km)
+        _number("procedural_erosion.base_amplitude_m", pe.base_amplitude_m, minimum=0.0)
+        _number("procedural_erosion.max_displacement_m", pe.max_displacement_m, minimum=0.0)
+        _number("procedural_erosion.max_local_strength", pe.max_local_strength, minimum=0.0)
+        _number("procedural_erosion.steering_strength", pe.steering_strength, minimum=0.0)
+        _number("procedural_erosion.fade_target_strength", pe.fade_target_strength, minimum=0.0, maximum=1.0)
+        _boolean("procedural_erosion.zero_mean_displacement", pe.zero_mean_displacement)
+        _boolean("procedural_erosion.recouple_after_canonical_pass", pe.recouple_after_canonical_pass)
+        for name in ("fluvial_weight", "pluvial_weight", "glacial_weight", "marine_weight", "chemical_weight", "freeze_thaw_weight"):
+            _number(f"procedural_erosion.{name}", getattr(pe, name), minimum=0.0)
+
         sim = self.simulation
         _integer("simulation.earth_system_passes", sim.earth_system_passes, minimum=1); _integer("simulation.final_climate_ocean_passes", sim.final_climate_ocean_passes, minimum=1)
         _fraction("simulation.intermediate_climate_fraction", sim.intermediate_climate_fraction); _fraction("simulation.intermediate_ocean_fraction", sim.intermediate_ocean_fraction); _boolean("simulation.preserve_initial_sea_level", sim.preserve_initial_sea_level)
@@ -609,7 +654,7 @@ class WorldConfig:
 _SECTION_TYPES = {
     "resolution": ResolutionConfig, "astronomy": AstronomyConfig, "atmogen": AtmogenConfig, "noise": NoiseConfig,
     "tectonics": TectonicsConfig, "terrain": TerrainConfig, "ocean": OceanConfig,
-    "climate": ClimateConfig, "hydrology": HydrologyConfig, "simulation": SimulationConfig,
+    "climate": ClimateConfig, "hydrology": HydrologyConfig, "procedural_erosion": ProceduralErosionConfig, "simulation": SimulationConfig,
     "weather": WeatherConfig, "resources": ResourcesConfig, "society": SocietyConfig,
     "appearance": AppearanceConfig, "output": OutputConfig,
 }
