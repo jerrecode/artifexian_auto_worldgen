@@ -19,6 +19,11 @@ remain future work and are not claimed as implemented.
 
 A deterministic, configurable Python pipeline that reconstructs the *kind of work* performed across the supplied **Worldbuilder's Log** transcripts as one automated procedural system.
 
+The environment-conditioned advanced phase-cell erosion layer is documented in
+[`PROCEDURAL_EROSION.md`](PROCEDURAL_EROSION.md), including the Runevision
+algorithmic lineage, spherical adaptation, environmental forcing contract,
+mass/volume semantics, recoupling behavior, validation, and limitations.
+
 The goal is not to automate Photoshop, GPlates, Blender, Desmos, or spreadsheet clicks. The goal is to replace those manual representations with the underlying data and operations they stand for: spherical geometry, orbital physics, kinematic plate history, continuous raster fields, hydrology, climate, rule-based geology/resource generation, and a seeded constrained history generator.
 
 ## What it generates
