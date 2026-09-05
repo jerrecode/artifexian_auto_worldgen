@@ -171,7 +171,7 @@ def test_major_water_mask_rejects_invalid_fraction_thresholds(kwargs):
     grid = SphereGrid(32, 16)
     water = np.zeros(grid.shape, dtype=bool)
     water[:, :16] = True
-    with pytest.raises(ValueError, match="fraction.*\[0, 1\]"):
+    with pytest.raises(ValueError, match=r"fraction.*\[0, 1\]"):
         major_water_mask(grid, water, **kwargs)
 
 
