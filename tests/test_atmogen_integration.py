@@ -175,7 +175,7 @@ def test_atmogen_settings_change_only_dependent_stage_key_inputs():
 
 
 def test_worldgen_targets_hardened_atmogen_revision():
-    assert ATMOGEN_COMPATIBLE_REVISION == "caf747f24f30e3c015fbcb60661effd08af505bd"
+    assert ATMOGEN_COMPATIBLE_REVISION == "401a5026b65f366eb7b67b2932b196e71fe3c341"
 
 
 @pytest.mark.parametrize(
