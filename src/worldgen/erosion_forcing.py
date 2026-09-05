@@ -297,6 +297,21 @@ def _surface_liquid_factor(
         if mass > 0.0:
             species_mass[str(raw_key)] = species_mass.get(str(raw_key), 0.0) + mass
 
+    partition_total = float(sum(species_mass.values()))
+    declared_total_raw = getattr(surface_liquids, "total_liquid_mass_kg", None)
+    if declared_total_raw is not None:
+        declared_total = float(declared_total_raw)
+        if not np.isfinite(declared_total) or declared_total < 0.0:
+            raise ValueError(
+                "surface total_liquid_mass_kg must be finite and non-negative"
+            )
+        tolerance = max(1.0e-9 * max(declared_total, partition_total, 1.0), 1.0e-6)
+        if abs(declared_total - partition_total) > tolerance:
+            raise ValueError(
+                "surface total_liquid_mass_kg is inconsistent with partition "
+                "liquid masses"
+            )
+
     if not species_mass:
         return 1.0, {
             "marine_fluid_property_source": "neutral_no_standing_liquid",
