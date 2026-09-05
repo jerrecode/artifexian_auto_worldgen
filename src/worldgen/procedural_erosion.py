@@ -97,7 +97,8 @@ def _unit_positions(grid) -> np.ndarray:
     )
 
 
-def _tangent_perpendicular(grid, south: np.ndarray, east_component: np.ndarray) -> np.ndarray:
+def _tangent_bases(grid) -> tuple[np.ndarray, np.ndarray]:
+    """Return immutable south/east tangent bases for the spherical raster."""
     lat = np.deg2rad(np.asarray(grid.lat, dtype=np.float64))
     lon = np.deg2rad(np.asarray(grid.lon, dtype=np.float64))
     east = np.stack((-np.sin(lon), np.cos(lon), np.zeros_like(lon)), axis=-1)
@@ -105,14 +106,35 @@ def _tangent_perpendicular(grid, south: np.ndarray, east_component: np.ndarray) 
         (-np.sin(lat) * np.cos(lon), -np.sin(lat) * np.sin(lon), np.cos(lat)),
         axis=-1,
     )
-    south_basis = -north
-    direction = south[..., None] * south_basis + east_component[..., None] * east
+    return -north, east
+
+
+def _tangent_perpendicular_precomputed(
+    normal: np.ndarray,
+    south_basis: np.ndarray,
+    east_basis: np.ndarray,
+    south: np.ndarray,
+    east_component: np.ndarray,
+) -> np.ndarray:
+    """Build the phase-line perpendicular from immutable spherical geometry."""
+    direction = (
+        south[..., None] * south_basis
+        + east_component[..., None] * east_basis
+    )
     dn = np.linalg.norm(direction, axis=-1, keepdims=True)
     direction = np.divide(direction, np.maximum(dn, 1.0e-15))
-    normal = _unit_positions(grid)
     perp = np.cross(normal, direction)
     pn = np.linalg.norm(perp, axis=-1, keepdims=True)
     return np.divide(perp, np.maximum(pn, 1.0e-15))
+
+
+def _tangent_perpendicular(grid, south: np.ndarray, east_component: np.ndarray) -> np.ndarray:
+    """Reference convenience path that derives spherical geometry on demand."""
+    normal = _unit_positions(grid)
+    south_basis, east_basis = _tangent_bases(grid)
+    return _tangent_perpendicular_precomputed(
+        normal, south_basis, east_basis, south, east_component
+    )
 
 
 def phase_cell_octave_xyz(
@@ -397,6 +419,11 @@ def apply_procedural_erosion(
     ridge_map = np.zeros(shape, dtype=np.float64)
     crease_map = np.zeros(shape, dtype=np.float64)
 
+    # Planet geometry is invariant across erosion octaves. The previous reference
+    # path rebuilt these trigonometric fields inside every phase-cell octave.
+    unit_xyz = _unit_positions(grid)
+    south_basis, east_basis = _tangent_bases(grid)
+
     slope_s, slope_e = grid.ops.metric_gradient(elevation)
     slope_length = np.hypot(slope_s, slope_e)
     slope_reference = max(float(getattr(cfg, "slope_reference", 0.08)), 1.0e-12)
@@ -475,11 +502,18 @@ def apply_procedural_erosion(
             where=gully_norm > 1.0e-12,
         )
 
-        c, s, coherence = _phase_cell_octave(
-            grid,
-            wavelength,
+        perpendicular_xyz = _tangent_perpendicular_precomputed(
+            unit_xyz,
+            south_basis,
+            east_basis,
             direction_s,
             direction_e,
+        )
+        c, s, coherence = phase_cell_octave_xyz(
+            unit_xyz,
+            float(grid.radius_km),
+            wavelength,
+            perpendicular_xyz,
             cell_scale=float(cfg.cell_scale),
             seed=int(seed),
             octave=octave,
@@ -585,6 +619,7 @@ def apply_procedural_erosion(
         "cell_scale": float(cfg.cell_scale),
         "phase_normalization": phase_normalization,
         "phase_chunk_rows": int(getattr(cfg, "phase_chunk_rows", 128)),
+        "spherical_geometry_precomputed": True,
         "gully_weight": gully_weight,
         "detail_power": detail_power,
         "slope_reference": slope_reference,
