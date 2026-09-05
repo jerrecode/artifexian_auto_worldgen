@@ -23,7 +23,15 @@ from .hydrology_advanced import (
     runoff_mm_advanced,
     transport_sediment_topological,
 )
+from .hydrology_reliability import (
+    channel_hierarchy_discharge_guarded,
+    enforce_hydrology_guardrails,
+    lake_mask_volume_guarded,
+    priority_flood_closed_aware,
+)
+from .hydrology_natural_routing import flow_directions_continuous_local
 from .multicondensate_water_balance import build_multicondensate_water_balance
+from .watershed_naturalism import build_watershed_hierarchy_natural
 
 
 # Keep the legacy/ordinary conservative bucket as the default, but let a hydrologic
@@ -69,18 +77,43 @@ for _result_cls in (WaterBalanceResult, AdvancedHydrologyResult):
 # Install deterministic optimized/conservative backends into the shared equations.
 # Both the interval and adaptive surface-evolution policies resolve these names from
 # hydrology_base at call time.
-_base._priority_flood = priority_flood
+_base._priority_flood = priority_flood_closed_aware
+_base._flow_directions = flow_directions_continuous_local
+_base._lake_mask = lake_mask_volume_guarded
 _base._runoff_mm = runoff_mm_advanced
 _base._transport_sediment = transport_sediment_topological
+_advanced._channel_hierarchy = channel_hierarchy_discharge_guarded
+_advanced.build_watershed_hierarchy = build_watershed_hierarchy_natural
 
 from .hydrology_base import *  # noqa: F401,F403,E402
 
-# Public advanced wrappers.  Existing callers continue using the same function names.
-build_hydrology = build_hydrology_advanced
+# Public advanced wrappers. Existing callers continue using the same function names.
+def build_hydrology(
+    grid,
+    terrain,
+    ocean,
+    climate,
+    cfg,
+    geology=None,
+    surface=None,
+):
+    """Build advanced hydrology and reject globally pathological classifications."""
+    result = build_hydrology_advanced(
+        grid, terrain, ocean, climate, cfg, geology, surface
+    )
+    enforce_hydrology_guardrails(result, terrain, cfg)
+    result.metadata["routing_reliability_model"] = (
+        "closed-basin-aware Priority-Flood + continuous multi-scale look-ahead "
+        "with strictly adjacent receivers + discharge-gated channels + bounded "
+        "lake occupancy + global major-basin watershed hierarchy"
+    )
+    return result
+
+
 evolve_surface = evolve_surface_advanced
 
 # Preserve historically importable private name for tests/tools.
-_priority_flood = priority_flood
+_priority_flood = priority_flood_closed_aware
 
 __all__ = [name for name in dir(_base) if not name.startswith("_")]
 __all__ += [
