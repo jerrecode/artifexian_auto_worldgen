@@ -337,8 +337,11 @@ The reference implementation is vectorized NumPy. The high-level operator defaul
 to row-chunked phase-cell evaluation (`phase_chunk_rows=128`) so the 27-neighbour
 temporary working set scales with chunk height rather than the full raster height.
 Set `phase_chunk_rows=0` to force the unchunked reference path; chunked and
-unchunked evaluation are regression-tested for bit-identical outputs. This reduces
-peak memory without changing hashes, phases, normalization, or octave recurrence.
+unchunked evaluation are regression-tested for bit-identical outputs. The high-level
+grid wrapper also constructs unit normals and phase-line perpendiculars inside the
+same row window, so full-raster XYZ geometry temporaries are not materialized before
+a chunked phase evaluation. This reduces peak memory without changing hashes,
+phases, normalization, tangent conventions, or octave recurrence.
 
 A development microbenchmark of one float64 phase-cell octave measured:
 
