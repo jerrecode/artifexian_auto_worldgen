@@ -44,7 +44,7 @@ def test_adapter_replaces_old_greenhouse_authority_and_records_revision():
     metadata = atmogen_runtime_metadata()
     assert metadata["compatible_git_revision"] == ATMOGEN_COMPATIBLE_REVISION
     assert metadata["package_version"] == "0.13.0"
-    assert metadata["api_schema_version"] == 11
+    assert metadata["api_schema_version"] == 12
     assert metadata["data_schema_version"] == 4
 
 
