@@ -203,6 +203,7 @@ def _phase_cell_octave(
     cell_scale: float,
     seed: int,
     octave: int,
+    normalization: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return phase_cell_octave_xyz(
         _unit_positions(grid),
@@ -212,6 +213,7 @@ def _phase_cell_octave(
         cell_scale=cell_scale,
         seed=seed,
         octave=octave,
+        normalization=normalization,
     )
 
 def _rounded_profile(c: np.ndarray, ridge_rounding: np.ndarray, crease_rounding: np.ndarray) -> np.ndarray:
