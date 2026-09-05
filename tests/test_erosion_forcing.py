@@ -91,6 +91,10 @@ def test_forcing_uses_runoff_lithology_soil_and_phase_crossings_without_nan():
     assert np.isfinite(forcing.strength).all()
     assert np.any(forcing.fluvial_activity > 0)
     assert np.any(forcing.freeze_thaw_activity > 0)
+    assert forcing.metadata["freeze_thaw_phase_source"] == (
+        "reference_species_temperature_threshold"
+    )
+    assert forcing.metadata["freeze_thaw_reference_species"] == "H2O"
     assert np.all(forcing.preferred_scale_km >= cfg.min_wavelength_km)
     assert np.all(forcing.preferred_scale_km <= cfg.max_wavelength_km)
 
@@ -394,3 +398,70 @@ def test_spatial_erosion_requests_compact_atmogen_transport_fields(monkeypatch):
         condensate_hydrology=condensate,
     )
     assert observed["include_mass_fractions"] is False
+
+
+def test_freeze_thaw_uses_spatial_condensate_thaw_state_as_phase_authority():
+    grid, terrain, ocean, climate, hydrology, geology, astronomy = _forcing_fixture(
+        land=True,
+        temperature_c=-80.0,
+        precipitation_mm_year=600.0,
+    )
+    shape = grid.shape
+    climate.continentality_index_c = np.full(shape, 24.0, dtype=np.float32)
+    condensate = _spatial_condensate_fixture(grid)
+    thaw = np.zeros((12, *shape), dtype=np.float32)
+    split = shape[1] // 2
+    thaw[6:, :, split:] = 1.0
+    condensate.monthly_thaw_fraction = thaw
+
+    forcing = build_erosion_forcing(
+        grid,
+        terrain,
+        ocean,
+        climate,
+        hydrology,
+        geology,
+        astronomy,
+        ProceduralErosionConfig(enabled=True),
+        condensate_hydrology=condensate,
+    )
+
+    left = forcing.freeze_thaw_activity[:, :split]
+    right = forcing.freeze_thaw_activity[:, split:]
+    assert np.count_nonzero(left) == 0
+    assert np.all(right > 0.0)
+    assert forcing.metadata["freeze_thaw_phase_source"] == (
+        "condensate_hydrology_monthly_thaw_fraction"
+    )
+    assert forcing.metadata["freeze_thaw_condensate_species"] == ["H2O", "NH3"]
+    assert 0.49 < forcing.metadata["freeze_thaw_spatial_active_fraction"] < 0.51
+
+
+@pytest.mark.parametrize(
+    "thaw",
+    [
+        np.ones((12, 1, 1), dtype=np.float32),
+        np.full((12, 32, 64), 1.1, dtype=np.float32),
+        np.full((12, 32, 64), np.nan, dtype=np.float32),
+    ],
+)
+def test_freeze_thaw_rejects_invalid_multicondensate_thaw_fields(thaw):
+    grid, terrain, ocean, climate, hydrology, geology, astronomy = _forcing_fixture(
+        land=True,
+        precipitation_mm_year=600.0,
+    )
+    condensate = _spatial_condensate_fixture(grid)
+    condensate.monthly_thaw_fraction = thaw
+
+    with pytest.raises(ValueError, match="monthly_thaw_fraction"):
+        build_erosion_forcing(
+            grid,
+            terrain,
+            ocean,
+            climate,
+            hydrology,
+            geology,
+            astronomy,
+            ProceduralErosionConfig(enabled=True),
+            condensate_hydrology=condensate,
+        )
