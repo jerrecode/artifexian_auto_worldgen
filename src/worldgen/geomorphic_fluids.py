@@ -9,6 +9,8 @@ from typing import Any
 
 import numpy as np
 
+from atmogen import fluid_transport_properties
+
 from .grid import SphereGrid, normalize01, smooth_periodic
 from .planetary_chemistry import CHEMICALS
 
@@ -50,7 +52,14 @@ class ExoticGeomorphologyResult:
 
 
 def _screening_fluid_properties(species: str) -> tuple[float, float, float]:
-    """Return screening-grade liquid density, viscosity and surface tension."""
+    """Return density, viscosity and surface tension from atmogen when available."""
+    props = fluid_transport_properties(species)
+    if props is not None:
+        return (
+            max(float(props.density_kg_m3), 30.0),
+            max(float(props.dynamic_viscosity_pa_s) * 1.0e3, 0.01),
+            max(float(props.surface_tension_n_m) * 1.0e3, 1.0),
+        )
     sp = CHEMICALS.get(species)
     if sp is None:
         return 997.0, 1.0, 72.0

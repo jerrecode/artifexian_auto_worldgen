@@ -23,7 +23,13 @@ from scipy import ndimage
 
 from .local_hydrology import LocalHydrologySolver, _sample_area_km2
 from .local_orography import edge_anchor_taper, terrain_frame
-from .planet_tiles import PlanetTilePyramid, TileKey, tile_geometry
+from .planet_tiles import (
+    PlanetTilePyramid,
+    TileKey,
+    approximate_meters_per_sample,
+    tile_geometry,
+)
+from .procedural_erosion import phase_cell_octave_xyz
 from .river_constraints import RiverConstraintGenerator
 
 
@@ -37,6 +43,15 @@ class LocalGeomorphologySpec:
     max_deposition_m: float = 3.0
     hillslope_diffusion_fraction: float = 0.12
     edge_anchor_cells: int = 4
+    procedural_detail_enabled: bool = True
+    procedural_octaves: int = 3
+    procedural_base_wavelength_samples: float = 36.0
+    procedural_min_samples_per_wavelength: float = 5.0
+    procedural_amplitude_m: float = 1.25
+    procedural_gain: float = 0.52
+    procedural_lacunarity: float = 2.0
+    procedural_cell_scale: float = 0.72
+    procedural_steering_strength: float = 0.28
 
     def validate(self) -> "LocalGeomorphologySpec":
         for name in (
@@ -57,6 +72,25 @@ class LocalGeomorphologySpec:
             raise ValueError("hillslope_diffusion_fraction must be in [0,0.5]")
         if int(self.edge_anchor_cells) < 1:
             raise ValueError("edge_anchor_cells must be >= 1")
+        if not isinstance(self.procedural_detail_enabled, bool):
+            raise TypeError("procedural_detail_enabled must be bool")
+        if not 1 <= int(self.procedural_octaves) <= 8:
+            raise ValueError("procedural_octaves must be in [1,8]")
+        for name in (
+            "procedural_base_wavelength_samples",
+            "procedural_min_samples_per_wavelength",
+            "procedural_amplitude_m",
+            "procedural_cell_scale",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive")
+        if not math.isfinite(float(self.procedural_gain)) or not 0.0 < float(self.procedural_gain) <= 1.0:
+            raise ValueError("procedural_gain must be in (0,1]")
+        if not math.isfinite(float(self.procedural_lacunarity)) or float(self.procedural_lacunarity) <= 1.0:
+            raise ValueError("procedural_lacunarity must be > 1")
+        if not math.isfinite(float(self.procedural_steering_strength)) or float(self.procedural_steering_strength) < 0.0:
+            raise ValueError("procedural_steering_strength must be finite and non-negative")
         return self
 
 
@@ -66,6 +100,8 @@ class LocalGeomorphologyResult:
     erosion_m: np.ndarray
     deposition_m: np.ndarray
     hillslope_adjustment_m: np.ndarray
+    procedural_detail_m: np.ndarray
+    procedural_coherence: np.ndarray
     major_river_constraint: np.ndarray
     metadata: Mapping[str, object]
 
@@ -136,6 +172,8 @@ class LocalGeomorphologySolver:
             "erosion_m",
             "deposition_m",
             "hillslope_adjustment_m",
+            "procedural_detail_m",
+            "procedural_coherence",
             "major_river_constraint",
         )
         paths = {name: self._path(key, name) for name in names}
@@ -147,6 +185,8 @@ class LocalGeomorphologySolver:
             erosion_m=np.load(paths["erosion_m"], mmap_mode="r", allow_pickle=False),
             deposition_m=np.load(paths["deposition_m"], mmap_mode="r", allow_pickle=False),
             hillslope_adjustment_m=np.load(paths["hillslope_adjustment_m"], mmap_mode="r", allow_pickle=False),
+            procedural_detail_m=np.load(paths["procedural_detail_m"], mmap_mode="r", allow_pickle=False),
+            procedural_coherence=np.load(paths["procedural_coherence"], mmap_mode="r", allow_pickle=False),
             major_river_constraint=np.load(paths["major_river_constraint"], mmap_mode="r", allow_pickle=False),
             metadata=json.loads(meta.read_text(encoding="utf-8")),
         )
@@ -165,7 +205,7 @@ class LocalGeomorphologySolver:
         area_m2 = area_km2 * 1.0e6
         hydro = self.hydrology.solve(key)
         river = self.rivers.generate(key)
-        _normal, slope_deg, _ge, _gs = terrain_frame(
+        _normal, slope_deg, grad_east, grad_south = terrain_frame(
             geom.xyz, base, self.pyramid.planet_radius_m
         )
         slope = np.tan(np.deg2rad(np.clip(slope_deg, 0.0, 80.0)))
@@ -215,6 +255,114 @@ class LocalGeomorphologySolver:
         if correction_denom > 0.0:
             hillslope -= correction_weight * (net / correction_denom)
         evolved = evolved + hillslope
+
+        # Add unresolved deterministic phase-cell morphology without changing the
+        # physical sediment ledger. The field is zero-area-mean on active land and
+        # tapers exactly to the inherited parent terrain at the tile boundary.
+        procedural = np.zeros_like(base)
+        procedural_coherence = np.zeros_like(base)
+        executed_octaves = 0
+        if cfg.procedural_detail_enabled and np.any(land):
+            sample_m = approximate_meters_per_sample(
+                self.pyramid.planet_radius_m,
+                key.level,
+                self.pyramid.spec.tile_size,
+            )
+            base_wavelength_m = sample_m * float(cfg.procedural_base_wavelength_samples)
+            runoff_n = 1.0 - np.exp(
+                -np.maximum(np.asarray(hydro.runoff_mm_year, dtype=np.float64), 0.0) / 650.0
+            )
+            discharge_n = np.clip(
+                np.asarray(hydro.discharge_index, dtype=np.float64), 0.0, 1.0
+            )
+            local_strength = (
+                np.sqrt(runoff_n * (0.20 + 0.80 * discharge_n))
+                * (0.30 + 0.70 * np.clip(slope / 0.15, 0.0, 1.0))
+                * land
+            )
+
+            direction_s = -np.asarray(grad_south, dtype=np.float64)
+            direction_e = -np.asarray(grad_east, dtype=np.float64)
+            direction_norm = np.hypot(direction_s, direction_e)
+            direction_s = np.divide(
+                direction_s, np.maximum(direction_norm, 1.0e-12)
+            )
+            direction_e = np.divide(
+                direction_e,
+                np.maximum(direction_norm, 1.0e-12),
+                out=np.ones_like(direction_e),
+                where=direction_norm > 1.0e-12,
+            )
+
+            unit = np.asarray(geom.xyz, dtype=np.float64)
+            zaxis = np.zeros_like(unit)
+            zaxis[..., 2] = 1.0
+            east_basis = np.cross(zaxis, unit)
+            east_norm = np.linalg.norm(east_basis, axis=-1, keepdims=True)
+            polar = east_norm[..., 0] < 1.0e-10
+            if np.any(polar):
+                fallback = np.zeros_like(unit)
+                fallback[..., 1] = 1.0
+                east_basis[polar] = np.cross(fallback[polar], unit[polar])
+                east_norm = np.linalg.norm(east_basis, axis=-1, keepdims=True)
+            east_basis /= np.maximum(east_norm, 1.0e-15)
+            south_basis = -np.cross(unit, east_basis)
+
+            phase_mask = np.zeros_like(base)
+            raw_detail = np.zeros_like(base)
+            for octave in range(int(cfg.procedural_octaves)):
+                wavelength_m = base_wavelength_m / (
+                    float(cfg.procedural_lacunarity) ** octave
+                )
+                if wavelength_m < float(cfg.procedural_min_samples_per_wavelength) * sample_m:
+                    break
+                direction_xyz = (
+                    direction_s[..., None] * south_basis
+                    + direction_e[..., None] * east_basis
+                )
+                perpendicular = np.cross(unit, direction_xyz)
+                cosine, sine, coherence = phase_cell_octave_xyz(
+                    unit,
+                    self.pyramid.planet_radius_m / 1000.0,
+                    np.full(base.shape, wavelength_m / 1000.0, dtype=np.float64),
+                    perpendicular,
+                    cell_scale=float(cfg.procedural_cell_scale),
+                    seed=int(self.pyramid._read_seed()) ^ 0x4C4F43414C,
+                    octave=octave + 8,
+                )
+                phase_mask = 1.0 - (1.0 - phase_mask) * (
+                    1.0 - np.clip(coherence * (0.55 + 0.45 * local_strength), 0.0, 1.0)
+                )
+                raw_detail += (
+                    float(cfg.procedural_amplitude_m)
+                    * (float(cfg.procedural_gain) ** octave)
+                    * local_strength
+                    * phase_mask
+                    * cosine
+                )
+                procedural_coherence = np.maximum(procedural_coherence, coherence)
+                turn = (
+                    float(cfg.procedural_steering_strength)
+                    * np.sign(sine)
+                    * coherence
+                    * local_strength
+                    * (float(cfg.procedural_gain) ** octave)
+                )
+                ct, st = np.cos(turn), np.sin(turn)
+                new_s = direction_s * ct - direction_e * st
+                new_e = direction_s * st + direction_e * ct
+                new_norm = np.hypot(new_s, new_e)
+                direction_s = np.divide(new_s, np.maximum(new_norm, 1.0e-12))
+                direction_e = np.divide(new_e, np.maximum(new_norm, 1.0e-12))
+                executed_octaves += 1
+
+            active_weight = area_m2 * land * taper
+            denom_detail = float(np.sum(active_weight))
+            if denom_detail > 0.0:
+                mean_detail = float(np.sum(raw_detail * active_weight) / denom_detail)
+                procedural = (raw_detail - mean_detail) * land * taper
+            evolved += procedural
+
         # Reapply exact parent/base perimeter anchoring after all floating operations.
         anchored = base + taper * (evolved - base)
         anchored[0, :] = base[0, :]
@@ -231,6 +379,8 @@ class LocalGeomorphologySolver:
             "erosion_m": erosion.astype(np.float32),
             "deposition_m": deposition.astype(np.float32),
             "hillslope_adjustment_m": hillslope.astype(np.float32),
+            "procedural_detail_m": procedural.astype(np.float32),
+            "procedural_coherence": procedural_coherence.astype(np.float32),
             "major_river_constraint": major.astype(np.bool_),
         }
         for name, values in arrays.items():
@@ -249,6 +399,10 @@ class LocalGeomorphologySolver:
             "exported_sediment_volume_m3": exported_volume_m3,
             "sediment_closure_relative": closure,
             "major_river_constraint_cells": int(np.count_nonzero(major)),
+            "procedural_detail_enabled": bool(cfg.procedural_detail_enabled),
+            "procedural_octaves_executed": int(executed_octaves),
+            "procedural_max_absolute_detail_m": float(np.max(np.abs(procedural))),
+            "procedural_semantics": "zero-area-mean unresolved morphology; excluded from the physical sediment mass ledger",
             "boundary_semantics": "all geomorphic terrain perturbations vanish on the tile perimeter; output core remains watertight with independently generated neighbours",
             "limitations": [
                 "single bounded local evolution pass uses the current local drainage graph rather than iterating hydrology to full landscape equilibrium",

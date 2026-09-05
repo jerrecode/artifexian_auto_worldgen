@@ -22,8 +22,9 @@ from . import pipeline as _pipeline  # noqa: E402
 from .pipeline_liquids import WorldPipeline as _SurfaceLiquidWorldPipeline  # noqa: E402,F401
 from .pipeline_exotic import WorldPipeline as _ExoticWorldPipeline  # noqa: E402,F401
 from .pipeline_landscape import WorldPipeline as _LandscapeWorldPipeline  # noqa: E402,F401
-from .pipeline_geomorphology import WorldPipeline as _GeomorphologyWorldPipeline  # noqa: E402
-_pipeline.WorldPipeline = _GeomorphologyWorldPipeline
+from .pipeline_geomorphology import WorldPipeline as _GeomorphologyWorldPipeline  # noqa: E402,F401
+from .pipeline_procedural_erosion import WorldPipeline as _ProceduralErosionWorldPipeline  # noqa: E402
+_pipeline.WorldPipeline = _ProceduralErosionWorldPipeline
 
 
 def __getattr__(name: str):
