@@ -1,0 +1,420 @@
+name: Maximum-quality random planet validation
+
+on:
+  push:
+    branches:
+      - planet-validation-20260905
+    paths:
+      - '.github/workflows/qa-max-quality-planets.yml'
+      - 'src/**'
+      - 'scripts/**'
+      - 'config/**'
+      - 'pyproject.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: max-quality-planets-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    name: Erosion + atmogen regression preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      MPLBACKEND: Agg
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_MAX_THREADS: '1'
+      NUMBA_CACHE_DIR: ${{ github.workspace }}/.numba-cache
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install full validation stack
+        run: |
+          set -euxo pipefail
+          python -m pip install --disable-pip-version-check -e '.[performance,jit,storage,thermodynamics,render,dev]'
+          python -m pip check
+      - name: Run coupled regression gates
+        run: |
+          set -euxo pipefail
+          python -m pytest -q             tests/test_procedural_erosion.py             tests/test_erosion_forcing.py             tests/test_pipeline_procedural_erosion.py             tests/test_atmogen_integration.py             tests/test_atmogen_coupling.py             tests/test_exotic_planets.py
+
+  generate-audit-archive:
+    needs: preflight
+    name: ${{ matrix.slug }} seed ${{ matrix.seed }} @ 2048x1024
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slug: temperate-earthlike
+            overlay: config/maximal_realism_safe.yaml
+            seed: 643544327
+          - slug: super-earth
+            overlay: config/super_earth.yaml
+            seed: 856796631
+          - slug: titan-like
+            overlay: config/titan_like.yaml
+            seed: 259503490
+          - slug: mars-like
+            overlay: config/mars_like.yaml
+            seed: 628617507
+          - slug: venus-like
+            overlay: config/venus_like.yaml
+            seed: 1394962079
+    env:
+      MPLBACKEND: Agg
+      WORLDGEN_DISTANCE_CACHE_MB: '128'
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_MAX_THREADS: '1'
+      NUMBA_CACHE_DIR: ${{ github.workspace }}/.numba-cache
+      SLUG: ${{ matrix.slug }}
+      OVERLAY: ${{ matrix.overlay }}
+      SEED: ${{ matrix.seed }}
+      ROOT: output/${{ matrix.slug }}-${{ matrix.seed }}
+      FAILURE: failure-capture/${{ matrix.slug }}-${{ matrix.seed }}
+      ARCHIVE: archives/${{ matrix.slug }}-${{ matrix.seed }}-2048x1024.tar.gz
+      RESOLVED_CONFIG: validation-configs/${{ matrix.slug }}-${{ matrix.seed }}.yaml
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install production, rendering and analysis backends
+        run: |
+          set -euxo pipefail
+          python -m pip install --disable-pip-version-check -e '.[performance,jit,storage,thermodynamics,render]'
+          python -m pip install --disable-pip-version-check pytest
+          python -m pip check
+
+      - name: Build high-fidelity profile
+        run: |
+          set -euxo pipefail
+          mkdir -p validation-configs
+          python - <<'PY'
+          import copy, os
+          from pathlib import Path
+          import yaml
+
+          base_path = Path("config/maximal_realism_safe.yaml")
+          overlay_path = Path(os.environ["OVERLAY"])
+          seed = int(os.environ["SEED"])
+          out = Path(os.environ["RESOLVED_CONFIG"])
+
+          def load(path):
+              value = yaml.safe_load(path.read_text(encoding="utf-8"))
+              if not isinstance(value, dict):
+                  raise TypeError(f"{path} must contain a mapping")
+              return value
+
+          def merge(base, overlay):
+              result = copy.deepcopy(base)
+              for key, value in overlay.items():
+                  if isinstance(value, dict) and isinstance(result.get(key), dict):
+                      result[key] = merge(result[key], value)
+                  else:
+                      result[key] = copy.deepcopy(value)
+              return result
+
+          base = load(base_path)
+          overlay = load(overlay_path)
+          cfg = merge(base, overlay)
+
+          # Physical inventories are profile authorities and must replace, not merge,
+          # the base world's species mappings.
+          overlay_astronomy = overlay.get("astronomy", {})
+          for key in ("atmosphere", "surface_volatiles", "moons"):
+              if key in overlay_astronomy:
+                  cfg.setdefault("astronomy", {})[key] = copy.deepcopy(overlay_astronomy[key])
+
+          cfg["seed"] = seed
+          cfg.setdefault("resolution", {})["width"] = 2048
+          cfg["resolution"]["height"] = 1024
+
+          cfg["atmogen"] = merge(cfg.get("atmogen", {}), {
+              "enabled": True,
+              "fidelity": "REFERENCE",
+              "chemistry_mode": "equilibrium",
+              "vertical_layers": 64,
+              "radiation_mode": "semi_gray_spectral_shortwave",
+              "temperature_profile_mode": "auto",
+              "representative_columns_enabled": True,
+              "representative_column_count": 16,
+              "representative_feedback_relaxation": 0.25,
+              "composition_tolerance": 2.0e-7,
+              "relaxation": 0.35,
+              "max_iterations": 100,
+              "allow_fidelity_fallback": True,
+          })
+          cfg["procedural_erosion"] = merge(cfg.get("procedural_erosion", {}), {
+              "enabled": True,
+              "phase_chunk_rows": 64,
+              "recouple_after_canonical_pass": True,
+              "zero_mean_displacement": True,
+          })
+          cfg.setdefault("output", {}).update({
+              "save_npz": True,
+              "save_png": True,
+              "save_json": True,
+              "save_report": True,
+              "compress_npz": True,
+              "map_dpi": 180,
+              "rgb_dpi": 200,
+          })
+          out.write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True), encoding="utf-8")
+          print(yaml.safe_dump({
+              "slug": os.environ["SLUG"],
+              "seed": seed,
+              "resolution": cfg["resolution"],
+              "atmogen": cfg["atmogen"],
+              "procedural_erosion": cfg["procedural_erosion"],
+          }, sort_keys=False))
+          PY
+
+      - name: Validate runtime plan
+        run: |
+          set -euxo pipefail
+          worldgen --runtime-info --dry-run             --config "$RESOLVED_CONFIG"             --seed "$SEED"             --resolution 2048x1024             --workers 4 --worker-cap 4 --threads-per-worker 1             --memory-per-worker-mb 1350
+
+      - name: Generate planet; preserve diagnostics but delete failed world
+        shell: bash
+        run: |
+          set -u
+          rm -rf "$ROOT" "$FAILURE"
+          mkdir -p "$ROOT" "$FAILURE"
+          set +e
+          /usr/bin/time -v worldgen generate             --config "$RESOLVED_CONFIG"             --seed "$SEED"             --resolution 2048x1024             --out "$ROOT"             --workers 4 --worker-cap 4 --threads-per-worker 1             --memory-per-worker-mb 1350             --checkpoint-dir "$ROOT/checkpoints" --checkpoint-max-gb 24             --compress-npz             --diagnostics --manifest --hash-outputs             --max-png-megapixels 120             --timings-json "$ROOT/timings_cli.json"             --progress-detail -vv             --log-file "$ROOT/generation.log" --log-json             2>&1 | tee "$ROOT/generation-console.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            cp "$ROOT/generation.log" "$FAILURE/" 2>/dev/null || true
+            cp "$ROOT/generation-console.log" "$FAILURE/" 2>/dev/null || true
+            cp "$RESOLVED_CONFIG" "$FAILURE/resolved-config.yaml" 2>/dev/null || true
+            find "$ROOT" -maxdepth 1 -type f \( -name '*.json' -o -name '*.md' \) -exec cp {} "$FAILURE/" \; 2>/dev/null || true
+            rm -rf "$ROOT"
+            echo "Generation failed with exit code $status; failed world directory deleted."
+            exit "$status"
+          fi
+
+      - name: Run scientific and optical audits
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python scripts/audit_generated_world.py "$ROOT"             --output "$ROOT/showcase_audit.json" | tee "$ROOT/showcase_audit.log"
+          python scripts/audit_planetary_optics.py "$ROOT"             --output "$ROOT/planetary_optics_audit.json" --enforce | tee "$ROOT/planetary_optics_audit.log"
+
+      - name: Run exhaustive numeric-array and image health analysis
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import json, math, os
+          from pathlib import Path
+          import numpy as np
+          from PIL import Image, ImageStat, ImageOps, ImageDraw
+
+          root = Path(os.environ["ROOT"])
+          analysis = root / "analysis"
+          analysis.mkdir(exist_ok=True)
+
+          failures = []
+          array_report = {"arrays": {}, "failure_count": 0}
+          with np.load(root / "world_arrays.npz", allow_pickle=False) as z:
+              for key in sorted(z.files):
+                  a = np.asarray(z[key])
+                  row = {"shape": list(a.shape), "dtype": str(a.dtype), "nbytes": int(a.nbytes)}
+                  if np.issubdtype(a.dtype, np.number):
+                      if np.issubdtype(a.dtype, np.floating):
+                          finite = np.isfinite(a)
+                          row["nan_count"] = int(np.count_nonzero(np.isnan(a)))
+                          row["inf_count"] = int(np.count_nonzero(np.isinf(a)))
+                          row["finite_fraction"] = float(np.mean(finite))
+                          if not bool(np.all(finite)):
+                              failures.append(f"{key}: non-finite values")
+                          vals = a[finite]
+                      else:
+                          vals = a.reshape(-1)
+                      if vals.size:
+                          v = vals.astype(np.float64, copy=False)
+                          row.update({
+                              "min": float(np.min(v)),
+                              "max": float(np.max(v)),
+                              "mean": float(np.mean(v)),
+                              "std": float(np.std(v)),
+                              "p01": float(np.percentile(v, 1)),
+                              "p50": float(np.percentile(v, 50)),
+                              "p99": float(np.percentile(v, 99)),
+                          })
+                  # Quantify equirectangular longitude seam relative to ordinary
+                  # east-west first differences for canonical spatial fields.
+                  if a.ndim >= 2 and a.shape[-2:] == (1024, 2048) and np.issubdtype(a.dtype, np.number):
+                      sample = a.astype(np.float64, copy=False)
+                      if a.ndim > 2:
+                          sample = sample.reshape((-1, 1024, 2048))[0]
+                      seam = np.abs(sample[:, 0] - sample[:, -1])
+                      local = np.abs(np.diff(sample, axis=1))
+                      scale = float(np.nanmedian(local)) if local.size else 0.0
+                      row["longitude_seam_mean_abs"] = float(np.nanmean(seam))
+                      row["longitude_neighbor_median_abs"] = scale
+                      row["longitude_seam_to_neighbor_ratio"] = float(np.nanmean(seam) / max(scale, 1e-12))
+                  array_report["arrays"][key] = row
+
+          image_rows = []
+          thumbs = []
+          for path in sorted(root.rglob("*.png")):
+              rel = path.relative_to(root).as_posix()
+              with Image.open(path) as im:
+                  im.load()
+                  rgb = im.convert("RGB")
+                  arr = np.asarray(rgb)
+                  stat = ImageStat.Stat(rgb)
+                  std = [float(x) for x in stat.stddev]
+                  extrema = [[int(lo), int(hi)] for lo, hi in rgb.getextrema()]
+                  unique_sample = int(np.unique(arr[::max(1,arr.shape[0]//256), ::max(1,arr.shape[1]//256)].reshape(-1,3), axis=0).shape[0])
+                  blank = max(std) < 0.35 or unique_sample < 4
+                  if blank:
+                      failures.append(f"{rel}: near-blank/degenerate PNG")
+                  image_rows.append({
+                      "path": rel, "size": list(rgb.size), "mode": im.mode,
+                      "stddev_rgb": std, "extrema_rgb": extrema,
+                      "sample_unique_rgb": unique_sample, "near_blank": blank,
+                  })
+                  thumb = ImageOps.contain(rgb, (360, 180))
+                  canvas = Image.new("RGB", (380, 215), "white")
+                  canvas.paste(thumb, ((380-thumb.width)//2, 5))
+                  ImageDraw.Draw(canvas).text((8, 190), rel[:58], fill="black")
+                  thumbs.append(canvas)
+
+          if not image_rows:
+              failures.append("no PNG images produced")
+          image_report = {"images": image_rows, "failure_count": sum(1 for x in failures if ".png" in x or "PNG" in x)}
+
+          if thumbs:
+              cols = 3
+              rows = math.ceil(len(thumbs)/cols)
+              sheet = Image.new("RGB", (cols*380, rows*215), "white")
+              for i, thumb in enumerate(thumbs):
+                  sheet.paste(thumb, ((i%cols)*380, (i//cols)*215))
+              sheet.save(analysis / "all_maps_contact_sheet.jpg", quality=92, optimize=True)
+
+          array_report["failure_count"] = len(failures)
+          (analysis / "advanced_data_audit.json").write_text(json.dumps(array_report, indent=2, sort_keys=True))
+          (analysis / "image_health_audit.json").write_text(json.dumps(image_report, indent=2, sort_keys=True))
+          (analysis / "audit_failures.json").write_text(json.dumps({"failures": failures}, indent=2))
+          if failures:
+              raise SystemExit("\n".join(failures))
+          PY
+
+      - name: Enforce generation invariants and write provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          import numpy as np
+          import atmogen
+          import worldgen
+
+          root = Path(os.environ["ROOT"])
+          diag = json.loads((root / "diagnostics.json").read_text())
+          audit = json.loads((root / "showcase_audit.json").read_text())
+          optics = json.loads((root / "planetary_optics_audit.json").read_text())
+          failures = []
+          if diag.get("all_invariants_passed") is not True:
+              failures.append(f"diagnostics invariants failed: {diag.get('invariants')}")
+          if optics.get("all_invariants_passed") is not True:
+              failures.append(f"optics invariants failed: {optics.get('invariants')}")
+          h = audit.get("hydrology", {})
+          c = audit.get("conservation", {})
+          if h.get("river_cells_on_ocean", 0) != 0:
+              failures.append(f"river cells on ocean: {h.get('river_cells_on_ocean')}")
+          if h.get("unassigned_land_cells", 0) != 0:
+              failures.append(f"unassigned land cells: {h.get('unassigned_land_cells')}")
+          for key, tol in (
+              ("water_balance_max_abs_residual_mm_year", 0.05),
+              ("condensate_mass_partition_relative_l1_residual", 1e-6),
+              ("sediment_routing_relative_residual", 1e-6),
+          ):
+              value = c.get(key)
+              if value is not None and abs(float(value)) > tol:
+                  failures.append(f"{key}={value} exceeds {tol}")
+
+          provenance = {
+              "slug": os.environ["SLUG"],
+              "seed": int(os.environ["SEED"]),
+              "resolution": [2048, 1024],
+              "worldgen_version": getattr(worldgen, "__version__", None),
+              "atmogen_version": getattr(atmogen, "__version__", None),
+              "github_sha": os.environ.get("GITHUB_SHA"),
+              "github_ref": os.environ.get("GITHUB_REF"),
+              "all_enforced_invariants_passed": not failures,
+              "failures": failures,
+          }
+          (root / "analysis" / "source_provenance.json").write_text(json.dumps(provenance, indent=2, sort_keys=True))
+          if failures:
+              raise SystemExit("\n".join(failures))
+          PY
+
+      - name: Delete world if any audit failed
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p "$FAILURE"
+          if [ -d "$ROOT" ]; then
+            find "$ROOT" -maxdepth 2 -type f \( -name '*.log' -o -name '*audit*.json' -o -name 'diagnostics.json' -o -name 'run_manifest.json' \)               -size -20M -exec cp --parents {} "$FAILURE/" \; 2>/dev/null || true
+          fi
+          cp "$RESOLVED_CONFIG" "$FAILURE/resolved-config.yaml" 2>/dev/null || true
+          rm -rf "$ROOT"
+          echo "Audit-failed uncompressed world directory deleted."
+
+      - name: Package successful planet and delete uncompressed world
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p archives
+          cp "$RESOLVED_CONFIG" "$ROOT/resolved-config.yaml"
+          find "$ROOT" -type f -printf '%P\t%s\n' | sort > "$ROOT/analysis/file_inventory.tsv"
+          du -sh "$ROOT" | tee "$ROOT/analysis/uncompressed_size.txt"
+          tar -C "$(dirname "$ROOT")" -czf "$ARCHIVE" "$(basename "$ROOT")"
+          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+          rm -rf "$ROOT"
+          test ! -e "$ROOT"
+          test -s "$ARCHIVE"
+          echo "Only compressed planet archive remains for this matrix job."
+
+      - name: Upload final planet archive only
+        uses: actions/upload-artifact@v4
+        with:
+          name: planet-archive-${{ matrix.slug }}-${{ matrix.seed }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload failure diagnostics only
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-planet-${{ matrix.slug }}-${{ matrix.seed }}
+          path: ${{ env.FAILURE }}/
+          compression-level: 6
+          retention-days: 3
+          if-no-files-found: warn
