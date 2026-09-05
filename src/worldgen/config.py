@@ -296,6 +296,7 @@ class ProceduralErosionConfig:
     lacunarity: float = 2.0
     gain: float = 0.52
     cell_scale: float = 0.72
+    min_samples_per_wavelength: float = 4.0
     base_wavelength_km: float = 420.0
     min_wavelength_km: float = 18.0
     max_wavelength_km: float = 1600.0
@@ -619,6 +620,7 @@ class WorldConfig:
         _number("procedural_erosion.lacunarity", pe.lacunarity, minimum=1.0, min_inclusive=False)
         _number("procedural_erosion.gain", pe.gain, minimum=0.0, maximum=1.0, min_inclusive=False)
         _number("procedural_erosion.cell_scale", pe.cell_scale, minimum=0.1, maximum=2.0)
+        _number("procedural_erosion.min_samples_per_wavelength", pe.min_samples_per_wavelength, minimum=2.0)
         _number("procedural_erosion.base_wavelength_km", pe.base_wavelength_km, minimum=0.0, min_inclusive=False)
         _number("procedural_erosion.min_wavelength_km", pe.min_wavelength_km, minimum=0.0, min_inclusive=False)
         _number("procedural_erosion.max_wavelength_km", pe.max_wavelength_km, minimum=pe.min_wavelength_km)
