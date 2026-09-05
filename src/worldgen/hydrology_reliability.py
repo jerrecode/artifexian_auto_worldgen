@@ -11,7 +11,6 @@ and occupied-cell guardrails.
 """
 
 import math
-from math import gcd
 from typing import Any
 
 import numpy as np
@@ -22,25 +21,6 @@ from .grid import normalize01
 from .priority_flood import priority_flood as _ocean_priority_flood
 
 _SECONDS_PER_YEAR = 365.25 * 24.0 * 3600.0
-
-
-def _primitive_offsets(radius: int = 4) -> tuple[tuple[int, int], ...]:
-    out: list[tuple[int, int]] = []
-    r = max(1, int(radius))
-    for dy in range(-r, r + 1):
-        for dx in range(-r, r + 1):
-            if dy == 0 and dx == 0:
-                continue
-            if max(abs(dy), abs(dx)) > r:
-                continue
-            if gcd(abs(dy), abs(dx)) != 1:
-                continue
-            out.append((dy, dx))
-    out.sort(key=lambda item: (math.hypot(*item), math.atan2(item[0], item[1])))
-    return tuple(out)
-
-
-_ROUTING_OFFSETS = _primitive_offsets(4)
 
 
 def priority_flood_closed_aware(
@@ -59,83 +39,6 @@ def priority_flood_closed_aware(
         return z.copy()
     return _ocean_priority_flood(z, oc, grid, epsilon_km=epsilon_km)
 
-
-def _direction_texture(grid, dy: int, dx: int) -> np.ndarray:
-    """Smooth deterministic near-tie breaker with no seed/state dependence."""
-    angle = math.atan2(float(dy), float(dx))
-    phase = (
-        np.deg2rad(np.asarray(grid.lon, dtype=np.float64)) * (0.83 + 0.17 * abs(dy))
-        + np.deg2rad(np.asarray(grid.lat, dtype=np.float64)) * (1.11 + 0.13 * abs(dx))
-        + 2.61803398875 * angle
-    )
-    return np.sin(phase) + 0.45 * np.sin(2.37 * phase + 0.91)
-
-
-def flow_directions_multidirection(
-    z: np.ndarray,
-    ocean: np.ndarray,
-    grid,
-    *,
-    near_tie_fraction: float = 0.035,
-) -> np.ndarray:
-    """Single-receiver descent over a dense angular stencil with near-tie steering.
-
-    The graph stays acyclic because every accepted receiver is strictly lower than
-    its source. Compared with the historical 20-direction stencil, primitive vectors
-    through radius four provide many more flow angles. A weak, smooth deterministic
-    steering term is considered only for slopes within 3.5% of physical steepest
-    descent, removing planet-scale ruler-straight artifacts while retaining
-    topographic control.
-    """
-    elev = np.asarray(z, dtype=np.float64)
-    oc = np.asarray(ocean, dtype=bool)
-    if elev.ndim != 2 or oc.shape != elev.shape:
-        raise ValueError("elevation and ocean must be equal-shaped 2-D arrays")
-    h, w = elev.shape
-    best_slope = np.zeros_like(elev)
-
-    for dy, dx in _ROUTING_OFFSETS:
-        ny, nx = grid.ops.neighbor_indices(dy, dx)
-        nb = elev[ny, nx]
-        if dx and dy:
-            dist = np.hypot(abs(dy) * float(grid.dy_km), abs(dx) * grid.dx_km)
-        elif dx:
-            dist = abs(dx) * grid.dx_km
-        else:
-            dist = np.full_like(grid.dx_km, abs(dy) * float(grid.dy_km))
-        slope = (elev - nb) / np.maximum(dist, 1.0e-9)
-        best_slope = np.maximum(best_slope, slope)
-
-    receiver = np.full((h, w), -1, dtype=np.int32)
-    best_score = np.full((h, w), -np.inf, dtype=np.float64)
-    tolerance = float(np.clip(near_tie_fraction, 0.0, 0.20))
-    active = best_slope > 0.0
-
-    for dy, dx in _ROUTING_OFFSETS:
-        ny, nx = grid.ops.neighbor_indices(dy, dx)
-        nb = elev[ny, nx]
-        if dx and dy:
-            dist = np.hypot(abs(dy) * float(grid.dy_km), abs(dx) * grid.dx_km)
-        elif dx:
-            dist = abs(dx) * grid.dx_km
-        else:
-            dist = np.full_like(grid.dx_km, abs(dy) * float(grid.dy_km))
-        slope = (elev - nb) / np.maximum(dist, 1.0e-9)
-        close = active & (slope > 0.0) & (slope >= best_slope * (1.0 - tolerance))
-        if not np.any(close):
-            continue
-        normalized = slope / np.maximum(best_slope, 1.0e-30)
-        texture = _direction_texture(grid, dy, dx)
-        hop_penalty = 0.0015 * max(math.hypot(dy, dx) - 1.0, 0.0)
-        score = normalized + 0.018 * texture - hop_penalty
-        better = close & (score > best_score)
-        if np.any(better):
-            target = (ny * w + nx).astype(np.int32, copy=False)
-            receiver[better] = target[better]
-            best_score[better] = score[better]
-
-    receiver[oc] = -1
-    return receiver.ravel()
 
 
 def lake_mask_volume_guarded(
@@ -364,7 +267,6 @@ def enforce_hydrology_guardrails(result: Any, terrain: Any, cfg: Any) -> None:
 
 __all__ = [
     "priority_flood_closed_aware",
-    "flow_directions_multidirection",
     "lake_mask_volume_guarded",
     "channel_hierarchy_discharge_guarded",
     "enforce_hydrology_guardrails",
