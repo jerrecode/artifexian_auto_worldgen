@@ -100,21 +100,20 @@ def _liquid_species_mass_fields(
     for raw_key, raw_mass in monthly_mass.items():
         key = str(raw_key)
         mass_source = np.asarray(raw_mass)
-        liquid_source = np.asarray(
-            monthly_liquid.get(raw_key, np.zeros_like(mass_source))
-        )
-        solid_source = np.asarray(
-            monthly_solid.get(raw_key, np.zeros_like(mass_source))
-        )
+        raw_liquid = monthly_liquid.get(raw_key)
+        raw_solid = monthly_solid.get(raw_key)
+        liquid_source = None if raw_liquid is None else np.asarray(raw_liquid)
+        solid_source = None if raw_solid is None else np.asarray(raw_solid)
         expected = (12, *shape)
         if (
             mass_source.shape != expected
-            or liquid_source.shape != expected
-            or solid_source.shape != expected
+            or (liquid_source is not None and liquid_source.shape != expected)
+            or (solid_source is not None and solid_source.shape != expected)
         ):
             raise ValueError(
                 f"condensate phase fields for {key!r} must have shape {expected}"
             )
+        zeros = np.zeros(shape, dtype=np.float64)
 
         # Accumulate month by month instead of promoting several complete
         # (12,H,W) tensors to float64. Peak new working memory therefore scales
@@ -122,8 +121,16 @@ def _liquid_species_mass_fields(
         annual_liquid_mass_kg_m2 = np.zeros(shape, dtype=np.float64)
         for month in range(12):
             mass = np.asarray(mass_source[month], dtype=np.float64)
-            liquid = np.asarray(liquid_source[month], dtype=np.float64)
-            solid = np.asarray(solid_source[month], dtype=np.float64)
+            liquid = (
+                zeros
+                if liquid_source is None
+                else np.asarray(liquid_source[month], dtype=np.float64)
+            )
+            solid = (
+                zeros
+                if solid_source is None
+                else np.asarray(solid_source[month], dtype=np.float64)
+            )
             if (
                 not np.isfinite(mass).all()
                 or not np.isfinite(liquid).all()
