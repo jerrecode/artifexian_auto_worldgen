@@ -180,3 +180,177 @@ def test_modern_and_legacy_geology_codes_are_equivalent_and_shape_checked():
             astronomy,
             cfg,
         )
+
+
+def _spatial_condensate_fixture(
+    grid: SphereGrid,
+    *,
+    left_species: str = "H2O",
+    right_species: str = "NH3",
+):
+    shape = grid.shape
+    monthly_shape = (12, *shape)
+    split = shape[1] // 2
+    masses = {
+        left_species: np.zeros(monthly_shape, dtype=np.float32),
+        right_species: np.zeros(monthly_shape, dtype=np.float32),
+    }
+    liquids = {
+        left_species: np.zeros(monthly_shape, dtype=np.float32),
+        right_species: np.zeros(monthly_shape, dtype=np.float32),
+    }
+    solids = {
+        left_species: np.zeros(monthly_shape, dtype=np.float32),
+        right_species: np.zeros(monthly_shape, dtype=np.float32),
+    }
+    masses[left_species][:, :, :split] = 1.0
+    liquids[left_species][:, :, :split] = 1.0
+    masses[right_species][:, :, split:] = 1.0
+    liquids[right_species][:, :, split:] = 1.0
+    return SimpleNamespace(
+        reference_species=left_species,
+        annual_liquid_input_mm=np.full(shape, 1200.0, dtype=np.float32),
+        annual_solid_input_mm=np.zeros(shape, dtype=np.float32),
+        species_monthly_mass_kg_m2=masses,
+        species_monthly_liquid_depth_mm=liquids,
+        species_monthly_solid_depth_mm=solids,
+    )
+
+
+def test_spatial_condensate_composition_produces_spatial_fluid_mechanical_factor():
+    grid, terrain, ocean, climate, hydrology, geology, astronomy = _forcing_fixture(
+        land=True,
+        temperature_c=15.0,
+        precipitation_mm_year=1200.0,
+    )
+    condensate = _spatial_condensate_fixture(grid)
+    forcing = build_erosion_forcing(
+        grid,
+        terrain,
+        ocean,
+        climate,
+        hydrology,
+        geology,
+        astronomy,
+        ProceduralErosionConfig(enabled=True),
+        condensate_hydrology=condensate,
+    )
+
+    split = grid.shape[1] // 2
+    water_side = float(np.mean(forcing.fluid_mechanical_factor[:, :split]))
+    ammonia_side = float(np.mean(forcing.fluid_mechanical_factor[:, split:]))
+    assert not np.isclose(water_side, ammonia_side, rtol=0.0, atol=1.0e-4)
+    assert forcing.metadata["fluid_property_source"].startswith(
+        "spatial_condensate_liquid_mixture"
+    )
+    assert forcing.metadata["liquid_transport_species"] == ["H2O", "NH3"]
+    assert forcing.metadata["unsupported_liquid_transport_species"] == []
+    assert forcing.metadata["fluid_mechanical_spatial_active_fraction"] > 0.999999
+    assert forcing.metadata["fluid_mechanical_factor_min"] < (
+        forcing.metadata["fluid_mechanical_factor_max"]
+    )
+
+
+def test_solid_only_condensate_does_not_pollute_liquid_transport_mixture():
+    grid, terrain, ocean, climate, hydrology, geology, astronomy = _forcing_fixture(
+        land=True,
+        temperature_c=-20.0,
+        precipitation_mm_year=1200.0,
+    )
+    shape = grid.shape
+    monthly_shape = (12, *shape)
+    condensate = SimpleNamespace(
+        reference_species="CH4",
+        annual_liquid_input_mm=np.zeros(shape, dtype=np.float32),
+        annual_solid_input_mm=np.full(shape, 1200.0, dtype=np.float32),
+        species_monthly_mass_kg_m2={
+            "CH4": np.ones(monthly_shape, dtype=np.float32),
+        },
+        species_monthly_liquid_depth_mm={
+            "CH4": np.zeros(monthly_shape, dtype=np.float32),
+        },
+        species_monthly_solid_depth_mm={
+            "CH4": np.ones(monthly_shape, dtype=np.float32),
+        },
+    )
+    forcing = build_erosion_forcing(
+        grid,
+        terrain,
+        ocean,
+        climate,
+        hydrology,
+        geology,
+        astronomy,
+        ProceduralErosionConfig(enabled=True),
+        condensate_hydrology=condensate,
+    )
+
+    assert forcing.metadata["liquid_transport_species"] == []
+    assert forcing.metadata["fluid_property_source"] == (
+        "water_reference+no_liquid_condensate"
+    )
+    assert np.ptp(forcing.fluid_mechanical_factor) == 0.0
+
+
+def test_unsupported_local_liquid_species_uses_explicit_water_reference_fallback():
+    grid, terrain, ocean, climate, hydrology, geology, astronomy = _forcing_fixture(
+        land=True,
+        temperature_c=15.0,
+        precipitation_mm_year=1200.0,
+    )
+    shape = grid.shape
+    monthly_shape = (12, *shape)
+    condensate = SimpleNamespace(
+        reference_species="C3H8",
+        annual_liquid_input_mm=np.full(shape, 1200.0, dtype=np.float32),
+        annual_solid_input_mm=np.zeros(shape, dtype=np.float32),
+        species_monthly_mass_kg_m2={
+            "C3H8": np.ones(monthly_shape, dtype=np.float32),
+        },
+        species_monthly_liquid_depth_mm={
+            "C3H8": np.ones(monthly_shape, dtype=np.float32),
+        },
+        species_monthly_solid_depth_mm={
+            "C3H8": np.zeros(monthly_shape, dtype=np.float32),
+        },
+    )
+    forcing = build_erosion_forcing(
+        grid,
+        terrain,
+        ocean,
+        climate,
+        hydrology,
+        geology,
+        astronomy,
+        ProceduralErosionConfig(enabled=True),
+        condensate_hydrology=condensate,
+    )
+
+    assert forcing.metadata["unsupported_liquid_transport_species"] == ["C3H8"]
+    assert forcing.metadata["fluid_property_source"] == (
+        "unsupported_liquid_species_water_reference_fallback"
+    )
+    assert np.ptp(forcing.fluid_mechanical_factor) == 0.0
+
+
+def test_spatial_condensate_transport_rejects_phase_field_shape_mismatch():
+    grid, terrain, ocean, climate, hydrology, geology, astronomy = _forcing_fixture(
+        land=True,
+        precipitation_mm_year=500.0,
+    )
+    condensate = _spatial_condensate_fixture(grid)
+    condensate.species_monthly_liquid_depth_mm["H2O"] = np.ones(
+        (12, 1, 1), dtype=np.float32
+    )
+    with pytest.raises(ValueError, match="condensate phase fields.*shape"):
+        build_erosion_forcing(
+            grid,
+            terrain,
+            ocean,
+            climate,
+            hydrology,
+            geology,
+            astronomy,
+            ProceduralErosionConfig(enabled=True),
+            condensate_hydrology=condensate,
+        )
