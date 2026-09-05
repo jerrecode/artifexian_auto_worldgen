@@ -45,7 +45,15 @@ jobs:
       - name: Run coupled regression gates
         run: |
           set -euxo pipefail
-          python -m pytest -q             tests/test_procedural_erosion.py             tests/test_erosion_forcing.py             tests/test_pipeline_procedural_erosion.py             tests/test_atmogen_integration.py             tests/test_atmogen_coupling.py             tests/test_exotic_planets.py
+          python -m pytest -q \
+            tests/test_procedural_erosion.py \
+            tests/test_erosion_forcing.py \
+            tests/test_pipeline_procedural_erosion.py \
+            tests/test_atmogen_integration.py \
+            tests/test_atmogen_coupling.py \
+            tests/test_exotic_planets.py \
+            tests/test_exotic_planetary_physics.py \
+            tests/test_diagnostics_surface_liquids.py
 
   generate-audit-archive:
     needs: preflight
@@ -139,6 +147,19 @@ jobs:
           for key in ("atmosphere", "surface_volatiles", "moons"):
               if key in overlay_astronomy:
                   cfg.setdefault("astronomy", {})[key] = copy.deepcopy(overlay_astronomy[key])
+
+          # The maximal-realism base predates the composition-aware volatile path.
+          # Make the Earth-like validation case an explicit H2O-reservoir world so it
+          # exercises the same atmogen -> phase -> hydrology -> optics contract as the
+          # exotic profiles instead of silently retaining legacy fixed-greenhouse I/O.
+          if os.environ["SLUG"] == "temperate-earthlike":
+              cfg.setdefault("astronomy", {})["greenhouse_model"] = "composition"
+              cfg["astronomy"]["thermodynamics_backend"] = "auto"
+              cfg["astronomy"]["surface_volatiles"] = {"H2O": 1.0}
+              cfg["astronomy"]["surface_condensible"] = "H2O"
+              cfg.setdefault("climate", {})["condensible_species"] = "H2O"
+              cfg["climate"]["phase_coupled_evaporation"] = True
+              cfg.setdefault("ocean", {})["fluid_species"] = "H2O"
 
           cfg["seed"] = seed
           cfg.setdefault("resolution", {})["width"] = 2048
