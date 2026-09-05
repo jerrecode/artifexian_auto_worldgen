@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from worldgen.grid import SphereGrid
 from worldgen.resources import _near
@@ -114,3 +115,82 @@ def test_spatial_naturalism_is_deterministic():
     a = irregular_blob_field(grid, centers, sigmas, weights)
     b = irregular_blob_field(grid, centers, sigmas, weights)
     np.testing.assert_array_equal(a, b)
+
+
+
+def test_irregular_near_rejects_wrong_shape_even_when_source_is_empty():
+    grid = SphereGrid(32, 16)
+    with pytest.raises(ValueError, match="mask.*shape"):
+        irregular_near(np.zeros((8, 64), dtype=bool), grid, 100.0)
+
+
+@pytest.mark.parametrize("radius", [np.nan, np.inf, -1.0])
+def test_irregular_near_rejects_invalid_radius(radius):
+    grid = SphereGrid(32, 16)
+    source = np.zeros(grid.shape, dtype=bool)
+    source[8, 16] = True
+    with pytest.raises(ValueError, match="km.*finite and non-negative"):
+        irregular_near(source, grid, radius)
+
+
+def test_zero_radius_irregular_near_is_exact_source_mask():
+    grid = SphereGrid(32, 16)
+    source = np.zeros(grid.shape, dtype=bool)
+    source[8, 16] = True
+    np.testing.assert_array_equal(irregular_near(source, grid, 0.0), source)
+
+
+@pytest.mark.parametrize(
+    "centers,sigmas,weights",
+    [
+        (np.asarray([[0.0, 0.0, 0.0]]), np.asarray([2.0]), np.asarray([1.0])),
+        (np.asarray([[np.nan, 0.0, 1.0]]), np.asarray([2.0]), np.asarray([1.0])),
+        (np.asarray([[1.0, 0.0, 0.0]]), np.asarray([0.0]), np.asarray([1.0])),
+        (np.asarray([[1.0, 0.0, 0.0]]), np.asarray([np.nan]), np.asarray([1.0])),
+        (np.asarray([[1.0, 0.0, 0.0]]), np.asarray([2.0]), np.asarray([np.nan])),
+    ],
+)
+def test_irregular_blob_rejects_invalid_geometry(centers, sigmas, weights):
+    grid = SphereGrid(32, 16)
+    with pytest.raises(ValueError, match="center|sigma|weight"):
+        irregular_blob_field(grid, centers, sigmas, weights)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"min_global_fraction": np.nan},
+        {"min_global_fraction": -0.1},
+        {"min_global_fraction": 1.1},
+        {"min_component_fraction_of_water": np.nan},
+        {"min_component_fraction_of_water": -0.1},
+        {"min_component_fraction_of_water": 1.1},
+    ],
+)
+def test_major_water_mask_rejects_invalid_fraction_thresholds(kwargs):
+    grid = SphereGrid(32, 16)
+    water = np.zeros(grid.shape, dtype=bool)
+    water[:, :16] = True
+    with pytest.raises(ValueError, match="fraction.*\[0, 1\]"):
+        major_water_mask(grid, water, **kwargs)
+
+
+@pytest.mark.parametrize("scale", [np.nan, np.inf, -np.inf, 0.0, -1.0])
+def test_marine_thermal_distance_rejects_invalid_inland_scale(scale):
+    grid = SphereGrid(32, 16)
+    water = np.zeros(grid.shape, dtype=bool)
+    with pytest.raises(ValueError, match="inland_scale_km.*finite and positive"):
+        marine_thermal_distance(
+            grid, water, np.zeros(grid.shape), inland_scale_km=scale
+        )
+
+
+def test_marine_thermal_distance_rejects_nonfinite_elevation():
+    grid = SphereGrid(32, 16)
+    water = np.zeros(grid.shape, dtype=bool)
+    elevation = np.zeros(grid.shape)
+    elevation[3, 5] = np.nan
+    with pytest.raises(ValueError, match="elevation_km.*finite"):
+        marine_thermal_distance(
+            grid, water, elevation, inland_scale_km=1000.0
+        )
