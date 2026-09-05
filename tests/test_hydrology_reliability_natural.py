@@ -178,3 +178,69 @@ def test_public_hydrology_facade_installs_reliability_backends():
     assert advanced._channel_hierarchy is channel_hierarchy_discharge_guarded
     assert advanced.build_watershed_hierarchy is build_watershed_hierarchy_natural
     assert hydro._priority_flood is priority_flood_closed_aware
+
+
+def test_endorheic_basins_are_not_merged_into_coastal_basin_groups():
+    grid = SphereGrid(width=24, height=12, radius_km=100.0)
+    h, w = grid.shape
+    land = np.ones(grid.shape, dtype=bool)
+    land[-1] = False
+    receiver = np.full(grid.shape, -1, dtype=np.int64)
+
+    # Most columns drain to the ocean. One interior column terminates in a genuine
+    # internal sink and must remain a distinct major-basin label.
+    ny, nx = grid.ops.neighbor_indices(1, 0)
+    target = ny * w + nx
+    for yy in range(h - 1):
+        receiver[yy] = target[yy]
+    sink_y, sink_x = h // 2, w // 2
+    receiver[sink_y, sink_x] = -1
+    for yy in range(sink_y):
+        receiver[yy, sink_x] = (yy + 1) * w + sink_x
+    receiver[~land] = -1
+
+    graph = DrainageGraph.from_receiver(receiver.ravel(), grid.shape)
+    cell_area = grid.cell_area_weights * (4.0 * np.pi * grid.radius_km**2)
+    drainage = graph.accumulate(cell_area * land)
+    elevation = np.linspace(1.0, -0.1, h)[:, None] * np.ones((1, w))
+    slope = np.full(grid.shape, 0.01)
+    channel = land & (drainage > np.percentile(drainage[land], 45.0))
+
+    hierarchy = build_watershed_hierarchy_natural(
+        grid,
+        graph,
+        land,
+        elevation,
+        drainage,
+        slope,
+        channel,
+        subbasin_thresholds_km2=(1000.0, 300.0, 80.0),
+    )
+    internal_labels = set(np.unique(hierarchy.basin_id[land & ~hierarchy.exorheic]))
+    exorheic_labels = set(np.unique(hierarchy.basin_id[land & hierarchy.exorheic]))
+    internal_labels.discard(0)
+    exorheic_labels.discard(0)
+    assert internal_labels
+    assert internal_labels.isdisjoint(exorheic_labels)
+    assert hierarchy.metadata["preserved_endorheic_terminal_basins"] >= 1
+
+
+def test_guardrail_prefers_spherical_area_fraction_over_cell_fraction():
+    result = SimpleNamespace(
+        metadata={
+            "river_area_fraction_of_land": 0.05,
+            "watersheds": {
+                "largest_basin_cells": 99,
+                "largest_basin_area_fraction_land": 0.50,
+            },
+        },
+        base=SimpleNamespace(metadata={"lake_area_fraction_of_land": 0.02}),
+    )
+    terrain = SimpleNamespace(land=np.ones((10, 10), dtype=bool))
+    cfg = SimpleNamespace(
+        hydrology_fail_river_fraction_land=0.35,
+        hydrology_fail_lake_fraction_land=0.10,
+        hydrology_fail_largest_basin_fraction_land=0.95,
+    )
+    enforce_hydrology_guardrails(result, terrain, cfg)
+    assert result.metadata["reliability_guardrails"]["largest_basin_fraction_land"] == pytest.approx(0.50)
