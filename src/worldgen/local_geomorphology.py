@@ -361,10 +361,11 @@ class LocalGeomorphologySolver:
             if denom_detail > 0.0:
                 mean_detail = float(np.sum(raw_detail * active_weight) / denom_detail)
                 procedural = (raw_detail - mean_detail) * land * taper
-            evolved += procedural
-
-        # Reapply exact parent/base perimeter anchoring after all floating operations.
-        anchored = base + taper * (evolved - base)
+        # Reapply the general finite-domain anchoring once, then add the
+        # procedural perturbation exactly once. The procedural field already
+        # contains its edge taper; applying the outer taper to it again would
+        # square the taper and change its area-weighted zero-mean semantics.
+        anchored = base + taper * (evolved - base) + procedural
         anchored[0, :] = base[0, :]
         anchored[-1, :] = base[-1, :]
         anchored[:, 0] = base[:, 0]
@@ -402,7 +403,15 @@ class LocalGeomorphologySolver:
             "procedural_detail_enabled": bool(cfg.procedural_detail_enabled),
             "procedural_octaves_executed": int(executed_octaves),
             "procedural_max_absolute_detail_m": float(np.max(np.abs(procedural))),
-            "procedural_semantics": "zero-area-mean unresolved morphology; excluded from the physical sediment mass ledger",
+            "procedural_area_weighted_mean_m": (
+                float(np.sum(procedural * area_m2) / np.sum(area_m2))
+                if float(np.sum(area_m2)) > 0.0
+                else 0.0
+            ),
+            "procedural_semantics": (
+                "zero-area-mean unresolved morphology applied once after "
+                "finite-domain anchoring; excluded from the physical sediment mass ledger"
+            ),
             "boundary_semantics": "all geomorphic terrain perturbations vanish on the tile perimeter; output core remains watertight with independently generated neighbours",
             "limitations": [
                 "single bounded local evolution pass uses the current local drainage graph rather than iterating hydrology to full landscape equilibrium",
