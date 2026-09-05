@@ -167,6 +167,9 @@ def test_area_zero_mean_survives_displacement_clipping():
     )
     assert abs(float(weighted_mean)) < 2.0e-6
     assert float(np.max(np.abs(result.delta_height_m))) <= 3.0 + 1e-6
+    assert result.metadata["displacement_limiter"] == "uniform_rescale"
+    assert result.metadata["displacement_scale_factor"] < 1.0
+    assert result.metadata["preconstraint_max_absolute_displacement_m"] > 3.0
     assert abs(result.metadata["area_weighted_mean_displacement_m"]) < 1.0e-9
 
 
@@ -218,4 +221,65 @@ def test_phase_normalization_rejects_invalid_values(normalization):
             seed=1,
             octave=0,
             normalization=normalization,
+        )
+
+
+def test_default_phase_normalization_preserves_existing_low_level_contract():
+    grid = SphereGrid(64, 32, 6371.0)
+    lon = np.deg2rad(grid.lon)
+    east_tangent = np.stack(
+        (-np.sin(lon), np.cos(lon), np.zeros_like(lon)),
+        axis=-1,
+    )
+    wavelength = np.full(grid.shape, 3000.0, dtype=np.float64)
+    implicit = phase_cell_octave_xyz(
+        grid.xyz,
+        grid.radius_km,
+        wavelength,
+        east_tangent,
+        cell_scale=0.72,
+        seed=99,
+        octave=2,
+    )
+    explicit = phase_cell_octave_xyz(
+        grid.xyz,
+        grid.radius_km,
+        wavelength,
+        east_tangent,
+        cell_scale=0.72,
+        seed=99,
+        octave=2,
+        normalization=1.0,
+    )
+    for a, b in zip(implicit, explicit, strict=True):
+        assert np.array_equal(a, b)
+
+
+@pytest.mark.parametrize(
+    "radius, cell_scale, wavelength_value, message",
+    [
+        (0.0, 0.72, 3000.0, "radius_km"),
+        (6371.0, 0.0, 3000.0, "cell_scale"),
+        (6371.0, 0.72, 0.0, "wavelength_km"),
+        (6371.0, 0.72, np.nan, "wavelength_km"),
+    ],
+)
+def test_phase_cell_public_geometry_contract_rejects_invalid_inputs(
+    radius, cell_scale, wavelength_value, message
+):
+    grid = SphereGrid(64, 32, 6371.0)
+    lon = np.deg2rad(grid.lon)
+    east_tangent = np.stack(
+        (-np.sin(lon), np.cos(lon), np.zeros_like(lon)),
+        axis=-1,
+    )
+    with pytest.raises(ValueError, match=message):
+        phase_cell_octave_xyz(
+            grid.xyz,
+            radius,
+            np.full(grid.shape, wavelength_value),
+            east_tangent,
+            cell_scale=cell_scale,
+            seed=1,
+            octave=0,
         )
