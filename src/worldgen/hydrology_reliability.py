@@ -322,8 +322,14 @@ def enforce_hydrology_guardrails(result: Any, terrain: Any, cfg: Any) -> None:
     land_cells = max(int(np.count_nonzero(np.asarray(terrain.land, bool))), 1)
     river_fraction = float(result.metadata.get("river_area_fraction_of_land", 0.0))
     lake_fraction = float(result.base.metadata.get("lake_area_fraction_of_land", 0.0))
-    largest_cells = int(result.metadata.get("watersheds", {}).get("largest_basin_cells", 0))
-    largest_fraction = largest_cells / land_cells
+    watershed_meta = result.metadata.get("watersheds", {})
+    largest_cells = int(watershed_meta.get("largest_basin_cells", 0))
+    largest_fraction = float(
+        watershed_meta.get(
+            "largest_basin_area_fraction_land",
+            largest_cells / land_cells,
+        )
+    )
 
     limits = {
         "river_fraction_land": float(getattr(cfg, "hydrology_fail_river_fraction_land", 0.35)),
@@ -350,7 +356,7 @@ def enforce_hydrology_guardrails(result: Any, terrain: Any, cfg: Any) -> None:
         )
     if largest_fraction > limits["largest_basin_fraction_land"]:
         failures.append(
-            f"largest terminal basin contains {largest_fraction:.3f} of land cells, exceeding {limits['largest_basin_fraction_land']:.3f}"
+            f"largest terminal basin contains {largest_fraction:.3f} of land area, exceeding {limits['largest_basin_fraction_land']:.3f}"
         )
     if failures:
         raise RuntimeError("hydrology reliability guardrail failure: " + "; ".join(failures))
