@@ -15,6 +15,7 @@ from atmogen import (
 
 from .grid import normalize01
 from .lithology_properties import properties_for_codes
+from .planetary_chemistry import CHEMICALS, canonical_chemical
 
 
 @dataclass(slots=True)
@@ -257,18 +258,237 @@ def _fluid_factor(
     }
 
 
-def _freeze_thaw(climate: Any, condensate_hydrology: Any | None, moisture: np.ndarray, frost_susceptibility: np.ndarray) -> np.ndarray:
-    temp_k = np.asarray(climate.temperature_c, dtype=np.float64) + 273.15
-    species = "H2O"
+def _species_phase_threshold_k(species: str) -> tuple[str, float | None, str]:
+    """Return the best explicit solid/liquid phase threshold available."""
+    raw = str(species)
+    try:
+        key = canonical_chemical(raw)
+    except KeyError:
+        key = raw
+    record = CHEMICALS.get(key)
+    if record is not None and record.triple_or_melting_k is not None:
+        value = float(record.triple_or_melting_k)
+        if np.isfinite(value) and value > 0.0:
+            return key, value, "worldgen_planetary_chemistry"
+    props = fluid_transport_properties(raw)
+    if props is not None and props.freezing_temperature_k is not None:
+        value = float(props.freezing_temperature_k)
+        if np.isfinite(value) and value > 0.0:
+            return key, value, "atmogen_transport_reference"
+    return key, None, "unavailable"
+
+
+def _phase_crossing_fraction(
+    monthly_temperature_c: np.ndarray,
+    threshold_k: float,
+) -> np.ndarray:
+    """Count cyclic monthly crossings without materializing a float64 season cube."""
+    source = np.asarray(monthly_temperature_c)
+    if source.ndim != 3 or source.shape[0] != 12:
+        raise ValueError("monthly climate temperature must have shape (12,y,x)")
+    threshold = float(threshold_k)
+    if not np.isfinite(threshold) or threshold <= 0.0:
+        raise ValueError("phase threshold must be finite and positive")
+
+    shape = source.shape[1:]
+    crossings = np.zeros(shape, dtype=np.float64)
+    for month in range(12):
+        current = np.asarray(source[month], dtype=np.float64) + 273.15 - threshold
+        following = (
+            np.asarray(source[(month + 1) % 12], dtype=np.float64)
+            + 273.15
+            - threshold
+        )
+        if not np.isfinite(current).all() or not np.isfinite(following).all():
+            raise ValueError("monthly climate temperature must contain only finite values")
+        # Equivalent to current * following < 0 without overflow and with the
+        # historical convention that an exact threshold value is not a crossing.
+        crossings += (
+            ((current < 0.0) & (following > 0.0))
+            | ((current > 0.0) & (following < 0.0))
+        )
+    return crossings / 12.0
+
+
+def _freeze_thaw(
+    grid,
+    climate: Any,
+    condensate_hydrology: Any | None,
+    moisture: np.ndarray,
+    frost_susceptibility: np.ndarray,
+) -> tuple[np.ndarray, dict]:
+    """Build composition-aware phase-cycling frost-weathering activity.
+
+    Local condensate species are weighted by annual condensed volume depth, while
+    each species' crossing frequency is evaluated against its own explicit
+    melting/triple-point screening threshold. Cells without usable local
+    composition retain the historical reference-condensate threshold fallback.
+    """
+    monthly_temperature = np.asarray(climate.temperature_c)
+    shape = np.asarray(moisture).shape
+    if monthly_temperature.shape != (12, *shape):
+        raise ValueError(
+            f"climate temperature must have shape {(12, *shape)}, got "
+            f"{monthly_temperature.shape}"
+        )
+
+    reference_raw = (
+        "H2O"
+        if condensate_hydrology is None
+        else str(getattr(condensate_hydrology, "reference_species", "H2O"))
+    )
+    reference_species, reference_threshold, reference_source = (
+        _species_phase_threshold_k(reference_raw)
+    )
+    if reference_threshold is None:
+        reference_species = "H2O"
+        reference_threshold = 273.16
+        reference_source = "water_reference_fallback"
+
+    reference_crossings = _phase_crossing_fraction(
+        monthly_temperature, reference_threshold
+    )
+    crossings = reference_crossings.copy()
+    numerator = np.zeros(shape, dtype=np.float64)
+    denominator = np.zeros(shape, dtype=np.float64)
+    thresholds: dict[str, float] = {}
+    threshold_sources: dict[str, str] = {}
+    unresolved: list[str] = []
+
     if condensate_hydrology is not None:
-        species = str(getattr(condensate_hydrology, "reference_species", "H2O"))
-    props = fluid_transport_properties(species)
-    freezing = 273.15 if props is None or props.freezing_temperature_k is None else float(props.freezing_temperature_k)
-    shifted = temp_k - freezing
-    crossings = np.mean(shifted * np.roll(shifted, -1, axis=0) < 0.0, axis=0)
-    continentality = np.asarray(getattr(climate, "continentality_index_c", np.ptp(temp_k, axis=0)), dtype=np.float64)
+        monthly_liquid = getattr(
+            condensate_hydrology, "species_monthly_liquid_depth_mm", {}
+        ) or {}
+        monthly_solid = getattr(
+            condensate_hydrology, "species_monthly_solid_depth_mm", {}
+        ) or {}
+        for raw_key in sorted(set(monthly_liquid) | set(monthly_solid), key=str):
+            key, threshold, threshold_source = _species_phase_threshold_k(
+                str(raw_key)
+            )
+            if threshold is None:
+                unresolved.append(key)
+                continue
+
+            raw_liquid = monthly_liquid.get(raw_key)
+            raw_solid = monthly_solid.get(raw_key)
+            liquid_source = None if raw_liquid is None else np.asarray(raw_liquid)
+            solid_source = None if raw_solid is None else np.asarray(raw_solid)
+            expected = (12, *shape)
+            if (
+                (liquid_source is not None and liquid_source.shape != expected)
+                or (solid_source is not None and solid_source.shape != expected)
+            ):
+                raise ValueError(
+                    f"condensate phase-depth fields for {key!r} must have "
+                    f"shape {expected}"
+                )
+
+            annual_depth = np.zeros(shape, dtype=np.float64)
+            zeros = np.zeros(shape, dtype=np.float64)
+            for month in range(12):
+                liquid = (
+                    zeros
+                    if liquid_source is None
+                    else np.asarray(liquid_source[month], dtype=np.float64)
+                )
+                solid = (
+                    zeros
+                    if solid_source is None
+                    else np.asarray(solid_source[month], dtype=np.float64)
+                )
+                if (
+                    not np.isfinite(liquid).all()
+                    or not np.isfinite(solid).all()
+                    or np.any(liquid < 0.0)
+                    or np.any(solid < 0.0)
+                ):
+                    raise ValueError(
+                        f"condensate phase-depth fields for {key!r} must be "
+                        "finite and non-negative"
+                    )
+                annual_depth += liquid + solid
+
+            if not np.any(annual_depth > 0.0):
+                continue
+            species_crossings = _phase_crossing_fraction(
+                monthly_temperature, threshold
+            )
+            numerator += species_crossings * annual_depth
+            denominator += annual_depth
+            thresholds[key] = threshold
+            threshold_sources[key] = threshold_source
+
+    spatial_active = denominator > 1.0e-12
+    np.divide(
+        numerator,
+        denominator,
+        out=crossings,
+        where=spatial_active,
+    )
+
+    continentality_raw = getattr(climate, "continentality_index_c", None)
+    if continentality_raw is None:
+        t_min = np.full(shape, np.inf, dtype=np.float64)
+        t_max = np.full(shape, -np.inf, dtype=np.float64)
+        for month in range(12):
+            values = np.asarray(monthly_temperature[month], dtype=np.float64)
+            if not np.isfinite(values).all():
+                raise ValueError(
+                    "monthly climate temperature must contain only finite values"
+                )
+            np.minimum(t_min, values, out=t_min)
+            np.maximum(t_max, values, out=t_max)
+        continentality = t_max - t_min
+    else:
+        continentality = np.asarray(continentality_raw, dtype=np.float64)
+        if continentality.shape != shape or not np.isfinite(continentality).all():
+            raise ValueError(
+                "continentality_index_c must be finite and match the climate grid"
+            )
+
+    moisture_field = np.asarray(moisture, dtype=np.float64)
+    frost_field = np.asarray(frost_susceptibility, dtype=np.float64)
+    if (
+        moisture_field.shape != shape
+        or frost_field.shape != shape
+        or not np.isfinite(moisture_field).all()
+        or not np.isfinite(frost_field).all()
+    ):
+        raise ValueError(
+            "freeze-thaw moisture and frost susceptibility must be finite grid fields"
+        )
+
     continentality_factor = _sat(continentality, 18.0, 0.85)
-    return np.clip(crossings * continentality_factor * (0.25 + 0.75 * moisture) * frost_susceptibility, 0.0, 2.0)
+    activity = np.clip(
+        crossings
+        * continentality_factor
+        * (0.25 + 0.75 * moisture_field)
+        * frost_field,
+        0.0,
+        2.0,
+    )
+
+    weights = np.asarray(grid.cell_area_weights, dtype=np.float64)
+    if weights.shape != shape:
+        raise ValueError("grid cell-area weights must match the freeze-thaw grid")
+    active_fraction = (
+        float(np.sum(weights[spatial_active])) if np.any(spatial_active) else 0.0
+    )
+    return activity, {
+        "freeze_thaw_phase_source": (
+            "spatial_condensate_species_thresholds+reference_fallback"
+            if thresholds
+            else "reference_species_threshold"
+        ),
+        "freeze_thaw_reference_species": reference_species,
+        "freeze_thaw_reference_threshold_k": float(reference_threshold),
+        "freeze_thaw_reference_threshold_source": reference_source,
+        "freeze_thaw_species_threshold_k": thresholds,
+        "freeze_thaw_species_threshold_source": threshold_sources,
+        "freeze_thaw_unresolved_species": sorted(set(unresolved)),
+        "freeze_thaw_spatial_active_fraction": active_fraction,
+    }
 
 
 def build_erosion_forcing(
@@ -358,7 +578,14 @@ def build_erosion_forcing(
         * (0.35 + 0.65 * np.clip(soil_saturation, 0.0, 1.0))
         * land
     )
-    freeze_thaw = _freeze_thaw(climate, condensate_hydrology, np.clip(soil_saturation, 0.0, 1.0), lith["frost_susceptibility"]) * land
+    freeze_thaw, freeze_meta = _freeze_thaw(
+        grid,
+        climate,
+        condensate_hydrology,
+        np.clip(soil_saturation, 0.0, 1.0),
+        lith["frost_susceptibility"],
+    )
+    freeze_thaw *= land
 
     strength = (
         float(cfg.fluvial_weight) * fluvial
@@ -407,9 +634,10 @@ def build_erosion_forcing(
         "model": "environment-conditioned procedural erosion forcing",
         "strength_semantics": "dimensionless process activity; not an erosion mass rate",
         "scale_semantics": "preferred procedural wavelength in kilometres",
-        "freeze_thaw_semantics": "actual monthly phase-threshold crossings modulated by moisture and continentality",
+        "freeze_thaw_semantics": "species-specific monthly solid/liquid threshold crossings weighted by local condensed-volume supply, with reference-condensate fallback; modulated by moisture and continentality",
         "chemical_weathering_semantics": "substrate/moisture/temperature screening only; no general solvent-reaction kinetics",
         **fluid_meta,
+        **freeze_meta,
     }
     return ErosionForcing(
         strength=np.asarray(strength, np.float32),
