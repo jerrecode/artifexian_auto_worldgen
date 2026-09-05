@@ -228,12 +228,27 @@ single factor.
 ### Glacial and freeze-thaw regimes
 
 Glacial activity uses cold conditions, solid precipitation supply, lithological
-abrasion susceptibility, and available cryogeology diagnostics. Freeze-thaw
-activity uses monthly phase crossings, moisture, continentality, and lithological
-frost susceptibility.
+abrasion susceptibility, and available cryogeology diagnostics.
 
-These fields modulate morphology; they do not solve full ice dynamics, quarrying,
-or subglacial sediment transport.
+When the multicomponent condensate-hydrology bridge is present, its
+`monthly_thaw_fraction` is the phase authority for freeze-thaw forcing. That field
+already incorporates the local condensate mixture and the phase screening used by
+the volatile/condensate system, so erosion does not independently re-infer liquid
+stability from a single planet-wide freezing point. The cyclic phase-change index is
+
+```text
+freeze_thaw_crossing =
+    mean_month( abs(thaw_fraction[m+1] - thaw_fraction[m]) )
+```
+
+For a pure binary frozen/liquid cycle this reduces to the old crossing count; for a
+mixed condensate it retains fractional transitions. If no condensate-hydrology thaw
+field exists, the legacy reference-condensate temperature/freezing-threshold crossing
+is used as a compatibility fallback. The resulting phase-cycling index is then
+modulated by soil moisture, continentality, and lithological frost susceptibility.
+
+These fields modulate morphology; they do not solve full ice dynamics, volumetric
+freeze expansion, frost-heave mechanics, quarrying, or subglacial sediment transport.
 
 ### Marine regime
 
