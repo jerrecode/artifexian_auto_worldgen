@@ -333,8 +333,15 @@ With `N` raster cells and `O` resolved octaves, CPU work is therefore linear in
 raster size and octave count with a relatively large trigonometric/hash constant:
 approximately `O(27 N O)`.
 
-The reference implementation is vectorized NumPy. It intentionally keeps the
-correctness path dependency-light and inspectable. The kernel is suitable for
+The reference implementation is vectorized NumPy. The high-level operator defaults
+to row-chunked phase-cell evaluation (`phase_chunk_rows=128`) so the 27-neighbour
+temporary working set scales with chunk height rather than the full raster height.
+Set `phase_chunk_rows=0` to force the unchunked reference path; chunked and
+unchunked evaluation are regression-tested for bit-identical outputs. This reduces
+peak memory without changing hashes, phases, normalization, or octave recurrence.
+
+The implementation intentionally keeps the correctness path dependency-light and
+inspectable. The kernel is suitable for
 Numba, CuPy, JAX, native SIMD, or compute-shader acceleration, but an accelerated
 backend must preserve deterministic hashing, partial-normalization behavior,
 spherical coordinate conventions, LOD decisions, boundary behavior, and numerical

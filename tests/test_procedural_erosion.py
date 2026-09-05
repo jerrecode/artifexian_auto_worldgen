@@ -283,3 +283,93 @@ def test_phase_cell_public_geometry_contract_rejects_invalid_inputs(
             seed=1,
             octave=0,
         )
+
+
+def test_phase_cell_row_chunking_is_bit_identical_to_unchunked():
+    grid = SphereGrid(64, 32, 6371.0)
+    lon = np.deg2rad(grid.lon)
+    east_tangent = np.stack(
+        (-np.sin(lon), np.cos(lon), np.zeros_like(lon)),
+        axis=-1,
+    )
+    wavelength = np.full(grid.shape, 3000.0, dtype=np.float64)
+    reference = phase_cell_octave_xyz(
+        grid.xyz,
+        grid.radius_km,
+        wavelength,
+        east_tangent,
+        cell_scale=0.72,
+        seed=123,
+        octave=2,
+        normalization=0.5,
+        chunk_rows=0,
+    )
+    chunked = phase_cell_octave_xyz(
+        grid.xyz,
+        grid.radius_km,
+        wavelength,
+        east_tangent,
+        cell_scale=0.72,
+        seed=123,
+        octave=2,
+        normalization=0.5,
+        chunk_rows=7,
+    )
+    for expected, actual in zip(reference, chunked, strict=True):
+        assert np.array_equal(expected, actual)
+
+
+def test_high_level_chunking_preserves_complete_erosion_result():
+    grid = SphereGrid(64, 32, 6371.0)
+    terrain = _terrain(grid)
+    base = dict(
+        enabled=True,
+        octaves=3,
+        base_amplitude_m=20.0,
+        max_displacement_m=35.0,
+        slope_reference=0.002,
+    )
+    reference = apply_procedural_erosion(
+        grid,
+        terrain,
+        _forcing(grid),
+        ProceduralErosionConfig(**base, phase_chunk_rows=0),
+        seed=773,
+    )
+    chunked = apply_procedural_erosion(
+        grid,
+        terrain,
+        _forcing(grid),
+        ProceduralErosionConfig(**base, phase_chunk_rows=7),
+        seed=773,
+    )
+    for name in (
+        "delta_height_m",
+        "phase_coherence",
+        "ridge_map",
+        "crease_map",
+        "effective_strength",
+        "effective_scale_km",
+    ):
+        assert np.array_equal(getattr(reference, name), getattr(chunked, name))
+
+
+@pytest.mark.parametrize("chunk_rows", [-1, 1.5, True])
+def test_phase_cell_chunk_rows_reject_invalid_values(chunk_rows):
+    grid = SphereGrid(64, 32, 6371.0)
+    lon = np.deg2rad(grid.lon)
+    east_tangent = np.stack(
+        (-np.sin(lon), np.cos(lon), np.zeros_like(lon)),
+        axis=-1,
+    )
+    with pytest.raises((TypeError, ValueError), match="chunk_rows"):
+        phase_cell_octave_xyz(
+            grid.xyz,
+            grid.radius_km,
+            np.full(grid.shape, 3000.0),
+            east_tangent,
+            cell_scale=0.72,
+            seed=1,
+            octave=0,
+            chunk_rows=chunk_rows,
+        )

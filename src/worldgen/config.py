@@ -321,6 +321,7 @@ class ProceduralErosionConfig:
     steering_strength: float = 0.34
     fade_target_strength: float = 1.0
     phase_normalization: float = 0.5
+    phase_chunk_rows: int = 128
     gully_weight: float = 0.5
     detail_power: float = 1.5
     slope_reference: float = 0.08
@@ -682,6 +683,7 @@ class WorldConfig:
         _number("procedural_erosion.steering_strength", pe.steering_strength, minimum=0.0)
         _number("procedural_erosion.fade_target_strength", pe.fade_target_strength, minimum=0.0, maximum=1.0)
         _number("procedural_erosion.phase_normalization", pe.phase_normalization, minimum=0.0, maximum=1.0)
+        _integer("procedural_erosion.phase_chunk_rows", pe.phase_chunk_rows, minimum=0, maximum=8192)
         _number("procedural_erosion.gully_weight", pe.gully_weight, minimum=0.0, maximum=1.0, min_inclusive=False)
         _number("procedural_erosion.detail_power", pe.detail_power, minimum=0.0)
         _number("procedural_erosion.slope_reference", pe.slope_reference, minimum=0.0, min_inclusive=False)
