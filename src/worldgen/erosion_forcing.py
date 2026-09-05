@@ -7,7 +7,11 @@ from typing import Any
 
 import numpy as np
 
-from atmogen import fluid_transport_properties, liquid_mixture_transport_properties
+from atmogen import (
+    fluid_transport_properties,
+    liquid_mixture_transport_fields,
+    liquid_mixture_transport_properties,
+)
 
 from .grid import normalize01
 from .lithology_properties import properties_for_codes
@@ -39,49 +43,188 @@ def _sat(values: np.ndarray, scale: float, power: float = 1.0) -> np.ndarray:
     return 1.0 - np.exp(-np.power(x / max(float(scale), 1.0e-12), float(power)))
 
 
-def _fluid_factor(astronomy: Any, condensate_hydrology: Any | None, shape: tuple[int, int]) -> tuple[np.ndarray, dict]:
-    gravity = float(getattr(astronomy, "planet", {}).get("surface_gravity_m_s2", 9.80665))
-    factor = 1.0
-    source = "water_reference"
-    species = "H2O"
-    mixture = None
-
-    if condensate_hydrology is not None:
-        species_mass: dict[str, float] = {}
-        for key, values in getattr(condensate_hydrology, "species_monthly_mass_kg_m2", {}).items():
-            mass = float(np.sum(np.maximum(np.asarray(values, dtype=np.float64), 0.0)))
-            if mass > 0:
-                species_mass[str(key)] = mass
-        if species_mass:
-            mixture = liquid_mixture_transport_properties(species_mass_kg=species_mass)
-            species = max(species_mass, key=species_mass.get)
-            source = "condensate_mass_weighted_mixture"
-
-    if mixture is not None:
-        rho = mixture.density_kg_m3
-        mu = mixture.dynamic_viscosity_pa_s
-        sigma = mixture.surface_tension_n_m
-    else:
-        props = fluid_transport_properties(species)
-        if props is None:
-            props = fluid_transport_properties("H2O")
-            source += "+unsupported_species_water_fallback"
-        assert props is not None
-        rho = props.density_kg_m3
-        mu = props.dynamic_viscosity_pa_s
-        sigma = props.surface_tension_n_m
-
+def _mechanical_factor_from_properties(
+    density_kg_m3: np.ndarray | float,
+    dynamic_viscosity_pa_s: np.ndarray | float,
+    surface_tension_n_m: np.ndarray | float,
+    gravity_m_s2: float,
+) -> np.ndarray:
+    rho = np.maximum(np.asarray(density_kg_m3, dtype=np.float64), 1.0e-12)
+    mu = np.maximum(np.asarray(dynamic_viscosity_pa_s, dtype=np.float64), 1.0e-12)
+    sigma = np.maximum(np.asarray(surface_tension_n_m, dtype=np.float64), 1.0e-12)
     factor = (
         (rho / 997.0) ** 0.55
-        * (gravity / 9.80665) ** 0.45
-        * (1.0e-3 / max(mu, 1.0e-12)) ** 0.16
-        * (0.072 / max(sigma, 1.0e-12)) ** 0.10
+        * (float(gravity_m_s2) / 9.80665) ** 0.45
+        * (1.0e-3 / mu) ** 0.16
+        * (0.072 / sigma) ** 0.10
     )
-    factor = float(np.clip(factor, 0.08, 3.0))
-    return np.full(shape, factor, dtype=np.float32), {
+    return np.clip(factor, 0.08, 3.0)
+
+
+def _liquid_species_mass_fields(
+    grid,
+    condensate_hydrology: Any | None,
+    shape: tuple[int, int],
+) -> dict[str, np.ndarray]:
+    """Return annual precipitating liquid mass per cell [kg] by condensate.
+
+    The condensate bridge stores total species precipitation mass plus separate
+    liquid/solid volume depths. Their depth ratio therefore supplies the phase
+    fraction without assuming another density. Multiplying the resulting kg/m² by
+    spherical cell area gives true per-cell mass for atmogen's mixture API.
+    """
+    if condensate_hydrology is None:
+        return {}
+    monthly_mass = getattr(
+        condensate_hydrology, "species_monthly_mass_kg_m2", {}
+    ) or {}
+    monthly_liquid = getattr(
+        condensate_hydrology, "species_monthly_liquid_depth_mm", {}
+    ) or {}
+    monthly_solid = getattr(
+        condensate_hydrology, "species_monthly_solid_depth_mm", {}
+    ) or {}
+    if not monthly_mass:
+        return {}
+
+    area_m2 = (
+        np.asarray(grid.cell_area_weights, dtype=np.float64)
+        * 4.0
+        * np.pi
+        * (float(grid.radius_km) * 1000.0) ** 2
+    )
+    if area_m2.shape != shape or not np.isfinite(area_m2).all() or np.any(area_m2 <= 0.0):
+        raise ValueError("grid cell areas must be finite, positive, and match erosion shape")
+
+    out: dict[str, np.ndarray] = {}
+    for raw_key, raw_mass in monthly_mass.items():
+        key = str(raw_key)
+        mass = np.asarray(raw_mass, dtype=np.float64)
+        liquid = np.asarray(monthly_liquid.get(raw_key, np.zeros_like(mass)), dtype=np.float64)
+        solid = np.asarray(monthly_solid.get(raw_key, np.zeros_like(mass)), dtype=np.float64)
+        expected = (12, *shape)
+        if mass.shape != expected or liquid.shape != expected or solid.shape != expected:
+            raise ValueError(
+                f"condensate phase fields for {key!r} must have shape {expected}"
+            )
+        if (
+            not np.isfinite(mass).all()
+            or not np.isfinite(liquid).all()
+            or not np.isfinite(solid).all()
+            or np.any(mass < 0.0)
+            or np.any(liquid < 0.0)
+            or np.any(solid < 0.0)
+        ):
+            raise ValueError(
+                f"condensate phase fields for {key!r} must be finite and non-negative"
+            )
+
+        condensed_depth = liquid + solid
+        liquid_fraction = np.divide(
+            liquid,
+            condensed_depth,
+            out=np.zeros_like(liquid),
+            where=condensed_depth > 1.0e-12,
+        )
+        annual_liquid_mass_kg_m2 = np.sum(mass * liquid_fraction, axis=0)
+        cell_mass = annual_liquid_mass_kg_m2 * area_m2
+        if np.any(cell_mass > 0.0):
+            out[key] = cell_mass
+    return out
+
+
+def _fluid_factor(
+    grid,
+    astronomy: Any,
+    condensate_hydrology: Any | None,
+    shape: tuple[int, int],
+) -> tuple[np.ndarray, dict]:
+    gravity = float(
+        getattr(astronomy, "planet", {}).get("surface_gravity_m_s2", 9.80665)
+    )
+    if not np.isfinite(gravity) or gravity <= 0.0:
+        raise ValueError("surface gravity must be finite and positive")
+
+    water = fluid_transport_properties("H2O")
+    assert water is not None
+    water_factor = float(
+        _mechanical_factor_from_properties(
+            water.density_kg_m3,
+            water.dynamic_viscosity_pa_s,
+            water.surface_tension_n_m,
+            gravity,
+        )
+    )
+    factor = np.full(shape, water_factor, dtype=np.float64)
+    source = "water_reference"
+    species = "H2O"
+    active = np.zeros(shape, dtype=bool)
+    liquid_species = _liquid_species_mass_fields(
+        grid, condensate_hydrology, shape
+    )
+
+    unsupported = sorted(
+        key
+        for key, values in liquid_species.items()
+        if np.any(values > 0.0) and fluid_transport_properties(key) is None
+    )
+    if liquid_species:
+        totals = {
+            key: float(np.sum(values, dtype=np.float64))
+            for key, values in liquid_species.items()
+        }
+        species = max(totals, key=totals.get)
+
+    if liquid_species and not unsupported:
+        total_species_mass = {
+            key: float(np.sum(values, dtype=np.float64))
+            for key, values in liquid_species.items()
+        }
+        global_mixture = liquid_mixture_transport_properties(
+            species_mass_kg=total_species_mass
+        )
+        spatial = liquid_mixture_transport_fields(
+            species_mass_kg=liquid_species
+        )
+        if global_mixture is not None and spatial is not None:
+            fallback = float(
+                _mechanical_factor_from_properties(
+                    global_mixture.density_kg_m3,
+                    global_mixture.dynamic_viscosity_pa_s,
+                    global_mixture.surface_tension_n_m,
+                    gravity,
+                )
+            )
+            factor.fill(fallback)
+            active = np.asarray(spatial.active_mask, dtype=bool)
+            local = _mechanical_factor_from_properties(
+                spatial.density_kg_m3,
+                spatial.dynamic_viscosity_pa_s,
+                spatial.surface_tension_n_m,
+                gravity,
+            )
+            factor[active] = local[active]
+            source = "spatial_condensate_liquid_mixture+global_liquid_mixture_fallback"
+    elif unsupported:
+        source = "unsupported_liquid_species_water_reference_fallback"
+    elif condensate_hydrology is not None:
+        source = "water_reference+no_liquid_condensate"
+
+    if not np.isfinite(factor).all():
+        raise RuntimeError("fluid mechanical factor became non-finite")
+    factor = np.clip(factor, 0.08, 3.0)
+    weights = np.asarray(grid.cell_area_weights, dtype=np.float64)
+    mean_factor = float(np.sum(factor * weights))
+    active_fraction = float(np.sum(weights[active])) if np.any(active) else 0.0
+    return np.asarray(factor, dtype=np.float32), {
         "dominant_condensate": species,
+        "liquid_transport_species": sorted(liquid_species),
+        "unsupported_liquid_transport_species": unsupported,
         "fluid_property_source": source,
-        "fluid_mechanical_factor": factor,
+        "fluid_mechanical_factor": mean_factor,
+        "fluid_mechanical_factor_min": float(np.min(factor)),
+        "fluid_mechanical_factor_max": float(np.max(factor)),
+        "fluid_mechanical_spatial_active_fraction": active_fraction,
         "gravity_m_s2": gravity,
     }
 
@@ -150,7 +293,9 @@ def build_erosion_forcing(
         liquid_precip = annual_p * (1.0 - snow_fraction)
         solid_precip = annual_p * snow_fraction
 
-    fluid_factor, fluid_meta = _fluid_factor(astronomy, condensate_hydrology, shape)
+    fluid_factor, fluid_meta = _fluid_factor(
+        grid, astronomy, condensate_hydrology, shape
+    )
     k_mech = np.clip(lith["mechanical_erodibility"] / 0.82, 0.25, 2.5)
     runoff_term = _sat(surface_runoff, 650.0, 0.85)
     discharge_term = _sat(discharge, 0.22, 0.80)
