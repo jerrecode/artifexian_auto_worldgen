@@ -18,6 +18,27 @@ class SphereGrid:
     distance_cache_max_bytes: int | None = None
 
     def __post_init__(self) -> None:
+        for name in ("width", "height"):
+            value = getattr(self, name)
+            if not isinstance(value, (int, np.integer)) or isinstance(value, (bool, np.bool_)):
+                raise TypeError("width and height dimensions must be integers")
+            if int(value) < 2:
+                raise ValueError("width and height dimensions must be at least 2")
+        radius = float(self.radius_km)
+        if not np.isfinite(radius) or radius <= 0.0:
+            raise ValueError("radius_km must be finite and positive")
+        self.width = int(self.width)
+        self.height = int(self.height)
+        self.radius_km = radius
+        if self.distance_cache_max_bytes is not None:
+            if (
+                not isinstance(self.distance_cache_max_bytes, (int, np.integer))
+                or isinstance(self.distance_cache_max_bytes, (bool, np.bool_))
+                or int(self.distance_cache_max_bytes) < 0
+            ):
+                raise ValueError("distance_cache_max_bytes must be a non-negative integer or None")
+            self.distance_cache_max_bytes = int(self.distance_cache_max_bytes)
+
         self.lon_1d = np.linspace(-180.0, 180.0, self.width, endpoint=False, dtype=np.float64)
         dlat = 180.0 / self.height
         self.lat_1d = np.linspace(90.0 - dlat / 2, -90.0 + dlat / 2, self.height, dtype=np.float64)
@@ -60,10 +81,21 @@ class SphereGrid:
         return self._distance_cache.stats()
 
     def weighted_fraction(self, mask: np.ndarray) -> float:
-        return float(np.sum(self.cell_area_weights * np.asarray(mask, dtype=float)))
+        values = np.asarray(mask, dtype=float)
+        if values.shape != self.shape:
+            raise ValueError(f"mask shape must match grid shape {self.shape}, got {values.shape}")
+        if np.any(~np.isfinite(values)):
+            raise ValueError("mask values must be finite")
+        return float(np.sum(self.cell_area_weights * values))
 
     def weighted_quantile(self, data: np.ndarray, q: float) -> float:
-        a = np.asarray(data, dtype=np.float64).ravel()
+        values = np.asarray(data, dtype=np.float64)
+        if values.shape != self.shape:
+            raise ValueError(f"data shape must match grid shape {self.shape}, got {values.shape}")
+        quantile = float(q)
+        if not np.isfinite(quantile) or not 0.0 <= quantile <= 1.0:
+            raise ValueError("q must be finite and in [0, 1]")
+        a = values.ravel()
         w = np.asarray(self.cell_area_weights, dtype=np.float64).ravel()
         finite = np.isfinite(a) & np.isfinite(w) & (w > 0)
         if not np.any(finite):
@@ -75,7 +107,7 @@ class SphereGrid:
         ww = ww[idx]
         c = np.cumsum(ww)
         c /= max(float(c[-1]), 1e-30)
-        return float(np.interp(float(np.clip(q, 0.0, 1.0)), c, aa))
+        return float(np.interp(quantile, c, aa))
 
     def great_circle_km(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         p1, p2 = np.deg2rad([lat1, lat2])
@@ -90,11 +122,23 @@ class SphereGrid:
 
 
 def spherical_voronoi_ids(grid: SphereGrid, seeds_xyz: np.ndarray, chunk: int = 65536) -> np.ndarray:
+    seeds = np.asarray(seeds_xyz, dtype=np.float64)
+    if seeds.ndim != 2 or seeds.shape[1:] != (3,) or seeds.shape[0] == 0:
+        raise ValueError("seed vectors must have non-empty shape (n, 3)")
+    if np.any(~np.isfinite(seeds)):
+        raise ValueError("seed vectors must be finite")
+    norms = np.linalg.norm(seeds, axis=1)
+    if np.any(~np.isfinite(norms)) or np.any(norms <= 0.0):
+        raise ValueError("seed vectors must have finite non-zero magnitude")
+    seeds = seeds / norms[:, None]
+    if not isinstance(chunk, (int, np.integer)) or isinstance(chunk, (bool, np.bool_)) or int(chunk) < 1:
+        raise ValueError("chunk must be a positive integer")
+    step = int(chunk)
     pts = grid.xyz.reshape(-1, 3)
-    out = np.empty(len(pts), dtype=np.int16 if len(seeds_xyz) < 32767 else np.int32)
-    for i in range(0, len(pts), chunk):
-        dot = pts[i:i + chunk] @ seeds_xyz.T
-        out[i:i + chunk] = np.argmax(dot, axis=1)
+    out = np.empty(len(pts), dtype=np.int16 if len(seeds) < 32767 else np.int32)
+    for i in range(0, len(pts), step):
+        dot = pts[i:i + step] @ seeds.T
+        out[i:i + step] = np.argmax(dot, axis=1)
     return out.reshape(grid.height, grid.width)
 
 
@@ -125,6 +169,8 @@ def distance_to(mask: np.ndarray, grid: SphereGrid) -> np.ndarray:
     byte-bounded; ``WORLDGEN_DISTANCE_CACHE_MB`` controls its default resident cap.
     """
     m = np.asarray(mask, dtype=bool)
+    if m.shape != grid.shape:
+        raise ValueError(f"mask shape must match grid shape {grid.shape}, got {m.shape}")
     key = _mask_digest(m)
     cached = grid._distance_cache.get(key)
     if cached is not None:
