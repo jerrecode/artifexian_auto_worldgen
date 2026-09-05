@@ -6,8 +6,8 @@ These functions address three failure modes that become obvious at high resoluti
 artificial polar outlets on oceanless bodies, long lattice-aligned receiver paths,
 and channel/lake masks whose drainage-area term can overwhelm the available liquid
 water budget.  They preserve the canonical single-receiver DrainageGraph API while
-making the receiver stencil denser and enforcing physically meaningful discharge
-and occupied-cell guardrails.
+using continuous multi-scale steering with strictly local receivers and enforcing
+physically meaningful discharge and occupied-cell guardrails.
 """
 
 import math
@@ -202,7 +202,8 @@ def channel_hierarchy_discharge_guarded(
         rivers &= keep
         cls[~rivers & (cls >= 2)] = 1
 
-    stream_order = np.where(rivers, stream_order, 0).astype(np.uint8)
+    # Preserve the established API: stream_order describes the complete resolved
+    # channel graph, not only the subset promoted to visible/river classes.
     width = (
         bankfull_index
         * (0.55 + 0.45 * stream_order / max(float(stream_order.max()), 1.0))
