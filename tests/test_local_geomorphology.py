@@ -81,6 +81,14 @@ def test_local_geomorphology_is_watertight_mass_accounted_and_river_constrained(
     np.testing.assert_array_equal(evolved[:, -1], base[:, -1])
     assert np.all(np.asarray(result.erosion_m) >= 0.0)
     assert np.all(np.asarray(result.deposition_m) >= 0.0)
+    assert np.isfinite(np.asarray(result.procedural_detail_m)).all()
+    assert np.isfinite(np.asarray(result.procedural_coherence)).all()
+    assert np.all((np.asarray(result.procedural_coherence) >= 0.0) & (np.asarray(result.procedural_coherence) <= 1.0))
+    assert np.any(np.abs(np.asarray(result.procedural_detail_m)[1:-1, 1:-1]) > 0.0)
+    assert np.allclose(np.asarray(result.procedural_detail_m)[0, :], 0.0)
+    assert np.allclose(np.asarray(result.procedural_detail_m)[-1, :], 0.0)
+    assert np.allclose(np.asarray(result.procedural_detail_m)[:, 0], 0.0)
+    assert np.allclose(np.asarray(result.procedural_detail_m)[:, -1], 0.0)
     assert np.any(np.asarray(result.major_river_constraint)[1:-1, 1:-1])
     assert np.any(evolved[1:-1, 1:-1] < base[1:-1, 1:-1])
     assert float(result.metadata["sediment_closure_relative"]) < 1e-12
@@ -89,6 +97,8 @@ def test_local_geomorphology_is_watertight_mass_accounted_and_river_constrained(
     exported = float(result.metadata["exported_sediment_volume_m3"])
     assert eroded >= 0 and deposited >= 0 and exported >= 0
     assert abs(eroded - deposited - exported) <= max(eroded, 1.0) * 1e-12
+    assert result.metadata["procedural_semantics"].startswith("zero-area-mean")
+    assert result.metadata["procedural_octaves_executed"] >= 1
 
 
 def test_local_geomorphology_cache_is_deterministic(tmp_path):
