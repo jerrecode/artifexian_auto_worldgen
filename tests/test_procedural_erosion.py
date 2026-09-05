@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import worldgen.procedural_erosion as procedural_erosion_module
+
 from worldgen.config import ProceduralErosionConfig
 from worldgen.erosion_forcing import ErosionForcing
 from worldgen.grid import SphereGrid
@@ -373,3 +375,49 @@ def test_phase_cell_chunk_rows_reject_invalid_values(chunk_rows):
             octave=0,
             chunk_rows=chunk_rows,
         )
+
+
+def test_precomputed_tangent_geometry_matches_reference_path_exactly():
+    grid = SphereGrid(64, 32, 6371.0)
+    south = np.sin(np.deg2rad(grid.lat)) + 0.25 * np.cos(np.deg2rad(grid.lon))
+    east = np.cos(np.deg2rad(grid.lat)) - 0.15 * np.sin(np.deg2rad(grid.lon))
+    normal = procedural_erosion_module._unit_positions(grid)
+    south_basis, east_basis = procedural_erosion_module._tangent_bases(grid)
+
+    reference = procedural_erosion_module._tangent_perpendicular(grid, south, east)
+    precomputed = procedural_erosion_module._tangent_perpendicular_precomputed(
+        normal, south_basis, east_basis, south, east
+    )
+    assert np.array_equal(reference, precomputed)
+
+
+def test_high_level_erosion_builds_invariant_spherical_geometry_once(monkeypatch):
+    grid = SphereGrid(64, 32, 6371.0)
+    terrain = _terrain(grid)
+    cfg = ProceduralErosionConfig(
+        enabled=True,
+        octaves=3,
+        base_amplitude_m=12.0,
+        slope_reference=0.002,
+        phase_chunk_rows=7,
+    )
+
+    calls = {"positions": 0, "bases": 0}
+    original_positions = procedural_erosion_module._unit_positions
+    original_bases = procedural_erosion_module._tangent_bases
+
+    def counted_positions(target_grid):
+        calls["positions"] += 1
+        return original_positions(target_grid)
+
+    def counted_bases(target_grid):
+        calls["bases"] += 1
+        return original_bases(target_grid)
+
+    monkeypatch.setattr(procedural_erosion_module, "_unit_positions", counted_positions)
+    monkeypatch.setattr(procedural_erosion_module, "_tangent_bases", counted_bases)
+
+    result = apply_procedural_erosion(grid, terrain, _forcing(grid), cfg, seed=7721)
+    assert result.metadata["octaves_executed"] >= 2
+    assert result.metadata["spherical_geometry_precomputed"] is True
+    assert calls == {"positions": 1, "bases": 1}
