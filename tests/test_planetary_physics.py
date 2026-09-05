@@ -196,3 +196,10 @@ def test_atmosphere_diagnostics_rejects_invalid_state(override):
     kwargs.update(override)
     with pytest.raises(ValueError, match="pressure|temperature|gravity"):
         atmosphere_diagnostics(**kwargs)
+
+
+
+@pytest.mark.parametrize("heat_flux", [np.nan, np.inf, -np.inf, -0.01])
+def test_geological_activity_rejects_invalid_heat_flux(heat_flux):
+    with pytest.raises(ValueError, match="internal heat flux.*finite and non-negative"):
+        geological_activity_regime(heat_flux)
