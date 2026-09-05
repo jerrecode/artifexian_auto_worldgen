@@ -208,9 +208,27 @@ different processes differently rather than serving as one universal multiplier.
 
 ### Planetary liquid mechanics
 
-When condensate composition is available, atmogen supplies mixture density
-`rho`, dynamic viscosity `mu`, and surface tension `sigma`. Worldgen maps
-these plus surface gravity to a bounded screening factor:
+Liquid mechanics are split by physical reservoir rather than using one planet-wide
+fluid identity for every erosion regime.
+
+For **precipitation, runoff, and fluvial/pluvial erosion**, the condensate-hydrology
+bridge supplies local precipitating-liquid composition. Worldgen converts its
+mass-conservative monthly species fields to local liquid-only species masses and
+asks atmogen for spatial mixture density `rho`, dynamic viscosity `mu`, and
+surface tension `sigma`. Solid condensate is excluded from this transport
+mixture. Cells with no local liquid precipitation use the global precipitating-liquid
+mixture as a routed-runoff fallback.
+
+For **marine and shelf erosion**, precipitation composition is not used as a proxy
+for the ocean. When a `SurfaceLiquidResult` exists, its conserved standing-liquid
+partitions provide the liquid masses used to build a separate mixture-property
+factor. The current surface-liquid solver represents one globally connected
+equipotential reservoir, so marine mechanics are currently one global standing-
+liquid mixture scalar applied only to submerged erosion. A future basin-isolated
+surface-liquid solver can promote this to a spatial marine-composition field without
+changing the erosion API boundary.
+
+Both paths use the same bounded screening relationship:
 
 ```text
 F_liquid =
@@ -220,10 +238,17 @@ F_liquid =
     * (0.072 / sigma)^0.10
 ```
 
-The result is clipped to a finite range. This is a reduced-order mechanical
-screening relationship, not a calibrated sediment-entrainment law. Explicit
-acidity/alkalinity and rock-fluid reaction kinetics are not represented by this
-single factor.
+The reference values are water-like normalizations, not an assertion that the
+working liquid is water. If a positive-mass component lacks supported transport
+properties, the corresponding path records an explicit water-reference fallback
+rather than silently discarding that species. Legacy worlds that do not expose a
+`SurfaceLiquidResult` keep the historical neutral marine multiplier so adding the
+new coupling does not change their marine forcing.
+
+These factors are reduced-order mechanical screening relationships, not calibrated
+Shields, stream-power, wave-orbital-velocity, or sediment-entrainment laws. Explicit
+acidity/alkalinity, salinity-dependent transport, pressure/temperature-dependent
+viscosity, and rock-fluid reaction kinetics are not represented by these factors.
 
 ### Glacial and freeze-thaw regimes
 
@@ -253,9 +278,15 @@ freeze expansion, frost-heave mechanics, quarrying, or subglacial sediment trans
 ### Marine regime
 
 Marine activity is stronger on shelves than in generic deep-ocean cells and is
-modulated by local slope and current speed. Wave-cut platforms, longshore
-transport, turbidity currents, and submarine landslides remain separate potential
-process modules.
+modulated by local slope, current speed, and the standing surface-liquid mechanical
+factor described above. It is deliberately independent of the precipitating-liquid
+factor used by rain and runoff.
+
+The present globally connected surface-liquid model implies one mixture composition
+for the standing ocean, while the spatial pattern of marine erosion still comes from
+the ocean mask, shelf classification, terrain slope, and currents. Wave-cut
+platforms, longshore transport, basin-specific fluid composition, turbidity
+currents, and submarine landslides remain separate potential process modules.
 
 ### Chemical weathering
 

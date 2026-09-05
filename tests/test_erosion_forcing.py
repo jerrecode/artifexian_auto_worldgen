@@ -152,6 +152,10 @@ def test_shelf_marine_activity_exceeds_matching_deep_ocean_activity():
     assert float(np.mean(forcing.marine_activity[shelf])) > (
         5.0 * float(np.mean(forcing.marine_activity[~shelf]))
     )
+    assert forcing.metadata["marine_fluid_property_source"] == (
+        "legacy_neutral_no_surface_liquid_result"
+    )
+    assert forcing.metadata["marine_fluid_mechanical_factor"] == 1.0
 
 
 def test_modern_and_legacy_geology_codes_are_equivalent_and_shape_checked():
@@ -464,4 +468,153 @@ def test_freeze_thaw_rejects_invalid_multicondensate_thaw_fields(thaw):
             astronomy,
             ProceduralErosionConfig(enabled=True),
             condensate_hydrology=condensate,
+        )
+
+
+def _surface_liquid_fixture(species_mass_kg):
+    partitions = {
+        species: SimpleNamespace(liquid_mass_kg=float(mass))
+        for species, mass in species_mass_kg.items()
+    }
+    return SimpleNamespace(
+        partitions=partitions,
+        total_liquid_mass_kg=float(sum(species_mass_kg.values())),
+    )
+
+
+def test_standing_liquid_composition_scales_marine_erosion_independently():
+    grid, terrain, ocean, climate, hydrology, geology, astronomy = _forcing_fixture(
+        land=False,
+        temperature_c=5.0,
+        precipitation_mm_year=0.0,
+    )
+    terrain.shelf = np.ones(grid.shape, dtype=bool)
+    water = build_erosion_forcing(
+        grid,
+        terrain,
+        ocean,
+        climate,
+        hydrology,
+        geology,
+        astronomy,
+        ProceduralErosionConfig(enabled=True),
+        surface_liquids=_surface_liquid_fixture({"H2O": 1.0e18}),
+    )
+    methane = build_erosion_forcing(
+        grid,
+        terrain,
+        ocean,
+        climate,
+        hydrology,
+        geology,
+        astronomy,
+        ProceduralErosionConfig(enabled=True),
+        surface_liquids=_surface_liquid_fixture({"CH4": 1.0e18}),
+    )
+
+    wf = water.metadata["marine_fluid_mechanical_factor"]
+    mf = methane.metadata["marine_fluid_mechanical_factor"]
+    assert not np.isclose(wf, mf, rtol=0.0, atol=1.0e-4)
+    assert water.metadata["marine_fluid_dominant_species"] == "H2O"
+    assert methane.metadata["marine_fluid_dominant_species"] == "CH4"
+    assert water.metadata["marine_fluid_property_source"] == (
+        "surface_liquid_global_mixture"
+    )
+    assert methane.metadata["marine_fluid_property_source"] == (
+        "surface_liquid_global_mixture"
+    )
+
+    active = water.marine_activity > 0.0
+    assert np.any(active)
+    np.testing.assert_allclose(
+        methane.marine_activity[active] / water.marine_activity[active],
+        mf / wf,
+        rtol=2.0e-6,
+        atol=2.0e-6,
+    )
+
+
+def test_unsupported_standing_liquid_uses_explicit_water_reference_fallback():
+    grid, terrain, ocean, climate, hydrology, geology, astronomy = _forcing_fixture(
+        land=False,
+        temperature_c=5.0,
+    )
+    terrain.shelf = np.ones(grid.shape, dtype=bool)
+    forcing = build_erosion_forcing(
+        grid,
+        terrain,
+        ocean,
+        climate,
+        hydrology,
+        geology,
+        astronomy,
+        ProceduralErosionConfig(enabled=True),
+        surface_liquids=_surface_liquid_fixture({"C3H8": 1.0e18}),
+    )
+    assert forcing.metadata["marine_fluid_dominant_species"] == "C3H8"
+    assert forcing.metadata["marine_fluid_unsupported_species"] == ["C3H8"]
+    assert forcing.metadata["marine_fluid_property_source"] == (
+        "unsupported_surface_liquid_water_reference_fallback"
+    )
+    assert forcing.metadata["marine_fluid_mechanical_factor"] > 0.0
+
+
+@pytest.mark.parametrize("mass", [np.nan, np.inf, -1.0])
+def test_standing_liquid_rejects_invalid_partition_mass(mass):
+    grid, terrain, ocean, climate, hydrology, geology, astronomy = _forcing_fixture(
+        land=False,
+    )
+    with pytest.raises(ValueError, match="surface liquid mass.*finite and non-negative"):
+        build_erosion_forcing(
+            grid,
+            terrain,
+            ocean,
+            climate,
+            hydrology,
+            geology,
+            astronomy,
+            ProceduralErosionConfig(enabled=True),
+            surface_liquids=_surface_liquid_fixture({"H2O": mass}),
+        )
+
+
+def test_empty_surface_liquid_inventory_keeps_marine_scaling_neutral():
+    grid, terrain, ocean, climate, hydrology, geology, astronomy = _forcing_fixture(
+        land=False,
+    )
+    forcing = build_erosion_forcing(
+        grid,
+        terrain,
+        ocean,
+        climate,
+        hydrology,
+        geology,
+        astronomy,
+        ProceduralErosionConfig(enabled=True),
+        surface_liquids=_surface_liquid_fixture({"H2O": 0.0}),
+    )
+    assert forcing.metadata["marine_fluid_property_source"] == (
+        "neutral_no_standing_liquid"
+    )
+    assert forcing.metadata["marine_fluid_dominant_species"] == "none"
+    assert forcing.metadata["marine_fluid_mechanical_factor"] == 1.0
+
+
+def test_standing_liquid_rejects_partition_total_mass_inconsistency():
+    grid, terrain, ocean, climate, hydrology, geology, astronomy = _forcing_fixture(
+        land=False,
+    )
+    inconsistent = _surface_liquid_fixture({"H2O": 4.0e17, "CH4": 1.0e17})
+    inconsistent.total_liquid_mass_kg = 9.0e17
+    with pytest.raises(ValueError, match="inconsistent with partition"):
+        build_erosion_forcing(
+            grid,
+            terrain,
+            ocean,
+            climate,
+            hydrology,
+            geology,
+            astronomy,
+            ProceduralErosionConfig(enabled=True),
+            surface_liquids=inconsistent,
         )

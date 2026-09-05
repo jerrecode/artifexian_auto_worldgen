@@ -3,7 +3,7 @@ from __future__ import annotations
 """Build physically conditioned parameter fields for procedural erosion."""
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -257,6 +257,114 @@ def _fluid_factor(
     }
 
 
+def _surface_liquid_factor(
+    astronomy: Any,
+    surface_liquids: Any | None,
+) -> tuple[float, dict]:
+    """Return a standing-liquid mechanical factor for marine erosion only.
+
+    The current surface-liquid solver represents one globally connected
+    equipotential mixture, so one scalar factor is the correct fidelity level.
+    Legacy worlds without a SurfaceLiquidResult retain a neutral multiplier.
+    """
+    if surface_liquids is None:
+        return 1.0, {
+            "marine_fluid_property_source": "legacy_neutral_no_surface_liquid_result",
+            "marine_fluid_dominant_species": "none",
+            "marine_fluid_transport_species": [],
+            "marine_fluid_unsupported_species": [],
+            "marine_fluid_mechanical_factor": 1.0,
+        }
+
+    gravity = float(
+        getattr(astronomy, "planet", {}).get("surface_gravity_m_s2", 9.80665)
+    )
+    if not np.isfinite(gravity) or gravity <= 0.0:
+        raise ValueError("surface gravity must be finite and positive")
+
+    partitions = getattr(surface_liquids, "partitions", {}) or {}
+    species_mass: dict[str, float] = {}
+    for raw_key, partition in partitions.items():
+        if isinstance(partition, Mapping):
+            raw_mass = partition.get("liquid_mass_kg", 0.0)
+        else:
+            raw_mass = getattr(partition, "liquid_mass_kg", 0.0)
+        mass = float(raw_mass)
+        if not np.isfinite(mass) or mass < 0.0:
+            raise ValueError(
+                f"surface liquid mass for {raw_key!r} must be finite and non-negative"
+            )
+        if mass > 0.0:
+            species_mass[str(raw_key)] = species_mass.get(str(raw_key), 0.0) + mass
+
+    partition_total = float(sum(species_mass.values()))
+    declared_total_raw = getattr(surface_liquids, "total_liquid_mass_kg", None)
+    if declared_total_raw is not None:
+        declared_total = float(declared_total_raw)
+        if not np.isfinite(declared_total) or declared_total < 0.0:
+            raise ValueError(
+                "surface total_liquid_mass_kg must be finite and non-negative"
+            )
+        tolerance = max(1.0e-9 * max(declared_total, partition_total, 1.0), 1.0e-6)
+        if abs(declared_total - partition_total) > tolerance:
+            raise ValueError(
+                "surface total_liquid_mass_kg is inconsistent with partition "
+                "liquid masses"
+            )
+
+    if not species_mass:
+        return 1.0, {
+            "marine_fluid_property_source": "neutral_no_standing_liquid",
+            "marine_fluid_dominant_species": "none",
+            "marine_fluid_transport_species": [],
+            "marine_fluid_unsupported_species": [],
+            "marine_fluid_mechanical_factor": 1.0,
+        }
+
+    dominant = max(species_mass, key=species_mass.get)
+    unsupported = sorted(
+        key for key in species_mass if fluid_transport_properties(key) is None
+    )
+    source = "surface_liquid_global_mixture"
+    transport_species = sorted(species_mass)
+
+    mixture = None
+    if not unsupported:
+        mixture = liquid_mixture_transport_properties(
+            species_mass_kg=species_mass
+        )
+
+    if mixture is None:
+        water = fluid_transport_properties("H2O")
+        assert water is not None
+        factor = float(
+            _mechanical_factor_from_properties(
+                water.density_kg_m3,
+                water.dynamic_viscosity_pa_s,
+                water.surface_tension_n_m,
+                gravity,
+            )
+        )
+        source = "unsupported_surface_liquid_water_reference_fallback"
+    else:
+        factor = float(
+            _mechanical_factor_from_properties(
+                mixture.density_kg_m3,
+                mixture.dynamic_viscosity_pa_s,
+                mixture.surface_tension_n_m,
+                gravity,
+            )
+        )
+
+    return factor, {
+        "marine_fluid_property_source": source,
+        "marine_fluid_dominant_species": dominant,
+        "marine_fluid_transport_species": transport_species,
+        "marine_fluid_unsupported_species": unsupported,
+        "marine_fluid_mechanical_factor": factor,
+    }
+
+
 def _phase_crossing_fraction(
     monthly_temperature_c: np.ndarray,
     threshold_k: float,
@@ -453,6 +561,7 @@ def build_erosion_forcing(
     *,
     condensate_hydrology: Any | None = None,
     cryogeology: Any | None = None,
+    surface_liquids: Any | None = None,
 ) -> ErosionForcing:
     shape = terrain.elevation_km.shape
     land = np.asarray(terrain.land, dtype=bool)
@@ -518,7 +627,16 @@ def build_erosion_forcing(
     slope_n = normalize01(slope, robust=True)
     current = normalize01(np.asarray(getattr(ocean, "current_speed", np.zeros(shape)), dtype=np.float64), robust=True)
     shelf = np.asarray(getattr(terrain, "shelf", np.zeros(shape, dtype=bool)), dtype=bool)
-    marine = ocean_mask * (0.10 + 0.90 * shelf) * slope_n * (0.35 + 0.65 * current)
+    marine_fluid_factor, marine_fluid_meta = _surface_liquid_factor(
+        astronomy, surface_liquids
+    )
+    marine = (
+        ocean_mask
+        * (0.10 + 0.90 * shelf)
+        * slope_n
+        * (0.35 + 0.65 * current)
+        * marine_fluid_factor
+    )
 
     thermal_weather = np.exp(-((temp - 18.0) / 28.0) ** 2)
     chemical = (
@@ -587,6 +705,7 @@ def build_erosion_forcing(
         "freeze_thaw_semantics": "cyclic changes in the multicomponent condensate bridge monthly_thaw_fraction when available, with reference-condensate temperature-threshold fallback; modulated by moisture, continentality, and lithological frost susceptibility",
         "chemical_weathering_semantics": "substrate/moisture/temperature screening only; no general solvent-reaction kinetics",
         **fluid_meta,
+        **marine_fluid_meta,
         **freeze_meta,
     }
     return ErosionForcing(
