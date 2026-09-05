@@ -333,8 +333,28 @@ With `N` raster cells and `O` resolved octaves, CPU work is therefore linear in
 raster size and octave count with a relatively large trigonometric/hash constant:
 approximately `O(27 N O)`.
 
-The reference implementation is vectorized NumPy. It intentionally keeps the
-correctness path dependency-light and inspectable. The kernel is suitable for
+The reference implementation is vectorized NumPy. The high-level operator defaults
+to row-chunked phase-cell evaluation (`phase_chunk_rows=128`) so the 27-neighbour
+temporary working set scales with chunk height rather than the full raster height.
+Set `phase_chunk_rows=0` to force the unchunked reference path; chunked and
+unchunked evaluation are regression-tested for bit-identical outputs. This reduces
+peak memory without changing hashes, phases, normalization, or octave recurrence.
+
+A development microbenchmark of one float64 phase-cell octave measured:
+
+| Raster | Unchunked runtime | 128-row runtime | Unchunked incremental peak RSS | 128-row incremental peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| 512 x 512 | 0.65 s | 0.51 s | 69 MiB | 24 MiB |
+| 1024 x 1024 | 4.34 s | 1.94 s | 264 MiB | 62 MiB |
+| 2048 x 2048 | not run | 8.28 s | not run | 171 MiB |
+
+The 2048 x 2048 unchunked case was intentionally not executed because the point of
+this path is to avoid its large temporary working set. These figures isolate the
+phase-cell kernel on a shared development CPU; they are not end-to-end pipeline
+guarantees.
+
+The implementation intentionally keeps the correctness path dependency-light and
+inspectable. The kernel is suitable for
 Numba, CuPy, JAX, native SIMD, or compute-shader acceleration, but an accelerated
 backend must preserve deterministic hashing, partial-normalization behavior,
 spherical coordinate conventions, LOD decisions, boundary behavior, and numerical

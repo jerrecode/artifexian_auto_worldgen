@@ -125,6 +125,7 @@ def phase_cell_octave_xyz(
     seed: int,
     octave: int,
     normalization: float = 1.0,
+    chunk_rows: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Evaluate one seamless 3-D phase-cell octave on arbitrary planet positions.
 
@@ -154,6 +155,38 @@ def phase_cell_octave_xyz(
     norm_parameter = float(normalization)
     if not np.isfinite(norm_parameter) or not 0.0 <= norm_parameter <= 1.0:
         raise ValueError("normalization must be finite and in [0,1]")
+
+    rows = 0
+    if chunk_rows is not None:
+        if isinstance(chunk_rows, bool) or not isinstance(chunk_rows, (int, np.integer)):
+            raise TypeError("chunk_rows must be an integer, zero, or None")
+        rows = int(chunk_rows)
+        if rows < 0:
+            raise ValueError("chunk_rows must be non-negative")
+    if rows > 0 and normal.ndim >= 2 and normal.shape[0] > rows:
+        output_shape = normal.shape[:-1]
+        cosine = np.empty(output_shape, dtype=np.float64)
+        sine = np.empty(output_shape, dtype=np.float64)
+        coherence = np.empty(output_shape, dtype=np.float64)
+        for start in range(0, normal.shape[0], rows):
+            stop = min(start + rows, normal.shape[0])
+            part = slice(start, stop)
+            c_part, s_part, q_part = phase_cell_octave_xyz(
+                normal[part],
+                radius,
+                wavelength[part],
+                perp[part],
+                cell_scale=cell,
+                seed=seed,
+                octave=octave,
+                normalization=norm_parameter,
+                chunk_rows=None,
+            )
+            cosine[part] = c_part
+            sine[part] = s_part
+            coherence[part] = q_part
+        return cosine, sine, coherence
+
     pn = np.linalg.norm(perp, axis=-1, keepdims=True)
     perp = np.divide(perp, np.maximum(pn, 1.0e-15))
     xyz = normal * radius
@@ -218,6 +251,7 @@ def _phase_cell_octave(
     seed: int,
     octave: int,
     normalization: float,
+    chunk_rows: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return phase_cell_octave_xyz(
         _unit_positions(grid),
@@ -228,6 +262,7 @@ def _phase_cell_octave(
         seed=seed,
         octave=octave,
         normalization=normalization,
+        chunk_rows=chunk_rows,
     )
 
 def _finalize_displacement(
@@ -449,6 +484,7 @@ def apply_procedural_erosion(
             seed=int(seed),
             octave=octave,
             normalization=phase_normalization,
+            chunk_rows=int(getattr(cfg, "phase_chunk_rows", 128)),
         )
         coherence = coherence * resolved
         c = c * resolved
@@ -548,6 +584,7 @@ def apply_procedural_erosion(
         "gain": float(cfg.gain),
         "cell_scale": float(cfg.cell_scale),
         "phase_normalization": phase_normalization,
+        "phase_chunk_rows": int(getattr(cfg, "phase_chunk_rows", 128)),
         "gully_weight": gully_weight,
         "detail_power": detail_power,
         "slope_reference": slope_reference,
