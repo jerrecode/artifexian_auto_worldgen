@@ -177,19 +177,21 @@ def phase_cell_octave_xyz(
                 jx = 0.15 + 0.70 * _hash01(ix, iy, iz, seed, salt0 + 1)
                 jy = 0.15 + 0.70 * _hash01(ix, iy, iz, seed, salt0 + 2)
                 jz = 0.15 + 0.70 * _hash01(ix, iy, iz, seed, salt0 + 3)
-                anchor = np.stack(
-                    (
-                        ix.astype(np.float64) + jx,
-                        iy.astype(np.float64) + jy,
-                        iz.astype(np.float64) + jz,
-                    ),
-                    axis=-1,
-                )
-                delta = q - anchor
-                d2 = np.sum(delta * delta, axis=-1)
+                # Keep displacement components scalar-field shaped. Building an
+                # (..., 3) anchor and another (..., 3) delta for every one of the
+                # 27 neighbours roughly doubles the dominant temporary working set.
+                dx = q[..., 0] - (ix.astype(np.float64) + jx)
+                dy = q[..., 1] - (iy.astype(np.float64) + jy)
+                dz = q[..., 2] - (iz.astype(np.float64) + jz)
+                d2 = dx * dx + dy * dy + dz * dz
                 w = np.maximum(1.0 - d2 / support_r2, 0.0) ** 3
                 phase0 = 2.0 * np.pi * _hash01(ix, iy, iz, seed, salt0 + 4)
-                phase = phase_scale * np.sum(perp * delta, axis=-1) + phase0
+                projected = (
+                    perp[..., 0] * dx
+                    + perp[..., 1] * dy
+                    + perp[..., 2] * dz
+                )
+                phase = phase_scale * projected + phase0
                 csum += w * np.cos(phase)
                 ssum += w * np.sin(phase)
                 wsum += w
