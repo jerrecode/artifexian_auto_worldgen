@@ -584,7 +584,7 @@ def build_erosion_forcing(
         "model": "environment-conditioned procedural erosion forcing",
         "strength_semantics": "dimensionless process activity; not an erosion mass rate",
         "scale_semantics": "preferred procedural wavelength in kilometres",
-        "freeze_thaw_semantics": "species-specific monthly solid/liquid threshold crossings weighted by local condensed-volume supply, with reference-condensate fallback; modulated by moisture and continentality",
+        "freeze_thaw_semantics": "cyclic changes in the multicomponent condensate bridge monthly_thaw_fraction when available, with reference-condensate temperature-threshold fallback; modulated by moisture, continentality, and lithological frost susceptibility",
         "chemical_weathering_semantics": "substrate/moisture/temperature screening only; no general solvent-reaction kinetics",
         **fluid_meta,
         **freeze_meta,
