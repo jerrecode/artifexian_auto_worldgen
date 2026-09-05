@@ -99,34 +99,52 @@ def _liquid_species_mass_fields(
     out: dict[str, np.ndarray] = {}
     for raw_key, raw_mass in monthly_mass.items():
         key = str(raw_key)
-        mass = np.asarray(raw_mass, dtype=np.float64)
-        liquid = np.asarray(monthly_liquid.get(raw_key, np.zeros_like(mass)), dtype=np.float64)
-        solid = np.asarray(monthly_solid.get(raw_key, np.zeros_like(mass)), dtype=np.float64)
+        mass_source = np.asarray(raw_mass)
+        liquid_source = np.asarray(
+            monthly_liquid.get(raw_key, np.zeros_like(mass_source))
+        )
+        solid_source = np.asarray(
+            monthly_solid.get(raw_key, np.zeros_like(mass_source))
+        )
         expected = (12, *shape)
-        if mass.shape != expected or liquid.shape != expected or solid.shape != expected:
+        if (
+            mass_source.shape != expected
+            or liquid_source.shape != expected
+            or solid_source.shape != expected
+        ):
             raise ValueError(
                 f"condensate phase fields for {key!r} must have shape {expected}"
             )
-        if (
-            not np.isfinite(mass).all()
-            or not np.isfinite(liquid).all()
-            or not np.isfinite(solid).all()
-            or np.any(mass < 0.0)
-            or np.any(liquid < 0.0)
-            or np.any(solid < 0.0)
-        ):
-            raise ValueError(
-                f"condensate phase fields for {key!r} must be finite and non-negative"
-            )
 
-        condensed_depth = liquid + solid
-        liquid_fraction = np.divide(
-            liquid,
-            condensed_depth,
-            out=np.zeros_like(liquid),
-            where=condensed_depth > 1.0e-12,
-        )
-        annual_liquid_mass_kg_m2 = np.sum(mass * liquid_fraction, axis=0)
+        # Accumulate month by month instead of promoting several complete
+        # (12,H,W) tensors to float64. Peak new working memory therefore scales
+        # with one raster slice rather than the full seasonal cube.
+        annual_liquid_mass_kg_m2 = np.zeros(shape, dtype=np.float64)
+        for month in range(12):
+            mass = np.asarray(mass_source[month], dtype=np.float64)
+            liquid = np.asarray(liquid_source[month], dtype=np.float64)
+            solid = np.asarray(solid_source[month], dtype=np.float64)
+            if (
+                not np.isfinite(mass).all()
+                or not np.isfinite(liquid).all()
+                or not np.isfinite(solid).all()
+                or np.any(mass < 0.0)
+                or np.any(liquid < 0.0)
+                or np.any(solid < 0.0)
+            ):
+                raise ValueError(
+                    f"condensate phase fields for {key!r} must be finite and non-negative"
+                )
+            phase_depth = liquid + solid
+            np.divide(
+                liquid,
+                phase_depth,
+                out=phase_depth,
+                where=phase_depth > 1.0e-12,
+            )
+            phase_depth[phase_depth <= 1.0e-12] = 0.0
+            annual_liquid_mass_kg_m2 += mass * phase_depth
+
         cell_mass = annual_liquid_mass_kg_m2 * area_m2
         if np.any(cell_mass > 0.0):
             out[key] = cell_mass
