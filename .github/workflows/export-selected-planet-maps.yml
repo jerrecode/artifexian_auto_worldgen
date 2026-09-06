@@ -1,0 +1,101 @@
+name: Export selected validated planet maps
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/export-selected-planet-maps.yml"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  export:
+    strategy:
+      fail-fast: false
+      matrix:
+        planet:
+          - slug: temperate-earthlike
+            seed: "643544327"
+            artifact: planet-archive-temperate-earthlike-643544327
+          - slug: super-earth
+            seed: "856796631"
+            artifact: planet-archive-super-earth-856796631
+          - slug: titan-like
+            seed: "259503490"
+            artifact: planet-archive-titan-like-259503490
+          - slug: mars-like
+            seed: "628617507"
+            artifact: planet-archive-mars-like-628617507
+          - slug: venus-like
+            seed: "1394962079"
+            artifact: planet-archive-venus-like-1394962079
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download validated planet archive
+        uses: actions/download-artifact@v5
+        with:
+          name: ${{ matrix.planet.artifact }}
+          path: source-artifact
+          run-id: 34053063420
+          github-token: ${{ github.token }}
+
+      - name: Extract selected original PNG maps
+        shell: bash
+        env:
+          SLUG: ${{ matrix.planet.slug }}
+          SEED: ${{ matrix.planet.seed }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(source-artifact/*.tar.gz)
+          if [ "${#archives[@]}" -ne 1 ]; then
+            echo "Expected exactly one tar.gz, got ${#archives[@]}" >&2
+            find source-artifact -maxdepth 2 -type f -printf '%p\n' >&2
+            exit 1
+          fi
+          archive="${archives[0]}"
+          root="${SLUG}-${SEED}"
+          mkdir -p "selected/${root}"
+
+          candidates=(
+            "maps/15_true_color.png"
+            "maps/02_elevation.png"
+            "maps/04_temperature_annual.png"
+            "maps/05_precipitation_annual.png"
+            "maps/08c_erosion.png"
+            "maps/09_geology.png"
+            "maps/55b_surface_liquid_optical_color.png"
+            "maps/56_ground_liquid_humidity.png"
+            "maps/57_atmospheric_haze_optical_depth.png"
+            "maps/58_solid_condensate_persistence.png"
+          )
+
+          listing="$(tar -tzf "$archive")"
+          extracted=0
+          for rel in "${candidates[@]}"; do
+            member="${root}/${rel}"
+            if grep -Fxq "$member" <<<"$listing"; then
+              tar -xzf "$archive" -C "selected/${root}" --strip-components=1 "$member"
+              extracted=$((extracted + 1))
+            fi
+          done
+
+          if [ ! -f "selected/${root}/maps/15_true_color.png" ]; then
+            echo "Required cloudless true-color PNG was not found." >&2
+            printf '%s\n' "$listing" | grep '/maps/' | tail -n 100 >&2
+            exit 1
+          fi
+
+          printf 'planet=%s\nseed=%s\nsource_run=34053063420\nsource_artifact=%s\nselected_png_count=%d\n'             "$SLUG" "$SEED" "${{ matrix.planet.artifact }}" "$extracted"             > "selected/${root}/SOURCE.txt"
+          find "selected/${root}" -type f -printf '%P\t%s bytes\n' | sort             > "selected/${root}/FILE_LIST.txt"
+
+      - name: Upload selected original maps
+        uses: actions/upload-artifact@v4
+        with:
+          name: selected-maps-${{ matrix.planet.slug }}-${{ matrix.planet.seed }}
+          path: selected/${{ matrix.planet.slug }}-${{ matrix.planet.seed }}/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
