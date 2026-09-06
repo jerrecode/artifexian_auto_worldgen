@@ -294,25 +294,100 @@ jobs:
                       row["longitude_seam_to_neighbor_ratio"] = float(np.nanmean(seam) / max(scale, 1e-12))
                   array_report["arrays"][key] = row
 
+          optics_path = root / "planetary_optics_audit.json"
+          optics_audit = json.loads(optics_path.read_text()) if optics_path.exists() else {}
+          wet_cell_count = int(optics_audit.get("surface_liquid", {}).get("wet_cell_count", -1))
+
           image_rows = []
           thumbs = []
           for path in sorted(root.rglob("*.png")):
               rel = path.relative_to(root).as_posix()
               with Image.open(path) as im:
                   im.load()
-                  rgb = im.convert("RGB")
-                  arr = np.asarray(rgb)
-                  stat = ImageStat.Stat(rgb)
-                  std = [float(x) for x in stat.stddev]
-                  extrema = [[int(lo), int(hi)] for lo, hi in rgb.getextrema()]
-                  unique_sample = int(np.unique(arr[::max(1,arr.shape[0]//256), ::max(1,arr.shape[1]//256)].reshape(-1,3), axis=0).shape[0])
-                  blank = max(std) < 0.35 or unique_sample < 4
+                  native = np.asarray(im)
+                  expected_empty = (
+                      rel.endswith("55b_surface_liquid_optical_color.png")
+                      and wet_cell_count == 0
+                  )
+
+                  # Preserve native precision for high-bit-depth scientific rasters.
+                  # Pillow's I;16 -> RGB conversion clips almost the entire 16-bit
+                  # distribution to 255 and can make a healthy elevation map appear
+                  # one-color in an 8-bit sample.
+                  high_precision_scalar = (
+                      native.ndim == 2
+                      and np.issubdtype(native.dtype, np.number)
+                      and (native.dtype.itemsize > 1 or im.mode in {"I;16", "I", "F"})
+                  )
+                  native_stats = None
+                  if high_precision_scalar:
+                      sy = max(1, native.shape[0] // 256)
+                      sx = max(1, native.shape[1] // 256)
+                      sample = np.asarray(native[::sy, ::sx])
+                      finite = np.isfinite(sample)
+                      vals = sample[finite].astype(np.float64, copy=False)
+                      unique_native = int(np.unique(vals).size) if vals.size else 0
+                      native_min = float(np.min(vals)) if vals.size else None
+                      native_max = float(np.max(vals)) if vals.size else None
+                      native_std = float(np.std(vals)) if vals.size else None
+                      native_range = (
+                          float(native_max - native_min)
+                          if native_min is not None and native_max is not None
+                          else None
+                      )
+                      blank = (
+                          not vals.size
+                          or unique_native < 4
+                          or (native_range is not None and native_range <= 2.0)
+                      )
+                      native_stats = {
+                          "sample_unique_native": unique_native,
+                          "native_min": native_min,
+                          "native_max": native_max,
+                          "native_range": native_range,
+                          "native_std": native_std,
+                          "native_dtype": str(native.dtype),
+                      }
+
+                      # Build a diagnostically useful 8-bit contact-sheet preview by
+                      # normalizing the native scalar range instead of clipping it.
+                      if vals.size and native_max > native_min:
+                          scaled = np.clip(
+                              (native.astype(np.float64) - native_min)
+                              / (native_max - native_min) * 255.0,
+                              0.0,
+                              255.0,
+                          ).astype(np.uint8)
+                      else:
+                          scaled = np.zeros(native.shape, dtype=np.uint8)
+                      rgb = Image.fromarray(scaled, mode="L").convert("RGB")
+                  else:
+                      rgb = im.convert("RGB")
+                      arr = np.asarray(rgb)
+                      stat = ImageStat.Stat(rgb)
+                      std = [float(x) for x in stat.stddev]
+                      extrema = [[int(lo), int(hi)] for lo, hi in rgb.getextrema()]
+                      sy = max(1, arr.shape[0] // 256)
+                      sx = max(1, arr.shape[1] // 256)
+                      unique_sample = int(
+                          np.unique(arr[::sy, ::sx].reshape(-1, 3), axis=0).shape[0]
+                      )
+                      blank = (max(std) < 0.35 or unique_sample < 4) and not expected_empty
+                      native_stats = {
+                          "stddev_rgb": std,
+                          "extrema_rgb": extrema,
+                          "sample_unique_rgb": unique_sample,
+                      }
+
                   if blank:
                       failures.append(f"{rel}: near-blank/degenerate PNG")
                   image_rows.append({
-                      "path": rel, "size": list(rgb.size), "mode": im.mode,
-                      "stddev_rgb": std, "extrema_rgb": extrema,
-                      "sample_unique_rgb": unique_sample, "near_blank": blank,
+                      "path": rel,
+                      "size": list(rgb.size),
+                      "mode": im.mode,
+                      "expected_empty": expected_empty,
+                      "near_blank": blank,
+                      **native_stats,
                   })
                   thumb = ImageOps.contain(rgb, (360, 180))
                   canvas = Image.new("RGB", (380, 215), "white")
@@ -410,6 +485,13 @@ jobs:
           set -euxo pipefail
           mkdir -p archives
           cp "$RESOLVED_CONFIG" "$ROOT/resolved-config.yaml"
+
+          # Checkpoints are resumability caches, not scientific deliverables. They can
+          # dominate an otherwise compressed planet by many gigabytes, so successful
+          # archives retain final fields, renders, audits, logs, timings and config
+          # while dropping the reproducible intermediate cache.
+          rm -rf "$ROOT/checkpoints"
+
           find "$ROOT" -type f -printf '%P\t%s\n' | sort > "$ROOT/analysis/file_inventory.tsv"
           du -sh "$ROOT" | tee "$ROOT/analysis/uncompressed_size.txt"
           tar -C "$(dirname "$ROOT")" -czf "$ARCHIVE" "$(basename "$ROOT")"
