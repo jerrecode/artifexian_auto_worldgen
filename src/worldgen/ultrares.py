@@ -186,6 +186,36 @@ ULTRARES_AUTHORITY_FIELDS = (
     "river_width_proxy",
 )
 
+ULTRARES_OPTIONAL_AUTHORITY_FIELDS = (
+    "temperature_c_monthly",
+    "precipitation_mm_monthly",
+    "wind_u_monthly",
+    "wind_v_monthly",
+    "humidity_proxy_monthly",
+    "koppen",
+    "continentality_index_c",
+    "soil_moisture_index",
+    "snow_persistence",
+    "vegetation_fraction",
+    "surface_albedo",
+    "cloud_fraction_annual",
+    "true_color_rgb",
+    "fog",
+    "thunderstorm_level",
+    "lightning_flashes_km2_year",
+    "tornado_potential",
+    "blizzard",
+    "sandstorm",
+    "duststorm",
+    "hurricane_genesis",
+    "aurora",
+    "sea_ice_max",
+    "sea_ice_min",
+    "coral_reef",
+    "rock_code",
+    "bedrock_code",
+)
+
 
 def compact_world_authority(
     world_root: str | Path,
@@ -205,7 +235,16 @@ def compact_world_authority(
                 "world_arrays.npz is missing ultra-resolution authority fields: "
                 + ", ".join(missing)
             )
-        arrays = {name: np.asarray(z[name]) for name in keep_fields}
+        selected = list(keep_fields)
+        selected.extend(
+            name for name in ULTRARES_OPTIONAL_AUTHORITY_FIELDS
+            if name in z.files and name not in selected
+        )
+        selected.extend(
+            name for name in z.files
+            if name.startswith("resource_") and name not in selected
+        )
+        arrays = {name: np.asarray(z[name]) for name in selected}
 
     tmp = root / ".world_arrays.ultrares.npz"
     np.savez(tmp, **arrays)
@@ -231,7 +270,7 @@ def compact_world_authority(
         shutil.rmtree(maps_root, ignore_errors=True)
 
     report = {
-        "fields": list(keep_fields),
+        "fields": list(arrays),
         "source_resolution": [int(len(arrays["lon"])), int(len(arrays["lat"]))],
         "npz_bytes": int(source.stat().st_size),
         "rendered_source_maps": sorted(
@@ -1066,6 +1105,7 @@ def run_ultra_resolution(
 
 __all__ = [
     "ULTRARES_AUTHORITY_FIELDS",
+    "ULTRARES_OPTIONAL_AUTHORITY_FIELDS",
     "UltraResolutionPlan",
     "UltraResolutionTilePyramid",
     "UltraResolutionReport",
