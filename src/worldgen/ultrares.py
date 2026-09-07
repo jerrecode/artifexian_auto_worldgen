@@ -45,6 +45,33 @@ from .planet_tiles import (
 
 
 @dataclass(slots=True, frozen=True)
+class UltraResolutionTilePyramid(PlanetTilePyramid):
+    """PlanetTilePyramid with a bounded in-process cache for compact authority arrays.
+
+    Ultra-resolution terrain repeatedly samples a deliberately compact source NPZ.
+    Keeping only those selected arrays resident avoids decompressing/re-reading the
+    same global field for every one of the 96 deepest tiles.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        self._ultra_source_cache: dict[str, np.ndarray] = {}
+        super().__init__(*args, **kwargs)
+
+    def _load_source_array(self, name: str) -> np.ndarray:
+        if self.source_kind != "base_npz":
+            return super()._load_source_array(name)
+        cached = self._ultra_source_cache.get(name)
+        if cached is not None:
+            return cached
+        with np.load(self.base_source_path, allow_pickle=False) as z:
+            if name not in z:
+                raise KeyError(f"source field {name!r} is not present in world_arrays.npz")
+            values = np.asarray(z[name])
+        self._ultra_source_cache[name] = values
+        return values
+
+
+@dataclass(slots=True, frozen=True)
 class UltraResolutionSpec:
     """Numerical contract for one ultra-resolution terrain build."""
 
@@ -898,7 +925,7 @@ def run_ultra_resolution(
     """Execute the complete deepest-first terrain refinement/reconstruction chain."""
     cfg = (spec or UltraResolutionSpec()).validate()
     root = Path(world_root).expanduser().resolve()
-    pyramid = PlanetTilePyramid(
+    pyramid = UltraResolutionTilePyramid(
         root,
         spec=TilePyramidSpec(
             tile_size=int(cfg.tile_size),
@@ -951,6 +978,7 @@ def run_ultra_resolution(
 
 __all__ = [
     "UltraResolutionPlan",
+    "UltraResolutionTilePyramid",
     "UltraResolutionReport",
     "UltraResolutionSpec",
     "audit_ultra_resolution",
