@@ -1,0 +1,84 @@
+name: Export validated 16-bit heightmaps
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/export-validated-heightmaps.yml"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  export:
+    strategy:
+      fail-fast: false
+      matrix:
+        planet:
+          - slug: temperate-earthlike
+            seed: "643544327"
+            artifact: planet-archive-temperate-earthlike-643544327
+          - slug: super-earth
+            seed: "856796631"
+            artifact: planet-archive-super-earth-856796631
+          - slug: titan-like
+            seed: "259503490"
+            artifact: planet-archive-titan-like-259503490
+          - slug: mars-like
+            seed: "628617507"
+            artifact: planet-archive-mars-like-628617507
+          - slug: venus-like
+            seed: "1394962079"
+            artifact: planet-archive-venus-like-1394962079
+
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download validated planet archive
+        uses: actions/download-artifact@v5
+        with:
+          name: ${{ matrix.planet.artifact }}
+          path: source-artifact
+          run-id: 34053063420
+          github-token: ${{ github.token }}
+
+      - name: Extract native 16-bit heightmap
+        shell: bash
+        env:
+          SLUG: ${{ matrix.planet.slug }}
+          SEED: ${{ matrix.planet.seed }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(source-artifact/*.tar.gz)
+          if [ "${#archives[@]}" -ne 1 ]; then
+            echo "Expected exactly one tar.gz, got ${#archives[@]}" >&2
+            exit 1
+          fi
+
+          archive="${archives[0]}"
+          root="${SLUG}-${SEED}"
+          out="heightmaps/${root}"
+          mkdir -p "$out"
+
+          png_member="${root}/maps/02b_height_grayscale_16bit.png"
+          json_member="${root}/maps/02b_height_grayscale_16bit.json"
+
+          tar -xzf "$archive" -C "$out" --strip-components=2 "$png_member"
+          tar -xzf "$archive" -C "$out" --strip-components=2 "$json_member"
+
+          test -s "$out/02b_height_grayscale_16bit.png"
+          test -s "$out/02b_height_grayscale_16bit.json"
+
+          printf 'planet=%s\nseed=%s\nsource_run=34053063420\nsource_artifact=%s\n'             "$SLUG" "$SEED" "${{ matrix.planet.artifact }}" > "$out/SOURCE.txt"
+          file "$out/02b_height_grayscale_16bit.png" > "$out/PNG_INFO.txt"
+          sha256sum "$out/02b_height_grayscale_16bit.png" > "$out/SHA256.txt"
+
+      - name: Upload native heightmap
+        uses: actions/upload-artifact@v4
+        with:
+          name: heightmap-16bit-${{ matrix.planet.slug }}-${{ matrix.planet.seed }}
+          path: heightmaps/${{ matrix.planet.slug }}-${{ matrix.planet.seed }}/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
