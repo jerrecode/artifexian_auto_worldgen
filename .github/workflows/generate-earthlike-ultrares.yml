@@ -1,4 +1,5 @@
 name: Earth-like ultra-resolution multiscale production
+# Retrigger after scale-band planner correction.
 
 on:
   push:
