@@ -160,12 +160,15 @@ class WorldPipeline(_LandscapeWorldPipeline):
                 "solid_condensate_input_mm_year": np.asarray(forcing.annual_solid_input_mm, np.float32),
                 "total_condensate_input_mm_year": np.asarray(forcing.annual_total_precipitation_depth_mm, np.float32),
             })
-            hydro = world["hydrology"]
-            arrays.update({
-                "soil_liquid_storage_mm": np.asarray(hydro.soil_liquid_storage_mm, np.float32),
-                "subsurface_liquid_storage_mm": np.asarray(hydro.subsurface_liquid_storage_mm, np.float32),
-                "solid_condensate_storage_mm": np.asarray(hydro.solid_condensate_storage_mm, np.float32),
-            })
+
+        # These are public chemically generic aliases of the hydrology stores and
+        # remain meaningful even when no explicit condensate forcing object exists.
+        hydro = world["hydrology"]
+        arrays.update({
+            "soil_liquid_storage_mm": np.asarray(hydro.soil_liquid_storage_mm, np.float32),
+            "subsurface_liquid_storage_mm": np.asarray(hydro.subsurface_liquid_storage_mm, np.float32),
+            "solid_condensate_storage_mm": np.asarray(hydro.solid_condensate_storage_mm, np.float32),
+        })
         pa = world.get("planetary_appearance")
         if pa is not None:
             arrays.update({
