@@ -262,6 +262,7 @@ class LocalGeomorphologySolver:
         procedural = np.zeros_like(base)
         procedural_coherence = np.zeros_like(base)
         executed_octaves = 0
+        executed_wavelengths_m: list[float] = []
         if cfg.procedural_detail_enabled and np.any(land):
             sample_m = approximate_meters_per_sample(
                 self.pyramid.planet_radius_m,
@@ -341,6 +342,7 @@ class LocalGeomorphologySolver:
                     * cosine
                 )
                 procedural_coherence = np.maximum(procedural_coherence, coherence)
+                executed_wavelengths_m.append(float(wavelength_m))
                 turn = (
                     float(cfg.procedural_steering_strength)
                     * np.sign(sine)
@@ -402,7 +404,31 @@ class LocalGeomorphologySolver:
             "major_river_constraint_cells": int(np.count_nonzero(major)),
             "procedural_detail_enabled": bool(cfg.procedural_detail_enabled),
             "procedural_octaves_executed": int(executed_octaves),
+            "procedural_wavelengths_m": executed_wavelengths_m,
+            "procedural_coarsest_wavelength_m": (
+                float(max(executed_wavelengths_m)) if executed_wavelengths_m else None
+            ),
+            "procedural_finest_wavelength_m": (
+                float(min(executed_wavelengths_m)) if executed_wavelengths_m else None
+            ),
+            "procedural_finest_samples_per_wavelength": (
+                float(min(executed_wavelengths_m) / sample_m)
+                if executed_wavelengths_m else None
+            ),
+            "tile_meters_per_sample_approx": (
+                float(sample_m) if cfg.procedural_detail_enabled and np.any(land) else None
+            ),
+            "physical_erosion_max_m": float(np.max(erosion)) if erosion.size else 0.0,
+            "physical_erosion_rms_m": float(np.sqrt(np.mean(np.square(erosion)))) if erosion.size else 0.0,
+            "physical_deposition_rms_m": float(np.sqrt(np.mean(np.square(deposition)))) if deposition.size else 0.0,
             "procedural_max_absolute_detail_m": float(np.max(np.abs(procedural))),
+            "procedural_detail_rms_m": float(np.sqrt(np.mean(np.square(procedural)))) if procedural.size else 0.0,
+            "combined_geomorphic_rms_m": float(
+                np.sqrt(np.mean(np.square(anchored - base)))
+            ) if anchored.size else 0.0,
+            "legacy_and_procedural_simultaneous": bool(
+                np.any(erosion > 1.0e-9) and np.any(np.abs(procedural) > 1.0e-9)
+            ),
             "procedural_area_weighted_mean_m": (
                 float(np.sum(procedural * area_m2) / np.sum(area_m2))
                 if float(np.sum(area_m2)) > 0.0
