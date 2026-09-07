@@ -24,7 +24,6 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from scipy import ndimage
 
-from .climate import classify_koppen
 from .heightmap import write_heightmap_png16
 from .local_downscaling import LocalClimateSpec
 from .local_orography import (
@@ -281,6 +280,95 @@ def _sample_optional(
 
 def _save_product(root: Path, category: str, field: str, key: TileKey, values: np.ndarray) -> None:
     _atomic_save_npy(_field_path(root, category, field, key), values)
+
+
+def _classify_koppen_geographic(
+    temp: np.ndarray,
+    precip: np.ndarray,
+    latitude_deg: np.ndarray,
+) -> np.ndarray:
+    """Köppen classifier using true geographic hemisphere on arbitrary tile geometry."""
+    t = np.asarray(temp, dtype=np.float64)
+    p = np.asarray(precip, dtype=np.float64)
+    lat = np.asarray(latitude_deg, dtype=np.float64)
+    if t.shape[0] != 12 or p.shape != t.shape or lat.shape != t.shape[1:]:
+        raise ValueError("Köppen tile classification requires (12,H,W) temp/precip and (H,W) latitude")
+    h, w = lat.shape
+    out = np.full((h, w), "", dtype="<U3")
+    t_ann = t.mean(0)
+    p_ann = p.sum(0)
+    t_min = t.min(0)
+    t_max = t.max(0)
+    months_gt10 = (t > 10.0).sum(0)
+    north = lat >= 0.0
+    summer_n = np.array([3, 4, 5, 6, 7, 8])
+    winter_n = np.array([9, 10, 11, 0, 1, 2])
+    p_sum_n = p[summer_n].sum(0)
+    p_win_n = p[winter_n].sum(0)
+    p_summer = np.where(north, p_sum_n, p_win_n)
+    p_winter = np.where(north, p_win_n, p_sum_n)
+    frac_s = p_summer / np.maximum(p_ann, 1.0e-6)
+    arid_threshold = np.maximum(
+        20.0 * t_ann
+        + np.where(frac_s >= 0.70, 280.0, np.where(frac_s >= 0.30, 140.0, 0.0)),
+        0.0,
+    )
+    desert = p_ann < 0.5 * arid_threshold
+    steppe = (~desert) & (p_ann < arid_threshold)
+    hot = t_ann >= 18.0
+    out[desert & hot] = "BWh"
+    out[desert & ~hot] = "BWk"
+    out[steppe & hot] = "BSh"
+    out[steppe & ~hot] = "BSk"
+    bmask = desert | steppe
+
+    ef = (~bmask) & (t_max < 0.0)
+    et = (~bmask) & (t_max >= 0.0) & (t_max < 10.0)
+    out[ef] = "EF"
+    out[et] = "ET"
+
+    tropical = (~bmask) & (t_min >= 18.0)
+    pmin = p.min(0)
+    af = tropical & (pmin >= 60.0)
+    am = tropical & ~af & (pmin >= 100.0 - p_ann / 25.0)
+    out[af] = "Af"
+    out[am] = "Am"
+
+    pmin_s_n = p[summer_n].min(0)
+    pmin_w_n = p[winter_n].min(0)
+    pmin_s = np.where(north, pmin_s_n, pmin_w_n)
+    pmin_w = np.where(north, pmin_w_n, pmin_s_n)
+    other_tropical = tropical & ~(af | am)
+    out[other_tropical & (pmin_s < pmin_w)] = "As"
+    out[other_tropical & ~(pmin_s < pmin_w)] = "Aw"
+
+    base = (~bmask) & ~tropical & ~(ef | et)
+    c_mask = base & (t_min > 0.0) & (t_min < 18.0) & (t_max > 10.0)
+    d_mask = base & (t_min <= 0.0) & (t_max > 10.0)
+    pmax_s_n = p[summer_n].max(0)
+    pmax_w_n = p[winter_n].max(0)
+    pmax_s = np.where(north, pmax_s_n, pmax_w_n)
+    pmax_w = np.where(north, pmax_w_n, pmax_s_n)
+    dry_s = (pmin_s < 40.0) & (pmin_s < pmax_w / 3.0)
+    dry_w = pmin_w < pmax_s / 10.0
+    second = np.where(dry_s, "s", np.where(dry_w, "w", "f"))
+    third_c = np.where(
+        (t_max >= 22.0) & (months_gt10 >= 4),
+        "a",
+        np.where(months_gt10 >= 4, "b", "c"),
+    )
+    third_d = np.where(
+        (t_max >= 22.0) & (months_gt10 >= 4),
+        "a",
+        np.where(months_gt10 >= 4, "b", np.where(t_min <= -38.0, "d", "c")),
+    )
+    for sec in ("s", "w", "f"):
+        for third in ("a", "b", "c"):
+            out[c_mask & (second == sec) & (third_c == third)] = "C" + sec + third
+        for third in ("a", "b", "c", "d"):
+            out[d_mask & (second == sec) & (third_d == third)] = "D" + sec + third
+    out[out == ""] = "UNK"
+    return out
 
 
 def _koppen_codes(classes: np.ndarray) -> np.ndarray:
@@ -542,7 +630,13 @@ def generate_climate_surface_products(
             & (annual_temp > 22.0)
             & (annual_p >= 1200.0)
         ] = 5
-        koppen = _koppen_codes(classify_koppen(local_temp_monthly, local_p64))
+        koppen = _koppen_codes(
+            _classify_koppen_geographic(
+                local_temp_monthly,
+                local_p64,
+                np.asarray(geom.latitude_deg, dtype=np.float64),
+            )
+        )
 
         parent_cloud = np.asarray(
             _sample_optional(
@@ -1168,7 +1262,7 @@ def _render_dominant_composite(
     for category in present:
         base = np.array(palette.get(category, (180, 180, 180)), dtype=np.float64)
         mask = np.asarray(code) == category
-        s = strength[mask, None]
+        s = strength[mask][:, None]
         color = 18.0 + s * (base[None, :] - 18.0)
         rgb[mask] = np.clip(np.rint(color), 0, 255).astype(np.uint8)
     image = Image.fromarray(rgb, mode="RGB")
