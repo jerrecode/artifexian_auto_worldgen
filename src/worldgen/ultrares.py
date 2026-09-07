@@ -400,10 +400,11 @@ def derive_scale_aware_geomorphology_spec(
             lac = requested_lac
 
     scale_ratio = max(coarsest_wavelength_m / 1000.0 / max(global_proc_wave_km, 1.0e-9), 1.0e-9)
-    procedural_amplitude = (
+    procedural_amplitude = min(
+        global_proc_amp_m,
         global_proc_amp_m
         * scale_ratio ** float(cfg.procedural_hurst_exponent)
-        * float(cfg.procedural_amplitude_fraction)
+        * float(cfg.procedural_amplitude_fraction),
     )
 
     # The local stream-power pass is a sub-grid correction, not another complete
