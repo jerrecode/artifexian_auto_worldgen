@@ -1,0 +1,243 @@
+name: Earth-like ultra-resolution multiscale production
+
+on:
+  push:
+    branches:
+      - earthlike-ultrares-multiscale
+    paths:
+      - '.github/workflows/generate-earthlike-ultrares.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: earthlike-ultrares-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      MPLBACKEND: Agg
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_MAX_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install validation stack
+        run: |
+          set -euxo pipefail
+          python -m pip install --disable-pip-version-check -e '.[performance,jit,storage,thermodynamics,render,dev]'
+          python -m pip check
+      - name: Run multiscale and erosion regression gates
+        run: |
+          set -euxo pipefail
+          python -m pytest -q             tests/test_ultrares.py             tests/test_local_geomorphology.py             tests/test_local_hydrology.py             tests/test_refinement.py             tests/test_procedural_erosion.py             tests/test_erosion_forcing.py             tests/test_pipeline_procedural_erosion.py             tests/test_diagnostics_surface_liquids.py
+
+  produce:
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      MPLBACKEND: Agg
+      WORLDGEN_DISTANCE_CACHE_MB: '128'
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_MAX_THREADS: '1'
+      NUMBA_CACHE_DIR: ${{ github.workspace }}/.numba-cache
+      SEED: '2026090707'
+      ROOT: output/earthlike-ultrares-2026090707
+      CONFIG: validation-configs/earthlike-ultrares-2026090707.yaml
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install production stack
+        run: |
+          set -euxo pipefail
+          python -m pip install --disable-pip-version-check -e '.[performance,jit,storage,thermodynamics,render]'
+          python -m pip install --disable-pip-version-check pytest
+          python -m pip check
+
+      - name: Build full-detail Earth source profile
+        run: |
+          set -euxo pipefail
+          mkdir -p validation-configs
+          python scripts/build_ultrares_earth_config.py             --base config/ultra_detail.yaml             --out "$CONFIG"             --seed "$SEED"
+
+      - name: Validate source runtime plan
+        run: |
+          set -euxo pipefail
+          worldgen --runtime-info --dry-run             --config "$CONFIG" --seed "$SEED" --resolution 2048x1024             --workers 4 --worker-cap 4 --threads-per-worker 1             --memory-per-worker-mb 1350
+
+      - name: Generate globally coupled full-detail Earth source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf "$ROOT"
+          mkdir -p "$ROOT"
+          /usr/bin/time -v worldgen generate             --config "$CONFIG"             --seed "$SEED"             --resolution 2048x1024             --out "$ROOT"             --workers 4 --worker-cap 4 --threads-per-worker 1             --memory-per-worker-mb 1350             --checkpoint-dir "$ROOT/checkpoints" --checkpoint-max-gb 18             --compress-npz             --diagnostics --manifest --hash-outputs             --max-png-megapixels 120             --timings-json "$ROOT/timings_cli.json"             --progress-detail -vv             --log-file "$ROOT/generation.log" --log-json             2>&1 | tee "$ROOT/generation-console.log"
+
+      - name: Audit global source before compaction
+        run: |
+          set -euxo pipefail
+          python scripts/audit_generated_world.py "$ROOT"             --output "$ROOT/source_scientific_audit.json" | tee "$ROOT/source_scientific_audit.log"
+          python scripts/audit_planetary_optics.py "$ROOT"             --output "$ROOT/source_optics_audit.json" --enforce | tee "$ROOT/source_optics_audit.log"
+
+      - name: Generate 4x base and 2x deeper terrain subsections
+        shell: bash
+        run: |
+          set -euxo pipefail
+          /usr/bin/time -v python scripts/run_ultrares_earth.py "$ROOT"             --workers 2             --tile-size 1024             --base-multiplier 4             --subsection-multiplier 2             --min-samples-per-wavelength 4             2>&1 | tee "$ROOT/ultrares-console.log"
+
+      - name: Enforce final ultra-resolution contract
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          import numpy as np
+          from PIL import Image
+
+          root = Path(os.environ["ROOT"])
+          audit = json.loads((root / "ultrares" / "terrain_detail_audit.json").read_text())
+          plan = json.loads((root / "ultrares" / "plan.json").read_text())["plan"]
+          assert audit["all_checks_passed"], audit["checks"]
+          assert plan["fullview_width"] == 8192 and plan["fullview_height"] == 4096, plan
+          assert plan["actual_base_multiplier"] >= 4.0 - 1e-9, plan
+          assert plan["actual_subsection_multiplier"] >= 2.0 - 1e-9, plan
+          assert plan["finest_tile_count"] == 96, plan
+
+          height = root / "ultrares" / "fullview" / "height_grayscale_16bit.png"
+          with Image.open(height) as im:
+              assert im.size == (8192, 4096), im.size
+              assert im.mode in {"I;16", "I"}, im.mode
+          elev = np.load(root / "ultrares" / "fullview" / "elevation_m.npy", mmap_mode="r")
+          assert elev.shape == (4096, 8192)
+          assert np.isfinite(elev).all()
+          print(json.dumps({
+              "plan": plan,
+              "aggregate": audit["aggregate"],
+              "checks": audit["checks"],
+          }, indent=2, sort_keys=True))
+          PY
+
+      - name: Prune reproducible intermediate caches after successful audit
+        shell: bash
+        run: |
+          set -euxo pipefail
+          DERIVED="$ROOT/tiles/cubesphere_v1/derived"
+          rm -rf             "$DERIVED/local_hydrology_v1"             "$DERIVED/river_constraints_v1"
+          rm -rf "$ROOT/tiles/cubesphere_v1/fields"
+          for field in deposition_m hillslope_adjustment_m procedural_coherence major_river_constraint; do
+            rm -rf "$DERIVED/local_geomorphology_v1/$field"
+          done
+          rm -rf             "$ROOT/ultrares/reconstructed/deposition_m"             "$ROOT/ultrares/reconstructed/hillslope_adjustment_m"
+          find "$ROOT" -type f -printf '%P\t%s\n' | sort > "$ROOT/ultrares/file_inventory.tsv"
+          du -sh "$ROOT" "$ROOT/ultrares" "$DERIVED/local_geomorphology_v1"
+
+      - name: Upload compact fullview and audits
+        uses: actions/upload-artifact@v4
+        with:
+          name: earthlike-ultrares-fullview-2026090707
+          compression-level: 6
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            ${{ env.ROOT }}/ultrares/fullview/
+            ${{ env.ROOT }}/ultrares/source_maps/
+            ${{ env.ROOT }}/ultrares/plan.json
+            ${{ env.ROOT }}/ultrares/terrain_detail_audit.json
+            ${{ env.ROOT }}/ultrares/reconstruction.json
+            ${{ env.ROOT }}/ultrares/authority_compaction.json
+            ${{ env.ROOT }}/ultrares/file_inventory.tsv
+            ${{ env.ROOT }}/source_scientific_audit.json
+            ${{ env.ROOT }}/source_optics_audit.json
+            ${{ env.ROOT }}/diagnostics.json
+            ${{ env.ROOT }}/world.json
+            ${{ env.CONFIG }}
+
+      - name: Upload deepest terrain face px
+        uses: actions/upload-artifact@v4
+        with:
+          name: earthlike-ultrares-z2-px
+          compression-level: 6
+          retention-days: 14
+          path: |
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/elevation_m/z02/px/
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/erosion_m/z02/px/
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/procedural_detail_m/z02/px/
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/metadata/z02/px/
+            ${{ env.ROOT }}/ultrares/reconstructed/elevation_m/z01/px/
+      - name: Upload deepest terrain face nx
+        uses: actions/upload-artifact@v4
+        with:
+          name: earthlike-ultrares-z2-nx
+          compression-level: 6
+          retention-days: 14
+          path: |
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/elevation_m/z02/nx/
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/erosion_m/z02/nx/
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/procedural_detail_m/z02/nx/
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/metadata/z02/nx/
+            ${{ env.ROOT }}/ultrares/reconstructed/elevation_m/z01/nx/
+      - name: Upload deepest terrain face py
+        uses: actions/upload-artifact@v4
+        with:
+          name: earthlike-ultrares-z2-py
+          compression-level: 6
+          retention-days: 14
+          path: |
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/elevation_m/z02/py/
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/erosion_m/z02/py/
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/procedural_detail_m/z02/py/
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/metadata/z02/py/
+            ${{ env.ROOT }}/ultrares/reconstructed/elevation_m/z01/py/
+      - name: Upload deepest terrain face ny
+        uses: actions/upload-artifact@v4
+        with:
+          name: earthlike-ultrares-z2-ny
+          compression-level: 6
+          retention-days: 14
+          path: |
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/elevation_m/z02/ny/
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/erosion_m/z02/ny/
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/procedural_detail_m/z02/ny/
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/metadata/z02/ny/
+            ${{ env.ROOT }}/ultrares/reconstructed/elevation_m/z01/ny/
+      - name: Upload deepest terrain face pz
+        uses: actions/upload-artifact@v4
+        with:
+          name: earthlike-ultrares-z2-pz
+          compression-level: 6
+          retention-days: 14
+          path: |
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/elevation_m/z02/pz/
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/erosion_m/z02/pz/
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/procedural_detail_m/z02/pz/
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/metadata/z02/pz/
+            ${{ env.ROOT }}/ultrares/reconstructed/elevation_m/z01/pz/
+      - name: Upload deepest terrain face nz
+        uses: actions/upload-artifact@v4
+        with:
+          name: earthlike-ultrares-z2-nz
+          compression-level: 6
+          retention-days: 14
+          path: |
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/elevation_m/z02/nz/
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/erosion_m/z02/nz/
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/procedural_detail_m/z02/nz/
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/metadata/z02/nz/
+            ${{ env.ROOT }}/ultrares/reconstructed/elevation_m/z01/nz/
