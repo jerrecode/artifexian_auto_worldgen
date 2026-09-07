@@ -378,18 +378,26 @@ def derive_scale_aware_geomorphology_spec(
     base_wavelength_samples = coarsest_wavelength_m / fine_mps
     finest_wavelength_m = min_samples * fine_mps
 
-    lac = float(cfg.procedural_lacunarity)
-    if coarsest_wavelength_m <= finest_wavelength_m:
+    requested_lac = float(cfg.procedural_lacunarity)
+    span = max(coarsest_wavelength_m / finest_wavelength_m, 1.0)
+    if span <= 1.0 + 1.0e-12:
         octaves = 1
+        lac = requested_lac
     else:
+        # Use enough octaves to reach the finest safe wavelength, then make the
+        # lacunarity infinitesimally smaller when necessary so the last octave
+        # lands exactly on that four-sample boundary instead of stopping one
+        # octave early because the coarsest endpoint is kept below the source
+        # authority's own four-sample resolution limit.
         octaves = 1 + int(
-            math.floor(
-                math.log(coarsest_wavelength_m / finest_wavelength_m)
-                / math.log(lac)
-                + 1.0e-9
+            math.ceil(
+                math.log(span) / math.log(requested_lac) - 1.0e-12
             )
         )
-    octaves = max(1, min(octaves, 8))
+        octaves = max(2, min(octaves, 8))
+        lac = span ** (1.0 / float(octaves - 1))
+        if lac <= 1.0:
+            lac = requested_lac
 
     scale_ratio = max(coarsest_wavelength_m / 1000.0 / max(global_proc_wave_km, 1.0e-9), 1.0e-9)
     procedural_amplitude = (
@@ -423,8 +431,15 @@ def derive_scale_aware_geomorphology_spec(
         procedural_base_wavelength_samples=float(base_wavelength_samples),
         procedural_min_samples_per_wavelength=min_samples,
         procedural_amplitude_m=float(max(procedural_amplitude, 0.05)),
-        procedural_gain=float(np.clip(global_proc_gain, 0.20, 0.90)),
-        procedural_lacunarity=lac,
+        procedural_gain=float(
+            np.clip(
+                global_proc_gain
+                ** (math.log(lac) / math.log(max(requested_lac, 1.000001))),
+                0.20,
+                0.90,
+            )
+        ),
+        procedural_lacunarity=float(lac),
         procedural_cell_scale=0.72,
         procedural_steering_strength=0.28,
     ).validate()
