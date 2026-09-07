@@ -585,7 +585,7 @@ def _sample_reconstructed_level(
         sin_lat = np.sin(lat)[:, None]
         xx = cos_lat * cos_lon[None, :]
         yy = cos_lat * sin_lon[None, :]
-        zz = np.broadcast_to(sin_lat[:, None], xx.shape)
+        zz = np.broadcast_to(sin_lat, xx.shape)
         face, s, t = _inverse_cube_coordinates(xx, yy, zz)
         qx = np.clip(
             (s + 1.0) * 0.5 * side,
