@@ -1617,8 +1617,17 @@ def reconstruct_fullview_maps(
         )
     )
 
+    # Fullview climate/surface arrays have all been rendered. Weather generation still
+    # needs the deepest climate/surface tiles, but not these ~gigabyte fullview arrays.
+    _remove_fullview_temp(*surface_fields.values())
+
     # Weather hazards use the climate/surface tile products for physically bounded local modulation.
     generate_weather_products(pyramid, plan)
+    if cleanup_deepest_products:
+        shutil.rmtree(
+            root / "ultrares" / "deepest_products" / "climate_surface",
+            ignore_errors=True,
+        )
     weather_paths: dict[str, Path] = {}
     for field in (*WEATHER_GROUPS, "dominant_weather_code", "dominant_weather_strength"):
         weather_paths[field] = sample(
@@ -1652,6 +1661,11 @@ def reconstruct_fullview_maps(
         )
         weather_number += 1
     _remove_fullview_temp(*weather_paths.values())
+    if cleanup_deepest_products:
+        shutil.rmtree(
+            root / "ultrares" / "deepest_products" / "weather",
+            ignore_errors=True,
+        )
 
     # Resource suitability remains global-geology-authoritative but is rebuilt through deepest tiles.
     generate_resource_products(pyramid, plan)
@@ -1688,6 +1702,11 @@ def reconstruct_fullview_maps(
         )
         number += 1
     _remove_fullview_temp(*resource_paths.values())
+    if cleanup_deepest_products:
+        shutil.rmtree(
+            root / "ultrares" / "deepest_products" / "resources",
+            ignore_errors=True,
+        )
 
     # Scientific temporary fullview arrays used only to render images can now go.
     _remove_fullview_temp(
@@ -1700,11 +1719,6 @@ def reconstruct_fullview_maps(
     # Keep the final fullview elevation NPY as a numeric companion to the image suite.
     final_elevation = output / "elevation_m.npy"
     os.replace(elev, final_elevation)
-
-    if cleanup_deepest_products:
-        shutil.rmtree(root / "ultrares" / "deepest_products" / "climate_surface", ignore_errors=True)
-        shutil.rmtree(root / "ultrares" / "deepest_products" / "weather", ignore_errors=True)
-        shutil.rmtree(root / "ultrares" / "deepest_products" / "resources", ignore_errors=True)
 
     # Remove terrain intermediates no longer needed for the requested image suite.
     if cleanup_heavy_solver_caches:
