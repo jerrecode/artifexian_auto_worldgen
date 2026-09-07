@@ -1,5 +1,5 @@
 name: Earth-like ultra-resolution multiscale production
-# Retrigger after scale-band planner correction.
+# Produces full-view physical map images reconstructed from deepest terrain tiles.
 
 on:
   push:
@@ -7,6 +7,14 @@ on:
       - earthlike-ultrares-multiscale
     paths:
       - '.github/workflows/generate-earthlike-ultrares.yml'
+      - 'src/worldgen/ultrares.py'
+      - 'src/worldgen/ultrares_maps.py'
+      - 'src/worldgen/local_geomorphology.py'
+      - 'scripts/run_ultrares_earth.py'
+      - 'scripts/render_ultrares_maps.py'
+      - 'scripts/build_ultrares_earth_config.py'
+      - 'tests/test_ultrares.py'
+      - 'tests/test_ultrares_maps.py'
   workflow_dispatch:
 
 permissions:
@@ -40,7 +48,16 @@ jobs:
       - name: Run multiscale and erosion regression gates
         run: |
           set -euxo pipefail
-          python -m pytest -q             tests/test_ultrares.py             tests/test_local_geomorphology.py             tests/test_local_hydrology.py             tests/test_refinement.py             tests/test_procedural_erosion.py             tests/test_erosion_forcing.py             tests/test_pipeline_procedural_erosion.py             tests/test_diagnostics_surface_liquids.py
+          python -m pytest -q \
+            tests/test_ultrares.py \
+            tests/test_ultrares_maps.py \
+            tests/test_local_geomorphology.py \
+            tests/test_local_hydrology.py \
+            tests/test_refinement.py \
+            tests/test_procedural_erosion.py \
+            tests/test_erosion_forcing.py \
+            tests/test_pipeline_procedural_erosion.py \
+            tests/test_diagnostics_surface_liquids.py
 
   produce:
     needs: preflight
@@ -135,6 +152,62 @@ jobs:
           }, indent=2, sort_keys=True))
           PY
 
+      - name: Rebuild all requested full-view maps from deepest tiles
+        shell: bash
+        run: |
+          set -euxo pipefail
+          /usr/bin/time -v python scripts/render_ultrares_maps.py "$ROOT" \
+            2>&1 | tee "$ROOT/ultrares-map-render.log"
+
+      - name: Validate reconstructed map suite
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          from PIL import Image
+
+          root = Path(os.environ["ROOT"])
+          maps = root / "ultrares" / "fullview_maps"
+          manifest = json.loads((maps / "map_manifest.json").read_text())
+          assert manifest["resolution"] == [8192, 4096], manifest["resolution"]
+          assert manifest["deepest_tile_count"] == 96
+          rows = manifest["files"]
+          assert len(rows) >= 38, len(rows)
+          names = {row["file"] for row in rows}
+          required = {
+              "00_terrain_relief.png",
+              "01_terrain_heightmap_grayscale16.png",
+              "04_rivers_deepest_tiles.png",
+              "07_temperature_annual_heatmap.png",
+              "08_precipitation_annual.png",
+              "09_humidity_proxy_annual.png",
+              "14_vegetation_fraction.png",
+              "17_biome_ecoregime_with_legend.png",
+              "18_koppen_climate_with_legend.png",
+              "19_true_color_refined.png",
+              "20_erosion_legacy_stream_power.png",
+              "21_erosion_procedural_phase_cell.png",
+              "22_erosion_combined_geomorphic_delta.png",
+              "23_weather_hazards_with_legend.png",
+              "30_resources_dominant_with_legend.png",
+          }
+          assert required <= names, sorted(required - names)
+          for row in rows:
+              path = maps / row["file"]
+              assert path.exists() and path.stat().st_size > 0, path
+              with Image.open(path) as im:
+                  assert im.size == (8192, 4096), (path.name, im.size)
+          with Image.open(maps / "01_terrain_heightmap_grayscale16.png") as im:
+              assert im.mode in {"I;16", "I"}, im.mode
+          print(json.dumps({
+              "map_count": len(rows),
+              "resolution": manifest["resolution"],
+              "files": sorted(names),
+          }, indent=2))
+          PY
+
       - name: Prune reproducible intermediate caches after successful audit
         shell: bash
         run: |
@@ -149,96 +222,60 @@ jobs:
           find "$ROOT" -type f -printf '%P\t%s\n' | sort > "$ROOT/ultrares/file_inventory.tsv"
           du -sh "$ROOT" "$ROOT/ultrares" "$DERIVED/local_geomorphology_v1"
 
-      - name: Upload compact fullview and audits
+      - name: Upload core full-view maps
         uses: actions/upload-artifact@v4
         with:
-          name: earthlike-ultrares-fullview-2026090707
+          name: earthlike-ultrares-core-maps-8192x4096
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            ${{ env.ROOT }}/ultrares/fullview_maps/0*.png
+            ${{ env.ROOT }}/ultrares/fullview_maps/1*.png
+            ${{ env.ROOT }}/ultrares/fullview_maps/2[0-2]_*.png
+            ${{ env.ROOT }}/ultrares/fullview_maps/01_terrain_heightmap_grayscale16.json
+            ${{ env.ROOT }}/ultrares/fullview_maps/elevation_m.npy
+            ${{ env.ROOT }}/ultrares/fullview_maps/map_manifest.json
+
+      - name: Upload weather full-view maps
+        uses: actions/upload-artifact@v4
+        with:
+          name: earthlike-ultrares-weather-maps-8192x4096
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            ${{ env.ROOT }}/ultrares/fullview_maps/2[3-9]_*.png
+            ${{ env.ROOT }}/ultrares/fullview_maps/map_manifest.json
+
+      - name: Upload resource full-view maps
+        uses: actions/upload-artifact@v4
+        with:
+          name: earthlike-ultrares-resource-maps-8192x4096
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            ${{ env.ROOT }}/ultrares/fullview_maps/3*.png
+            ${{ env.ROOT }}/ultrares/fullview_maps/map_manifest.json
+
+      - name: Upload scientific provenance and audits
+        uses: actions/upload-artifact@v4
+        with:
+          name: earthlike-ultrares-provenance-2026090707
           compression-level: 6
           retention-days: 14
           if-no-files-found: error
           path: |
-            ${{ env.ROOT }}/ultrares/fullview/
             ${{ env.ROOT }}/ultrares/source_maps/
             ${{ env.ROOT }}/ultrares/plan.json
             ${{ env.ROOT }}/ultrares/terrain_detail_audit.json
             ${{ env.ROOT }}/ultrares/reconstruction.json
             ${{ env.ROOT }}/ultrares/authority_compaction.json
             ${{ env.ROOT }}/ultrares/file_inventory.tsv
+            ${{ env.ROOT }}/ultrares-map-render.log
             ${{ env.ROOT }}/source_scientific_audit.json
             ${{ env.ROOT }}/source_optics_audit.json
             ${{ env.ROOT }}/diagnostics.json
             ${{ env.ROOT }}/world.json
             ${{ env.CONFIG }}
-
-      - name: Upload deepest terrain face px
-        uses: actions/upload-artifact@v4
-        with:
-          name: earthlike-ultrares-z2-px
-          compression-level: 6
-          retention-days: 14
-          path: |
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/elevation_m/z02/px/
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/erosion_m/z02/px/
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/procedural_detail_m/z02/px/
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/metadata/z02/px/
-            ${{ env.ROOT }}/ultrares/reconstructed/elevation_m/z01/px/
-      - name: Upload deepest terrain face nx
-        uses: actions/upload-artifact@v4
-        with:
-          name: earthlike-ultrares-z2-nx
-          compression-level: 6
-          retention-days: 14
-          path: |
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/elevation_m/z02/nx/
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/erosion_m/z02/nx/
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/procedural_detail_m/z02/nx/
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/metadata/z02/nx/
-            ${{ env.ROOT }}/ultrares/reconstructed/elevation_m/z01/nx/
-      - name: Upload deepest terrain face py
-        uses: actions/upload-artifact@v4
-        with:
-          name: earthlike-ultrares-z2-py
-          compression-level: 6
-          retention-days: 14
-          path: |
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/elevation_m/z02/py/
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/erosion_m/z02/py/
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/procedural_detail_m/z02/py/
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/metadata/z02/py/
-            ${{ env.ROOT }}/ultrares/reconstructed/elevation_m/z01/py/
-      - name: Upload deepest terrain face ny
-        uses: actions/upload-artifact@v4
-        with:
-          name: earthlike-ultrares-z2-ny
-          compression-level: 6
-          retention-days: 14
-          path: |
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/elevation_m/z02/ny/
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/erosion_m/z02/ny/
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/procedural_detail_m/z02/ny/
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/metadata/z02/ny/
-            ${{ env.ROOT }}/ultrares/reconstructed/elevation_m/z01/ny/
-      - name: Upload deepest terrain face pz
-        uses: actions/upload-artifact@v4
-        with:
-          name: earthlike-ultrares-z2-pz
-          compression-level: 6
-          retention-days: 14
-          path: |
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/elevation_m/z02/pz/
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/erosion_m/z02/pz/
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/procedural_detail_m/z02/pz/
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/metadata/z02/pz/
-            ${{ env.ROOT }}/ultrares/reconstructed/elevation_m/z01/pz/
-      - name: Upload deepest terrain face nz
-        uses: actions/upload-artifact@v4
-        with:
-          name: earthlike-ultrares-z2-nz
-          compression-level: 6
-          retention-days: 14
-          path: |
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/elevation_m/z02/nz/
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/erosion_m/z02/nz/
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/procedural_detail_m/z02/nz/
-            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/metadata/z02/nz/
-            ${{ env.ROOT }}/ultrares/reconstructed/elevation_m/z01/nz/
