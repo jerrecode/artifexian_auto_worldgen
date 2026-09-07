@@ -26,6 +26,7 @@ import json
 import math
 import os
 from pathlib import Path
+import shutil
 import tempfile
 from threading import local
 from typing import Any, Iterable, Mapping
@@ -44,7 +45,6 @@ from .planet_tiles import (
 )
 
 
-@dataclass(slots=True, frozen=True)
 class UltraResolutionTilePyramid(PlanetTilePyramid):
     """PlanetTilePyramid with a bounded in-process cache for compact authority arrays.
 
@@ -171,6 +171,79 @@ def _atomic_save_npy(path: Path, values: np.ndarray) -> None:
             tmp.unlink()
         except FileNotFoundError:
             pass
+
+
+ULTRARES_AUTHORITY_FIELDS = (
+    "lat",
+    "lon",
+    "elevation_km",
+    "runoff_mm_year",
+    "annual_precipitation_mm",
+    "annual_temperature_c",
+    "rivers",
+    "stream_order",
+    "discharge_index",
+    "river_width_proxy",
+)
+
+
+def compact_world_authority(
+    world_root: str | Path,
+    *,
+    keep_fields: tuple[str, ...] = ULTRARES_AUTHORITY_FIELDS,
+    prune_rendered_maps: bool = True,
+) -> dict[str, Any]:
+    """Keep only exact global fields required by terrain LOD refinement."""
+    root = Path(world_root).expanduser().resolve()
+    source = root / "world_arrays.npz"
+    if not source.exists():
+        raise FileNotFoundError(source)
+    with np.load(source, allow_pickle=False) as z:
+        missing = [name for name in keep_fields if name not in z.files]
+        if missing:
+            raise KeyError(
+                "world_arrays.npz is missing ultra-resolution authority fields: "
+                + ", ".join(missing)
+            )
+        arrays = {name: np.asarray(z[name]) for name in keep_fields}
+
+    tmp = root / ".world_arrays.ultrares.npz"
+    np.savez(tmp, **arrays)
+    os.replace(tmp, source)
+
+    source_maps = root / "ultrares" / "source_maps"
+    source_maps.mkdir(parents=True, exist_ok=True)
+    maps_root = root / "maps"
+    for name in (
+        "02_elevation.png",
+        "02b_height_grayscale_16bit.png",
+        "02b_height_grayscale_16bit.json",
+        "05_precipitation_annual.png",
+        "08c_erosion.png",
+        "15_true_color.png",
+    ):
+        path = maps_root / name
+        if path.exists():
+            shutil.copy2(path, source_maps / name)
+
+    shutil.rmtree(root / "checkpoints", ignore_errors=True)
+    if prune_rendered_maps and maps_root.exists():
+        shutil.rmtree(maps_root, ignore_errors=True)
+
+    report = {
+        "fields": list(keep_fields),
+        "source_resolution": [int(len(arrays["lon"])), int(len(arrays["lat"]))],
+        "npz_bytes": int(source.stat().st_size),
+        "rendered_source_maps": sorted(
+            path.name for path in source_maps.iterdir() if path.is_file()
+        ),
+        "semantics": (
+            "values copied exactly from the completed full-detail global solve; "
+            "only redundant arrays/checkpoints/renders were pruned"
+        ),
+    }
+    _atomic_json(root / "ultrares" / "authority_compaction.json", report)
+    return report
 
 
 def _world_payload(world_root: Path) -> dict[str, Any]:
@@ -977,11 +1050,13 @@ def run_ultra_resolution(
 
 
 __all__ = [
+    "ULTRARES_AUTHORITY_FIELDS",
     "UltraResolutionPlan",
     "UltraResolutionTilePyramid",
     "UltraResolutionReport",
     "UltraResolutionSpec",
     "audit_ultra_resolution",
+    "compact_world_authority",
     "derive_scale_aware_geomorphology_spec",
     "generate_finest_geomorphology",
     "make_ultra_resolution_plan",
