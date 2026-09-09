@@ -152,6 +152,8 @@ def test_local_geomorphology_cache_is_deterministic(tmp_path):
 
 
 def test_terrain_eighth_moment_catches_balanced_axis_diagonal_grid():
+    from worldgen.local_geomorphology import _grid_angular_moments
+
     y, x = np.mgrid[:256, :256]
     field = np.zeros((256, 256), dtype=np.float64)
     field[:128] = np.sin(2.0 * np.pi * x[:128] / 12.0)
