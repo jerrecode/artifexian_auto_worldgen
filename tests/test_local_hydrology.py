@@ -621,3 +621,69 @@ def test_local_hydrology_rejects_stale_algorithm_revision(tmp_path):
     solver.solve(key)
     repaired = json.loads(meta_path.read_text(encoding="utf-8"))
     assert repaired["algorithm_revision"] == LOCAL_HYDROLOGY_ALGORITHM_REVISION
+
+
+
+def test_meander_phase_evolves_along_streamwise_flow():
+    from worldgen.local_hydrology import _meander_phase
+
+    h, w = 48, 160
+    yy, xx = np.meshgrid(
+        np.linspace(-0.025, 0.025, h),
+        np.linspace(-0.16, 0.16, w),
+        indexing="ij",
+    )
+    xyz = np.stack((xx, yy, np.ones_like(xx)), axis=-1)
+    xyz /= np.linalg.norm(xyz, axis=-1, keepdims=True)
+    q = np.full((h, w), 0.88, dtype=np.float64)
+
+    # Local eastward flow: atan2(dy=0, dx=1) = 0.
+    flow = np.zeros((h, w), dtype=np.float64)
+    phase = _meander_phase(
+        xyz,
+        6.4e6,
+        q,
+        seed=2026090707,
+        variant=2,
+        minimum_wavelength_m=12_000.0,
+        flow_angle_rad=flow,
+    )
+
+    centre = phase[h // 2]
+    assert np.isfinite(phase).all()
+    assert float(np.std(centre)) > 0.08
+    # The field must vary repeatedly downstream, not remain nearly constant
+    # along a river that happens to be orthogonal to an arbitrary global axis.
+    signs = np.signbit(centre)
+    transitions = int(np.count_nonzero(signs[1:] != signs[:-1]))
+    assert transitions >= 2
+
+
+def test_meander_phase_streamwise_axis_is_deterministic():
+    from worldgen.local_hydrology import _meander_phase
+
+    h = w = 36
+    yy, xx = np.meshgrid(
+        np.linspace(-0.08, 0.08, h),
+        np.linspace(-0.08, 0.08, w),
+        indexing="ij",
+    )
+    xyz = np.stack((xx, yy, np.ones_like(xx)), axis=-1)
+    xyz /= np.linalg.norm(xyz, axis=-1, keepdims=True)
+    q = np.linspace(0.2, 1.0, w, dtype=np.float64)[None, :]
+    q = np.broadcast_to(q, (h, w))
+    flow = np.full((h, w), np.pi / 4.0, dtype=np.float64)
+
+    a = _meander_phase(
+        xyz, 6.4e6, q,
+        seed=77, variant=1,
+        minimum_wavelength_m=10_000.0,
+        flow_angle_rad=flow,
+    )
+    b = _meander_phase(
+        xyz, 6.4e6, q,
+        seed=77, variant=1,
+        minimum_wavelength_m=10_000.0,
+        flow_angle_rad=flow,
+    )
+    np.testing.assert_array_equal(a, b)
