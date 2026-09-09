@@ -40,6 +40,8 @@ from .planet_tiles import (
 )
 
 
+LOCAL_HYDROLOGY_ALGORITHM_REVISION = "adaptive-d16-routing-v2"
+
 _D8 = (
     (-1, -1),
     (-1, 0),
@@ -1115,7 +1117,21 @@ class LocalHydrologySolver:
         meta_path = self._metadata_path(key)
         if not meta_path.exists() or not all(path.exists() for path in paths.values()):
             return None
-        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        try:
+            metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return None
+        if metadata.get("key") != asdict(key):
+            return None
+        if metadata.get("source_sha256") != self.pyramid._source_hash():
+            return None
+        if metadata.get("spec") != asdict(self.spec):
+            return None
+        if (
+            metadata.get("algorithm_revision")
+            != LOCAL_HYDROLOGY_ALGORITHM_REVISION
+        ):
+            return None
         arrays = {
             name: np.load(path, mmap_mode="r", allow_pickle=False)
             for name, path in paths.items()
@@ -1501,6 +1517,7 @@ class LocalHydrologySolver:
         metadata = {
             "schema_version": 3,
             "key": asdict(key),
+            "algorithm_revision": LOCAL_HYDROLOGY_ALGORITHM_REVISION,
             "spec": asdict(self.spec),
             "source_sha256": self.pyramid._source_hash(),
             "patch_shape": [
@@ -1543,6 +1560,7 @@ class LocalHydrologySolver:
         metadata = {
             "schema_version": 2,
             "key": asdict(key),
+            "algorithm_revision": LOCAL_HYDROLOGY_ALGORITHM_REVISION,
             "spec": asdict(self.spec),
             "source_sha256": self.pyramid._source_hash(),
             "patch_shape": [int(elevation.shape[0]), int(elevation.shape[1])],
@@ -1564,6 +1582,7 @@ class LocalHydrologySolver:
 
 
 __all__ = [
+    "LOCAL_HYDROLOGY_ALGORITHM_REVISION",
     "LocalHydrologyResult",
     "LocalHydrologySolver",
     "LocalHydrologySpec",
