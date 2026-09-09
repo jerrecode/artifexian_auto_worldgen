@@ -592,3 +592,32 @@ def test_d16_corrective_steering_floor_preserves_strict_downhill_flow():
             steering_weight=steer,
             steering_score_floor=-0.01,
         )
+
+
+
+def test_local_hydrology_rejects_stale_algorithm_revision(tmp_path):
+    import json
+    from worldgen.local_hydrology import LOCAL_HYDROLOGY_ALGORITHM_REVISION
+
+    _world(tmp_path)
+    pyramid = PlanetTilePyramid(
+        tmp_path,
+        spec=TilePyramidSpec(tile_size=16, elevation_detail_strength=0.2),
+    )
+    solver = LocalHydrologySolver(
+        pyramid,
+        spec=LocalHydrologySpec(halo_cells=4, stream_quantile=0.95),
+    )
+    key = TileKey("px", 1, 0, 0)
+    solver.solve(key)
+
+    meta_path = solver._metadata_path(key)
+    metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert metadata["algorithm_revision"] == LOCAL_HYDROLOGY_ALGORITHM_REVISION
+    metadata["algorithm_revision"] = "stale-routing-revision"
+    meta_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    assert solver._load_cached(key) is None
+    solver.solve(key)
+    repaired = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert repaired["algorithm_revision"] == LOCAL_HYDROLOGY_ALGORITHM_REVISION
