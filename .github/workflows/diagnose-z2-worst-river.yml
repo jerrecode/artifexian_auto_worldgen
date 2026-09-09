@@ -1,0 +1,105 @@
+name: Diagnose worst z2 river tile
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - z2-river-seam-audit-fix
+    paths:
+      - '.github/workflows/diagnose-z2-worst-river.yml'
+      - 'src/worldgen/local_hydrology.py'
+      - 'src/worldgen/local_geomorphology.py'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  diagnose-river:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      MPLBACKEND: Agg
+      WORLDGEN_DISTANCE_CACHE_MB: '128'
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_MAX_THREADS: '1'
+      NUMBA_CACHE_DIR: ${{ github.workspace }}/.numba-cache
+      ROOT: output/earthlike-ultrares-2026090707
+      SOURCE_RUN_ID: '34353489700'
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install production stack
+        run: |
+          set -euxo pipefail
+          python -m pip install --disable-pip-version-check -e '.[performance,jit,storage,thermodynamics,render,dev]'
+          python -m pip check
+
+      - name: Restore existing compact source authority
+        uses: actions/download-artifact@v4
+        with:
+          name: earthlike-ultrares-source-2026090707
+          path: ${{ env.ROOT }}
+          github-token: ${{ github.token }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+
+      - name: Regenerate only worst straight-run tile with enhanced diagnostics
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          from worldgen.local_geomorphology import LocalGeomorphologySolver
+          from worldgen.planet_tiles import TileKey
+          from worldgen.ultrares import UltraResolutionSpec, _prepare_ultra_resolution
+
+          root = Path(os.environ["ROOT"])
+          spec = UltraResolutionSpec(
+              base_linear_multiplier=4.0,
+              subsection_linear_multiplier=2.0,
+              tile_size=1024,
+              min_samples_per_wavelength=4.0,
+              terrain_detail_strength=1.15,
+              workers=1,
+          ).validate()
+          pyramid, plan, geomorph = _prepare_ultra_resolution(root, spec)
+          key = TileKey("ny", 2, 3, 1)
+          assert plan.finest_level == 2 and plan.finest_tile_count == 96
+
+          pyramid.generate_tile(key, ("elevation_m",))
+          result = LocalGeomorphologySolver(pyramid, spec=geomorph).solve(key)
+          routing = dict(result.metadata["final_routing_metrics"])
+          payload = {
+              "key": {"face": key.face, "level": key.level, "x": key.x, "y": key.y},
+              "plan": {
+                  "finest_level": plan.finest_level,
+                  "finest_tile_count": plan.finest_tile_count,
+                  "finest_m_per_sample": plan.finest_m_per_sample,
+              },
+              "routing_metrics": routing,
+              "final_stream_cells": result.metadata["final_stream_cells"],
+          }
+          out = root / "ultrares" / "worst-river-diagnostic.json"
+          out.parent.mkdir(parents=True, exist_ok=True)
+          out.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+          print("[worst-river-diagnostic] " + json.dumps(payload, sort_keys=True))
+          PY
+
+      - name: Upload worst-river diagnostic
+        uses: actions/upload-artifact@v4
+        with:
+          name: z2-worst-river-diagnostic
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            ${{ env.ROOT }}/ultrares/worst-river-diagnostic.json
