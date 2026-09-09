@@ -38,6 +38,7 @@ from scipy import ndimage
 from .heightmap import write_heightmap_png16
 from .local_geomorphology import LocalGeomorphologySolver, LocalGeomorphologySpec
 from .procedural_erosion import phase_cell_octave_xyz
+from .progress_telemetry import HierarchicalProgressTracker
 from .planet_tiles import (
     CUBE_FACES,
     PlanetTilePyramid,
@@ -733,7 +734,7 @@ def _tile_resume_valid(
 
     expected_shape = (int(pyramid.spec.tile_size) + 1,) * 2
     expected_dtypes = {
-        "elevation_m": np.dtype(np.float32),
+        "elevation_m": np.dtype(np.float64),
         "erosion_m": np.dtype(np.float32),
         "procedural_detail_m": np.dtype(np.float32),
         "final_drainage_area_km2": np.dtype(np.float32),
@@ -825,6 +826,17 @@ def generate_finest_geomorphology(
     worker_count = max(1, int(workers))
     thread_state = local()
     source_sha256 = pyramid._source_hash()
+
+    telemetry = HierarchicalProgressTracker(
+        pyramid.world_root / "ultrares" / "telemetry",
+        scope=f"terrain-shard-{int(shard_index):03d}-of-{int(shard_count):03d}",
+        heartbeat_seconds=30.0,
+        parallelism=worker_count,
+        # base elevation + 7 geomorphology phases + cleanup/checkpoint.
+        subsubsteps_per_substep=9,
+        processing_steps_total=3,
+    )
+    resume_scan_started = time.monotonic()
     resumed_keys: set[TileKey] = set()
     if resume:
         resumed_keys = {
@@ -838,6 +850,20 @@ def generate_finest_geomorphology(
                 repair_marker=True,
             )
         }
+    telemetry.observe(
+        "processing_step",
+        "resume_scan",
+        max(time.monotonic() - resume_scan_started, 0.0),
+        meta={"selected_tiles": len(keys), "resumed_tiles": len(resumed_keys)},
+    )
+    telemetry.set_processing_step("terrain_generation", completed_before=1)
+    telemetry.configure_substeps(
+        completed=len(resumed_keys),
+        total=len(keys),
+        resumed=len(resumed_keys),
+    )
+    telemetry.start_heartbeat()
+
     todo = tuple(key for key in keys if key not in resumed_keys)
     completed = len(resumed_keys)
     newly_completed = 0
@@ -851,19 +877,81 @@ def generate_finest_geomorphology(
         progress_path = _progress_path(pyramid.world_root)
     started = time.monotonic()
 
+    phase_order = {
+        "source_geometry": 2,
+        "initial_hydrology": 3,
+        "river_constraints": 4,
+        "physical_evolution": 5,
+        "procedural_morphology": 6,
+        "final_channel_routing": 7,
+        "persistence": 8,
+    }
+
+    def timing_callback(
+        key: TileKey,
+        phase: str,
+        event: str,
+        duration: float | None,
+    ) -> None:
+        tile_id = f"{key.face}/z{key.level}/x{key.x}/y{key.y}"
+        token = f"{tile_id}:{phase}"
+        if event == "start":
+            telemetry.begin(
+                "subsubstep",
+                phase,
+                token=token,
+                parent=tile_id,
+                index=phase_order.get(phase),
+                total=9,
+                meta={"tile": tile_id},
+            )
+        elif event == "end":
+            telemetry.end(
+                token,
+                duration_seconds=duration,
+                meta={"tile": tile_id},
+            )
+
     def solver() -> LocalGeomorphologySolver:
         value = getattr(thread_state, "solver", None)
         if value is None:
-            value = LocalGeomorphologySolver(pyramid, spec=geomorphology_spec)
+            value = LocalGeomorphologySolver(
+                pyramid,
+                spec=geomorphology_spec,
+                timing_callback=timing_callback,
+            )
             thread_state.solver = value
         return value
 
     def run_one(key: TileKey) -> TileKey:
-        # The base tile already contains seamless absolute-XYZ tectonic microrelief.
-        # Hydrology/geomorphology then consume that field at native LOD.
-        pyramid.generate_tile(key, ("elevation_m",))
-        local_solver = solver()
-        local_solver.solve(key)
+        tile_id = f"{key.face}/z{key.level}/x{key.x}/y{key.y}"
+        tile_token = f"tile:{tile_id}"
+        telemetry.begin(
+            "substep",
+            tile_id,
+            token=tile_token,
+            parent="terrain_generation",
+            total=len(keys),
+            meta={"tile": tile_id},
+        )
+        try:
+            # The base tile already contains seamless absolute-XYZ tectonic microrelief.
+            # Hydrology/geomorphology then consume that field at native LOD.
+            base_token = f"{tile_id}:base_elevation"
+            telemetry.begin(
+                "subsubstep",
+                "base_elevation",
+                token=base_token,
+                parent=tile_id,
+                index=1,
+                total=9,
+                meta={"tile": tile_id},
+            )
+            pyramid.generate_tile(key, ("elevation_m",))
+            telemetry.end(base_token, meta={"tile": tile_id})
+
+            local_solver = solver()
+            local_solver.solve(key)
 
         # Keep only fields required by final scientific products/audits.  These
         # retained fields are the durable restart authority for this tile.
@@ -910,15 +998,31 @@ def generate_finest_geomorphology(
         pyramid._field_path(key, "elevation_m").unlink(missing_ok=True)
         pyramid._metadata_path(key).unlink(missing_ok=True)
 
-        if not _tile_resume_valid(
-            pyramid,
-            key,
-            geomorphology_spec,
-            source_sha256=source_sha256,
-            repair_marker=True,
-        ):
-            raise RuntimeError(f"completed tile failed restart validation: {key!r}")
-        return key
+            cleanup_token = f"{tile_id}:cleanup_checkpoint"
+            telemetry.begin(
+                "subsubstep",
+                "cleanup_checkpoint",
+                token=cleanup_token,
+                parent=tile_id,
+                index=9,
+                total=9,
+                meta={"tile": tile_id},
+            )
+            if not _tile_resume_valid(
+                pyramid,
+                key,
+                geomorphology_spec,
+                source_sha256=source_sha256,
+                repair_marker=True,
+            ):
+                raise RuntimeError(f"completed tile failed restart validation: {key!r}")
+            telemetry.end(cleanup_token, meta={"tile": tile_id})
+            telemetry.end(tile_token, meta={"tile": tile_id})
+            return key
+        except Exception:
+            # Leave active spans visible in the final telemetry snapshot.  The
+            # checkpoint validator on the next run decides whether the tile can resume.
+            raise
 
     def publish(last: TileKey | None, state: str) -> None:
         elapsed = max(time.monotonic() - started, 0.0)
@@ -990,6 +1094,13 @@ def generate_finest_geomorphology(
                     publish(last_key, "running")
                 fill()
     publish(last_key, "complete")
+    telemetry.observe(
+        "processing_step",
+        "shard_finalize",
+        0.0,
+        meta={"completed_tiles": completed, "selected_tiles": len(keys)},
+    )
+    telemetry.close()
     return completed
 
 
