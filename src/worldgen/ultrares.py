@@ -1182,9 +1182,13 @@ def audit_ultra_resolution(
 
     terrain_grid_real = 0.0
     terrain_grid_imag = 0.0
+    terrain_grid_eighth_real = 0.0
+    terrain_grid_eighth_imag = 0.0
     terrain_grid_weight = 0.0
     river_grid_real = 0.0
     river_grid_imag = 0.0
+    river_grid_eighth_real = 0.0
+    river_grid_eighth_imag = 0.0
     river_direction_count = 0
     turn_weighted = 0.0
     turn_transition_count = 0
@@ -1244,10 +1248,22 @@ def audit_ultra_resolution(
         if bool(meta.get("legacy_and_procedural_simultaneous", False)):
             simultaneous += 1
 
-        grid = meta.get("terrain_grid_fourfold_moment", {})
-        terrain_grid_real += float(grid.get("real", 0.0))
-        terrain_grid_imag += float(grid.get("imag", 0.0))
-        terrain_grid_weight += float(grid.get("weight", 0.0))
+        grid_angular = meta.get("terrain_grid_angular_moments")
+        if isinstance(grid_angular, dict):
+            terrain_grid_real += float(grid_angular.get("fourth_real", 0.0))
+            terrain_grid_imag += float(grid_angular.get("fourth_imag", 0.0))
+            terrain_grid_eighth_real += float(
+                grid_angular.get("eighth_real", 0.0)
+            )
+            terrain_grid_eighth_imag += float(
+                grid_angular.get("eighth_imag", 0.0)
+            )
+            terrain_grid_weight += float(grid_angular.get("weight", 0.0))
+        else:
+            grid = meta.get("terrain_grid_fourfold_moment", {})
+            terrain_grid_real += float(grid.get("real", 0.0))
+            terrain_grid_imag += float(grid.get("imag", 0.0))
+            terrain_grid_weight += float(grid.get("weight", 0.0))
 
         routing = meta.get("final_routing_metrics", {})
         direction_count = int(routing.get("stream_direction_count", 0) or 0)
@@ -1257,6 +1273,12 @@ def audit_ultra_resolution(
         )
         river_grid_imag += float(
             routing.get("directional_fourfold_moment_imag", 0.0) or 0.0
+        )
+        river_grid_eighth_real += float(
+            routing.get("directional_eighth_moment_real", 0.0) or 0.0
+        )
+        river_grid_eighth_imag += float(
+            routing.get("directional_eighth_moment_imag", 0.0) or 0.0
         )
         transition_count = int(
             routing.get("stream_transition_count", 0) or 0
@@ -1346,9 +1368,25 @@ def audit_ultra_resolution(
         abs(complex(terrain_grid_real, terrain_grid_imag))
         / max(terrain_grid_weight, 1.0e-30)
     )
+    terrain_grid_eighth_anisotropy = (
+        abs(complex(terrain_grid_eighth_real, terrain_grid_eighth_imag))
+        / max(terrain_grid_weight, 1.0e-30)
+    )
+    terrain_grid_worst_anisotropy = max(
+        terrain_grid_anisotropy,
+        terrain_grid_eighth_anisotropy,
+    )
     river_grid_anisotropy = (
         abs(complex(river_grid_real, river_grid_imag))
         / max(river_direction_count, 1)
+    )
+    river_grid_eighth_anisotropy = (
+        abs(complex(river_grid_eighth_real, river_grid_eighth_imag))
+        / max(river_direction_count, 1)
+    )
+    river_grid_worst_anisotropy = max(
+        river_grid_anisotropy,
+        river_grid_eighth_anisotropy,
     )
     turn_fraction = (
         turn_weighted / max(turn_transition_count, 1)
@@ -1379,6 +1417,7 @@ def audit_ultra_resolution(
         "tectonic_microdetail_active": aggregate_microdetail > 1.0,
         "terrain_square_grid_imprint_below_limit": (
             terrain_grid_anisotropy < 0.28
+            and terrain_grid_eighth_anisotropy < 0.36
         ),
         "legacy_erosion_active": aggregate_physical > 1.0e-5,
         "procedural_erosion_active": aggregate_procedural > 1.0e-5,
@@ -1414,7 +1453,10 @@ def audit_ultra_resolution(
             aggregate_procedural <= max(aggregate_physical * 3.0, 0.25)
         ),
         "final_rivers_exist": river_direction_count > 100,
-        "river_square_grid_imprint_below_limit": river_grid_anisotropy < 0.58,
+        "river_square_grid_imprint_below_limit": (
+            river_grid_anisotropy < 0.58
+            and river_grid_eighth_anisotropy < 0.72
+        ),
         "rivers_turn_at_resolved_scale": turn_fraction > 0.025,
         "river_straight_runs_bounded": max_straight_run <= 220,
         "rivers_have_resolved_sinuosity": (
@@ -1462,10 +1504,22 @@ def audit_ultra_resolution(
             "terrain_square_grid_fourfold_anisotropy": float(
                 terrain_grid_anisotropy
             ),
+            "terrain_square_grid_eighth_anisotropy": float(
+                terrain_grid_eighth_anisotropy
+            ),
+            "terrain_square_grid_worst_anisotropy": float(
+                terrain_grid_worst_anisotropy
+            ),
             "legacy_physical_erosion_rms_m": aggregate_physical,
             "procedural_detail_rms_m": aggregate_procedural,
             "river_square_grid_fourfold_anisotropy": float(
                 river_grid_anisotropy
+            ),
+            "river_square_grid_eighth_anisotropy": float(
+                river_grid_eighth_anisotropy
+            ),
+            "river_square_grid_worst_anisotropy": float(
+                river_grid_worst_anisotropy
             ),
             "river_stream_direction_count": int(river_direction_count),
             "river_turn_fraction_gt10deg": float(turn_fraction),
