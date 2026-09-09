@@ -289,6 +289,19 @@ jobs:
             --min-samples-per-wavelength 4 \
             --terrain-detail-strength 1.15 \
             2>&1 | tee "$ROOT/ultrares-finalize.log"
+      - name: Upload finalize diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: earthlike-ultrares-finalize-diagnostics-2026090707
+          retention-days: 14
+          compression-level: 6
+          if-no-files-found: warn
+          path: |
+            ${{ env.ROOT }}/ultrares/terrain_detail_audit.json
+            ${{ env.ROOT }}/ultrares/plan.json
+            ${{ env.ROOT }}/ultrares/authority_compaction.json
+            ${{ env.ROOT }}/ultrares-finalize.log
       - name: Enforce final ultra-resolution contract
         shell: bash
         run: |

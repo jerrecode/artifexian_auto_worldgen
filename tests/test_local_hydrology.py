@@ -4,6 +4,7 @@ import heapq
 import json
 
 import numpy as np
+import pytest
 
 from worldgen.local_hydrology import (
     _D16,
@@ -423,3 +424,320 @@ def test_priority_flood_optional_numba_matches_independent_python_reference():
     expected = reference(elevation, ocean, 0.01)
     actual = _priority_flood_open(elevation, ocean, epsilon_m=0.01)
     np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-12)
+
+
+
+def test_d16_meander_steering_breaks_long_axis_lock_without_uphill_flow():
+    from worldgen.local_hydrology import _routing_metrics
+
+    h = w = 96
+    yy, xx = np.meshgrid(
+        np.arange(h, dtype=np.float64),
+        np.arange(w, dtype=np.float64),
+        indexing="ij",
+    )
+    scale = 2.0e-5
+    xyz = np.stack(
+        (
+            (xx - w / 2.0) * scale,
+            (yy - h / 2.0) * scale,
+            np.ones((h, w), dtype=np.float64),
+        ),
+        axis=-1,
+    )
+    xyz /= np.linalg.norm(xyz, axis=-1, keepdims=True)
+
+    # Primarily eastward descent, with a much smaller southward component.  Both
+    # east and southeast remain downhill, allowing deterministic steering to
+    # choose a gently oscillating path instead of an axis-locked reach.
+    z = 2000.0 - 2.0 * xx - 0.30 * yy
+    ocean = np.zeros((h, w), dtype=bool)
+    preferred = 0.62 * np.sin(2.0 * np.pi * xx / 18.0)
+    steer = np.full((h, w), 0.84, dtype=np.float64)
+
+    receiver, code16, _slope = _flow_d16_open(
+        z,
+        ocean,
+        xyz,
+        1.0e6,
+        preferred_angle_rad=preferred,
+        steering_weight=steer,
+    )
+    streams = code16 >= 0
+    metrics = _routing_metrics(
+        receiver,
+        code16,
+        streams,
+        np.ones((h, w), dtype=np.float64),
+        xyz,
+        1.0e6,
+    )
+
+    flat_z = z.ravel()
+    active = receiver >= 0
+    sources = np.flatnonzero(active)
+    assert np.all(flat_z[receiver[active]] < flat_z[sources])
+    assert metrics["max_straight_run_cells"] < 80
+    assert metrics["stream_turn_fraction_gt10deg"] > 0.02
+
+
+
+def test_adaptive_meander_variants_are_deterministic_bounded_and_distinct():
+    from worldgen.local_hydrology import _meander_phase
+
+    h, w = 40, 48
+    yy, xx = np.meshgrid(
+        np.linspace(-0.08, 0.08, h),
+        np.linspace(-0.10, 0.10, w),
+        indexing="ij",
+    )
+    xyz = np.stack((xx, yy, np.ones_like(xx)), axis=-1)
+    xyz /= np.linalg.norm(xyz, axis=-1, keepdims=True)
+    q = np.clip((xx + 0.10) / 0.20, 0.0, 1.0)
+
+    kwargs = dict(
+        radius_m=6.4e6,
+        discharge_index=q,
+        seed=2026090707,
+        minimum_wavelength_m=12_000.0,
+    )
+    base = _meander_phase(xyz, variant=0, **kwargs)
+    v1 = _meander_phase(xyz, variant=1, **kwargs)
+    v1_again = _meander_phase(xyz, variant=1, **kwargs)
+    v2 = _meander_phase(xyz, variant=2, **kwargs)
+
+    np.testing.assert_array_equal(v1, v1_again)
+    assert np.isfinite(base).all()
+    assert np.isfinite(v1).all()
+    assert np.isfinite(v2).all()
+    assert float(np.max(np.abs(v1))) <= 1.0 + 1e-12
+    assert float(np.max(np.abs(v2))) <= 1.0 + 1e-12
+    assert not np.array_equal(base, v1)
+    assert not np.array_equal(v1, v2)
+
+
+def test_routing_metadata_reports_resolved_adaptive_wavelength_floor(tmp_path):
+    from worldgen.planet_tiles import approximate_meters_per_sample
+
+    _world(tmp_path)
+    pyramid = PlanetTilePyramid(
+        tmp_path,
+        spec=TilePyramidSpec(
+            tile_size=32,
+            elevation_detail_strength=0.0,
+            maximum_level=4,
+        ),
+    )
+    solver = LocalHydrologySolver(
+        pyramid,
+        spec=LocalHydrologySpec(halo_cells=6, stream_quantile=0.94),
+    )
+    key = TileKey("px", 1, 0, 0)
+    result = solver.solve(key)
+    expected = 4.5 * approximate_meters_per_sample(
+        pyramid.planet_radius_m,
+        key.level,
+        pyramid.spec.tile_size,
+    )
+    assert result.metadata["adaptive_meander_min_wavelength_m"] == pytest.approx(
+        expected
+    )
+    assert result.metadata["adaptive_meander_attempt"] in (0, 1, 2)
+    assert result.metadata["routing_candidate_metrics"]
+
+
+
+def test_d16_corrective_steering_floor_preserves_strict_downhill_flow():
+    h = w = 64
+    yy, xx = np.meshgrid(
+        np.arange(h, dtype=np.float64),
+        np.arange(w, dtype=np.float64),
+        indexing="ij",
+    )
+    scale = 2.0e-5
+    xyz = np.stack(
+        (
+            (xx - w / 2.0) * scale,
+            (yy - h / 2.0) * scale,
+            np.ones((h, w), dtype=np.float64),
+        ),
+        axis=-1,
+    )
+    xyz /= np.linalg.norm(xyz, axis=-1, keepdims=True)
+    z = 2500.0 - 2.8 * xx - 0.22 * yy
+    preferred = 0.72 * np.sin(2.0 * np.pi * xx / 16.0)
+    steer = np.full((h, w), 0.92, dtype=np.float64)
+
+    receiver, _code, _slope = _flow_d16_open(
+        z,
+        np.zeros((h, w), dtype=bool),
+        xyz,
+        1.0e6,
+        preferred_angle_rad=preferred,
+        steering_weight=steer,
+        steering_score_floor=0.018,
+    )
+    flat = z.ravel()
+    active = receiver >= 0
+    sources = np.flatnonzero(active)
+    assert np.all(flat[receiver[active]] < flat[sources])
+
+    with pytest.raises(ValueError):
+        _flow_d16_open(
+            z,
+            np.zeros((h, w), dtype=bool),
+            xyz,
+            1.0e6,
+            preferred_angle_rad=preferred,
+            steering_weight=steer,
+            steering_score_floor=-0.01,
+        )
+
+
+
+def test_local_hydrology_rejects_stale_algorithm_revision(tmp_path):
+    import json
+    from worldgen.local_hydrology import LOCAL_HYDROLOGY_ALGORITHM_REVISION
+
+    _world(tmp_path)
+    pyramid = PlanetTilePyramid(
+        tmp_path,
+        spec=TilePyramidSpec(tile_size=16, elevation_detail_strength=0.2),
+    )
+    solver = LocalHydrologySolver(
+        pyramid,
+        spec=LocalHydrologySpec(halo_cells=4, stream_quantile=0.95),
+    )
+    key = TileKey("px", 1, 0, 0)
+    solver.solve(key)
+
+    meta_path = solver._metadata_path(key)
+    metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert metadata["algorithm_revision"] == LOCAL_HYDROLOGY_ALGORITHM_REVISION
+    metadata["algorithm_revision"] = "stale-routing-revision"
+    meta_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    assert solver._load_cached(key) is None
+    solver.solve(key)
+    repaired = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert repaired["algorithm_revision"] == LOCAL_HYDROLOGY_ALGORITHM_REVISION
+
+
+
+
+
+
+def test_competitive_d16_selector_prefers_aligned_near_tie_and_stays_downhill():
+    h = w = 80
+    yy, xx = np.meshgrid(
+        np.arange(h, dtype=np.float64),
+        np.arange(w, dtype=np.float64),
+        indexing="ij",
+    )
+    scale = 2.0e-5
+    xyz = np.stack(
+        (
+            (xx - w / 2.0) * scale,
+            (yy - h / 2.0) * scale,
+            np.ones((h, w), dtype=np.float64),
+        ),
+        axis=-1,
+    )
+    xyz /= np.linalg.norm(xyz, axis=-1, keepdims=True)
+
+    # East is the true steepest direction. The D16 (dy=1, dx=2) knight move is
+    # still about 94% as steep, matching the measured production flat-reach case.
+    z = 3000.0 - 2.0 * xx - 0.20 * yy
+    ocean = np.zeros((h, w), dtype=bool)
+    receiver0, code0, max_slope = _flow_d16_open(
+        z, ocean, xyz, 1.0e6
+    )
+    centre = (h // 2, w // 2)
+    assert int(code0[centre]) == 4  # east
+
+    preferred = np.full(
+        (h, w),
+        np.arctan2(1.0, 2.0),
+        dtype=np.float64,
+    )
+    steer = np.full((h, w), 0.25, dtype=np.float64)
+    receiver, code, _ = _flow_d16_open(
+        z,
+        ocean,
+        xyz,
+        1.0e6,
+        preferred_angle_rad=preferred,
+        steering_weight=steer,
+        steering_score_floor=0.018,
+        competitive_slope_fraction=0.90,
+        reference_max_slope=max_slope,
+        competitive_alignment_weight=0.96,
+    )
+
+    assert int(code[centre]) == 13  # (dy=1, dx=2)
+    flat = z.ravel()
+    active = receiver >= 0
+    sources = np.flatnonzero(active)
+    assert np.all(flat[receiver[active]] < flat[sources])
+
+    with pytest.raises(ValueError):
+        _flow_d16_open(
+            z,
+            ocean,
+            xyz,
+            1.0e6,
+            preferred_angle_rad=preferred,
+            steering_weight=steer,
+            competitive_slope_fraction=0.90,
+            reference_max_slope=None,
+        )
+
+
+def test_competitive_selector_does_not_admit_materially_worse_descent():
+    h = w = 64
+    yy, xx = np.meshgrid(
+        np.arange(h, dtype=np.float64),
+        np.arange(w, dtype=np.float64),
+        indexing="ij",
+    )
+    scale = 2.0e-5
+    xyz = np.stack(
+        (
+            (xx - w / 2.0) * scale,
+            (yy - h / 2.0) * scale,
+            np.ones((h, w), dtype=np.float64),
+        ),
+        axis=-1,
+    )
+    xyz /= np.linalg.norm(xyz, axis=-1, keepdims=True)
+
+    # Pure eastward slope: the preferred diagonal/knight directions are well
+    # below the 90% competitive threshold, so steering cannot override relief.
+    z = 2000.0 - 2.0 * xx
+    ocean = np.zeros((h, w), dtype=bool)
+    _r0, code0, max_slope = _flow_d16_open(
+        z, ocean, xyz, 1.0e6
+    )
+    preferred = np.full(
+        (h, w),
+        np.pi / 4.0,
+        dtype=np.float64,
+    )
+    receiver, code, _ = _flow_d16_open(
+        z,
+        ocean,
+        xyz,
+        1.0e6,
+        preferred_angle_rad=preferred,
+        steering_weight=np.ones((h, w), dtype=np.float64),
+        steering_score_floor=0.0,
+        competitive_slope_fraction=0.90,
+        reference_max_slope=max_slope,
+        competitive_alignment_weight=1.0,
+    )
+    centre = (h // 2, w // 2)
+    assert int(code[centre]) == int(code0[centre]) == 4
+    flat = z.ravel()
+    active = receiver >= 0
+    sources = np.flatnonzero(active)
+    assert np.all(flat[receiver[active]] < flat[sources])

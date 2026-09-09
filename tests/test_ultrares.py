@@ -6,6 +6,7 @@ import math
 
 import numpy as np
 
+from worldgen.local_geomorphology import LOCAL_GEOMORPHOLOGY_ALGORITHM_REVISION
 from worldgen.planet_tiles import PlanetTilePyramid, TileKey, TilePyramidSpec, tile_geometry
 from worldgen.ultrares import (
     ULTRARES_RESUME_FIELDS,
@@ -265,6 +266,8 @@ def test_ultrares_resume_requires_matching_retained_authority(tmp_path):
                 "schema_version": 2,
                 "key": asdict(key),
                 "source_sha256": pyramid._source_hash(),
+                "authority_sampling_revision": pyramid.authority_sampling_revision,
+                "algorithm_revision": LOCAL_GEOMORPHOLOGY_ALGORITHM_REVISION,
                 "spec": asdict(geom),
             }
         ),
@@ -314,6 +317,8 @@ def test_ultrares_resume_rejects_stale_spec_even_with_marker(tmp_path):
         "schema_version": 2,
         "key": asdict(key),
         "source_sha256": pyramid._source_hash(),
+        "authority_sampling_revision": pyramid.authority_sampling_revision,
+        "algorithm_revision": LOCAL_GEOMORPHOLOGY_ALGORITHM_REVISION,
         "spec": asdict(geom),
     }
     metadata["spec"]["max_fluvial_erosion_m"] += 1.0
@@ -365,3 +370,151 @@ def test_ultrares_pyramid_prefers_semantic_compaction_fingerprint(tmp_path):
         ),
     )
     assert pyramid._source_hash() == semantic
+
+
+
+def test_metric_isotropic_elevation_prefilter_suppresses_polar_zonal_aliasing(tmp_path):
+    _write_source(tmp_path)
+    source_path = tmp_path / "world_arrays.npz"
+    with np.load(source_path, allow_pickle=False) as z:
+        arrays = {name: np.asarray(z[name]) for name in z.files}
+
+    elevation = np.zeros_like(arrays["elevation_km"], dtype=np.float32)
+    x = np.arange(elevation.shape[1], dtype=np.float64)
+    stripe = (8.0 * np.sin(2.0 * np.pi * x / 4.0)).astype(np.float32)
+    elevation[0, :] = stripe
+    elevation[-1, :] = stripe
+    elevation[elevation.shape[0] // 2, :] = stripe
+    arrays["elevation_km"] = elevation
+    np.savez(source_path, **arrays)
+
+    pyramid = UltraResolutionTilePyramid(
+        tmp_path,
+        spec=TilePyramidSpec(
+            tile_size=64,
+            elevation_detail_strength=1.0,
+            maximum_level=6,
+        ),
+    )
+    filtered = pyramid._metric_isotropic_elevation_source()
+
+    raw_polar_std = float(np.std(elevation[0]))
+    filtered_polar_std = float(np.std(filtered[0]))
+    raw_equatorial_std = float(np.std(elevation[elevation.shape[0] // 2]))
+    filtered_equatorial_std = float(np.std(filtered[elevation.shape[0] // 2]))
+
+    assert filtered_polar_std < 0.10 * raw_polar_std
+    assert filtered_equatorial_std > 0.95 * raw_equatorial_std
+    np.testing.assert_allclose(
+        np.mean(filtered, axis=1),
+        np.mean(elevation, axis=1),
+        rtol=0.0,
+        atol=1.0e-12,
+    )
+
+
+def test_resume_rejects_pre_sampling_revision_checkpoint(tmp_path):
+    _write_source(tmp_path)
+    cfg = UltraResolutionSpec(
+        base_linear_multiplier=4.0,
+        subsection_linear_multiplier=2.0,
+        tile_size=64,
+        terrain_detail_strength=1.0,
+    )
+    pyramid = UltraResolutionTilePyramid(
+        tmp_path,
+        spec=TilePyramidSpec(
+            tile_size=64,
+            elevation_detail_strength=1.0,
+            maximum_level=6,
+        ),
+    )
+    plan = make_ultra_resolution_plan(pyramid, cfg)
+    geom = derive_scale_aware_geomorphology_spec(pyramid, plan, cfg)
+    key = TileKey("px", plan.finest_level, 0, 0)
+    shape = (65, 65)
+
+    for field in ULTRARES_RESUME_FIELDS:
+        path = _geomorph_path(pyramid, key, field)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        dtype = (
+            np.bool_ if field == "final_streams"
+            else np.float64 if field == "elevation_m"
+            else np.float32
+        )
+        np.save(path, np.zeros(shape, dtype=dtype), allow_pickle=False)
+
+    metadata_path = _geomorph_metadata_path(pyramid, key)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "key": asdict(key),
+                "source_sha256": pyramid._source_hash(),
+                "spec": asdict(geom),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert not _tile_resume_valid(pyramid, key, geom)
+
+
+
+def test_metric_isotropic_source_reduces_high_latitude_cube_seam_derivative(tmp_path):
+    _write_source(tmp_path)
+    source_path = tmp_path / "world_arrays.npz"
+    with np.load(source_path, allow_pickle=False) as z:
+        arrays = {name: np.asarray(z[name]) for name in z.files}
+
+    h, w = arrays["elevation_km"].shape
+    lat = np.asarray(arrays["lat"], dtype=np.float64)
+    x = np.arange(w, dtype=np.float64)
+    high_latitude = np.abs(lat) >= 70.0
+    zonal = 8.0 * np.sin(2.0 * np.pi * x / 4.0)
+    elevation = np.zeros((h, w), dtype=np.float32)
+    elevation[high_latitude, :] = zonal[None, :]
+    arrays["elevation_km"] = elevation
+    np.savez(source_path, **arrays)
+
+    raw = PlanetTilePyramid(
+        tmp_path,
+        spec=TilePyramidSpec(
+            tile_size=64,
+            elevation_detail_strength=0.0,
+            maximum_level=6,
+        ),
+    )
+    filtered = UltraResolutionTilePyramid(
+        tmp_path,
+        spec=TilePyramidSpec(
+            tile_size=64,
+            elevation_detail_strength=0.0,
+            maximum_level=6,
+        ),
+    )
+    a_key = TileKey("nz", 2, 1, 1)
+    b_key = TileKey("nz", 2, 1, 2)
+    a_geom = tile_geometry(a_key, 64)
+    b_geom = tile_geometry(b_key, 64)
+
+    raw_a = np.asarray(raw._sample_source_field("elevation_m", a_geom), dtype=np.float64)
+    raw_b = np.asarray(raw._sample_source_field("elevation_m", b_geom), dtype=np.float64)
+    filt_a = np.asarray(
+        filtered._sample_source_field("elevation_m", a_geom), dtype=np.float64
+    )
+    filt_b = np.asarray(
+        filtered._sample_source_field("elevation_m", b_geom), dtype=np.float64
+    )
+
+    np.testing.assert_allclose(raw_a[-1, :], raw_b[0, :], rtol=0.0, atol=1.0e-9)
+    np.testing.assert_allclose(filt_a[-1, :], filt_b[0, :], rtol=0.0, atol=1.0e-9)
+
+    raw_diff = (raw_a[-1, :] - raw_a[-2, :]) - (raw_b[1, :] - raw_b[0, :])
+    filt_diff = (filt_a[-1, :] - filt_a[-2, :]) - (filt_b[1, :] - filt_b[0, :])
+    raw_rms = float(np.sqrt(np.mean(np.square(raw_diff))))
+    filt_rms = float(np.sqrt(np.mean(np.square(filt_diff))))
+
+    assert raw_rms > 100.0
+    assert filt_rms < 0.35 * raw_rms

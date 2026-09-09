@@ -1,0 +1,272 @@
+name: Z2 audit fix targeted production validation
+
+on:
+  push:
+    branches:
+      - fix-z2-river-seam-audits
+    paths:
+      - '.github/workflows/z2-audit-fix-targeted.yml'
+      - 'src/worldgen/ultrares.py'
+      - 'src/worldgen/local_geomorphology.py'
+      - 'src/worldgen/local_hydrology.py'
+      - 'tests/test_ultrares.py'
+      - 'tests/test_local_hydrology.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: z2-audit-fix-targeted-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MPLBACKEND: Agg
+  WORLDGEN_DISTANCE_CACHE_MB: '128'
+  OMP_NUM_THREADS: '1'
+  OPENBLAS_NUM_THREADS: '1'
+  MKL_NUM_THREADS: '1'
+  NUMEXPR_MAX_THREADS: '1'
+  NUMBA_CACHE_DIR: ${{ github.workspace }}/.numba-cache
+  SEED: '2026090707'
+  ROOT: output/earthlike-ultrares-2026090707
+
+jobs:
+  targeted:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install production stack
+        run: |
+          set -euxo pipefail
+          python -m pip install --disable-pip-version-check -e '.[performance,jit,storage,thermodynamics,render,dev]'
+          python -m pip check
+      - name: Restore preserved compact source authority from failed production
+        uses: actions/download-artifact@v4
+        with:
+          name: earthlike-ultrares-source-2026090707
+          path: ${{ env.ROOT }}
+          github-token: ${{ github.token }}
+          run-id: 34353489700
+      - name: Regenerate measured river problem tile
+        shell: bash
+        run: |
+          set -euxo pipefail
+          /usr/bin/time -v python scripts/run_ultrares_earth.py "$ROOT" \
+            --mode shard \
+            --no-compact \
+            --workers 2 \
+            --tile-size 1024 \
+            --base-multiplier 4 \
+            --subsection-multiplier 2 \
+            --min-samples-per-wavelength 4 \
+            --terrain-detail-strength 1.15 \
+            --shard-index 55 \
+            --shard-count 96 \
+            2>&1 | tee "$ROOT/targeted-tile-55.log"
+      - name: Validate river outlier immediately
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          from worldgen.planet_tiles import TileKey, TilePyramidSpec
+          from worldgen.ultrares import UltraResolutionTilePyramid
+
+          root = Path(os.environ["ROOT"])
+          pyramid = UltraResolutionTilePyramid(
+              root,
+              spec=TilePyramidSpec(
+                  tile_size=1024,
+                  elevation_detail_strength=1.15,
+                  detail_hurst_exponent=0.65,
+                  detail_harmonics=1,
+                  maximum_level=12,
+              ),
+          )
+          key = TileKey("ny", 2, 3, 1)
+          p = (
+              pyramid.root / "derived" / "local_geomorphology_v1" / "metadata"
+              / "z02" / "ny" / "x00000003" / "y00000001.json"
+          )
+          meta = json.loads(p.read_text(encoding="utf-8"))
+          routing = meta["final_routing_metrics"]
+          report = {
+              "river_problem_tile": {
+                  "key": "ny/z2/x3/y1",
+                  "max_straight_run_cells": int(
+                      routing["max_straight_run_cells"]
+                  ),
+                  "max_straight_run_distance_m": routing.get(
+                      "max_straight_run_distance_m"
+                  ),
+                  "max_straight_run_direction_code": routing.get(
+                      "max_straight_run_direction_code"
+                  ),
+                  "max_straight_run_start_yx": routing.get(
+                      "max_straight_run_start_yx"
+                  ),
+                  "max_straight_run_end_yx": routing.get(
+                      "max_straight_run_end_yx"
+                  ),
+                  "max_straight_run_downhill_alternatives": routing.get(
+                      "max_straight_run_downhill_alternatives"
+                  ),
+                  "turn_fraction_gt10deg": float(
+                      routing["stream_turn_fraction_gt10deg"]
+                  ),
+                  "median_sinuosity": routing["median_sampled_sinuosity"],
+                  "adaptive_meander_attempt": meta.get(
+                      "adaptive_meander_attempt"
+                  ),
+                  "adaptive_meander_min_wavelength_m": meta.get(
+                      "adaptive_meander_min_wavelength_m"
+                  ),
+                  "routing_candidate_metrics": meta.get(
+                      "routing_candidate_metrics"
+                  ),
+                  "pre_channel_routing_metrics": meta.get(
+                      "pre_channel_routing_metrics"
+                  ),
+                  "pre_channel_adaptive_meander_attempt": meta.get(
+                      "pre_channel_adaptive_meander_attempt"
+                  ),
+                  "pre_channel_routing_candidate_metrics": meta.get(
+                      "pre_channel_routing_candidate_metrics"
+                  ),
+              },
+          }
+          out = root / "targeted-z2-fix-validation.json"
+          out.write_text(
+              json.dumps(report, indent=2, sort_keys=True),
+              encoding="utf-8",
+          )
+          print(json.dumps(report, indent=2, sort_keys=True))
+          assert report["river_problem_tile"]["max_straight_run_cells"] <= 220, report
+          PY
+      - name: Regenerate measured seam problem tiles
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # 73,74 = pz/z2/x1/y2 -> x2/y2
+          # 85,89 = nz/z2/x1/y1 -> x1/y2
+          for ordinal in 73 74 85 89; do
+            /usr/bin/time -v python scripts/run_ultrares_earth.py "$ROOT" \
+              --mode shard \
+              --no-compact \
+              --workers 2 \
+              --tile-size 1024 \
+              --base-multiplier 4 \
+              --subsection-multiplier 2 \
+              --min-samples-per-wavelength 4 \
+              --terrain-detail-strength 1.15 \
+              --shard-index "$ordinal" \
+              --shard-count 96 \
+              2>&1 | tee "$ROOT/targeted-tile-${ordinal}.log"
+          done
+      - name: Validate measured seam failure locations
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          import numpy as np
+
+          from worldgen.planet_tiles import TileKey, TilePyramidSpec
+          from worldgen.ultrares import (
+              UltraResolutionTilePyramid,
+              _geomorph_path,
+          )
+
+          root = Path(os.environ["ROOT"])
+          pyramid = UltraResolutionTilePyramid(
+              root,
+              spec=TilePyramidSpec(
+                  tile_size=1024,
+                  elevation_detail_strength=1.15,
+                  detail_hurst_exponent=0.65,
+                  detail_harmonics=1,
+                  maximum_level=12,
+              ),
+          )
+
+          def elevation(key):
+              return np.asarray(
+                  np.load(
+                      _geomorph_path(pyramid, key, "elevation_m"),
+                      mmap_mode="r",
+                      allow_pickle=False,
+                  ),
+                  dtype=np.float64,
+              )
+
+          def y_seam(a_key, b_key):
+              a, b = elevation(a_key), elevation(b_key)
+              value_max = float(np.max(np.abs(a[-1, :] - b[0, :])))
+              diff = (a[-1, :] - a[-2, :]) - (b[1, :] - b[0, :])
+              return (
+                  value_max,
+                  float(np.sqrt(np.mean(np.square(diff)))),
+                  float(np.max(np.abs(diff))),
+              )
+
+          def x_seam(a_key, b_key):
+              a, b = elevation(a_key), elevation(b_key)
+              value_max = float(np.max(np.abs(a[:, -1] - b[:, 0])))
+              diff = (a[:, -1] - a[:, -2]) - (b[:, 1] - b[:, 0])
+              return (
+                  value_max,
+                  float(np.sqrt(np.mean(np.square(diff)))),
+                  float(np.max(np.abs(diff))),
+              )
+
+          nz = y_seam(
+              TileKey("nz", 2, 1, 1),
+              TileKey("nz", 2, 1, 2),
+          )
+          pz = x_seam(
+              TileKey("pz", 2, 1, 2),
+              TileKey("pz", 2, 2, 2),
+          )
+          out = root / "targeted-z2-fix-validation.json"
+          report = json.loads(out.read_text(encoding="utf-8"))
+          report["worst_observed_nz_seam_retest"] = {
+              "value_max_abs_m": nz[0],
+              "derivative_rms_m": nz[1],
+              "derivative_max_abs_m": nz[2],
+          }
+          report["high_observed_pz_seam_retest"] = {
+              "value_max_abs_m": pz[0],
+              "derivative_rms_m": pz[1],
+              "derivative_max_abs_m": pz[2],
+          }
+          out.write_text(
+              json.dumps(report, indent=2, sort_keys=True),
+              encoding="utf-8",
+          )
+          print(json.dumps(report, indent=2, sort_keys=True))
+          assert nz[0] <= 1.0e-5 and pz[0] <= 1.0e-5, report
+          assert nz[1] <= 80.0, report
+          assert pz[1] <= 80.0, report
+          PY
+      - name: Upload targeted validation diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: z2-audit-fix-targeted-validation
+          retention-days: 14
+          compression-level: 6
+          if-no-files-found: warn
+          path: |
+            ${{ env.ROOT }}/targeted-z2-fix-validation.json
+            ${{ env.ROOT }}/targeted-tile-*.log
+            ${{ env.ROOT }}/ultrares/telemetry/

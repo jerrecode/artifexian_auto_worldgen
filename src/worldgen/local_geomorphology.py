@@ -24,6 +24,9 @@ from scipy import ndimage
 
 from .local_hydrology import LocalHydrologySolver, _sample_area_km2
 from .local_orography import edge_anchor_taper, terrain_frame
+LOCAL_GEOMORPHOLOGY_ALGORITHM_REVISION = "metric-source-local-bend-routing-v6"
+
+
 from .planet_tiles import (
     PlanetTilePyramid,
     TileKey,
@@ -279,6 +282,24 @@ class LocalGeomorphologySolver:
         meta = self._metadata_path(key)
         if not meta.exists() or not all(path.exists() for path in paths.values()):
             return None
+        try:
+            metadata = json.loads(meta.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return None
+        if metadata.get("key") != asdict(key):
+            return None
+        if metadata.get("source_sha256") != self.pyramid._source_hash():
+            return None
+        if metadata.get("spec") != asdict(self.spec):
+            return None
+        if metadata.get("authority_sampling_revision") != getattr(
+            self.pyramid,
+            "authority_sampling_revision",
+            "legacy",
+        ):
+            return None
+        if metadata.get("algorithm_revision") != LOCAL_GEOMORPHOLOGY_ALGORITHM_REVISION:
+            return None
         return LocalGeomorphologyResult(
             elevation_m=np.load(paths["elevation_m"], mmap_mode="r", allow_pickle=False),
             erosion_m=np.load(paths["erosion_m"], mmap_mode="r", allow_pickle=False),
@@ -294,7 +315,7 @@ class LocalGeomorphologySolver:
             final_flow_direction_d16=np.load(paths["final_flow_direction_d16"], mmap_mode="r", allow_pickle=False),
             final_meander_potential=np.load(paths["final_meander_potential"], mmap_mode="r", allow_pickle=False),
             major_river_constraint=np.load(paths["major_river_constraint"], mmap_mode="r", allow_pickle=False),
-            metadata=json.loads(meta.read_text(encoding="utf-8")),
+            metadata=metadata,
         )
 
     def solve(self, key: TileKey) -> LocalGeomorphologyResult:
@@ -616,6 +637,12 @@ class LocalGeomorphologySolver:
             "schema_version": 2,
             "key": asdict(key),
             "source_sha256": self.pyramid._source_hash(),
+            "authority_sampling_revision": getattr(
+                self.pyramid,
+                "authority_sampling_revision",
+                "legacy",
+            ),
+            "algorithm_revision": LOCAL_GEOMORPHOLOGY_ALGORITHM_REVISION,
             "spec": asdict(cfg),
             "upstream": {
                 "hydrology": "local_hydrology_v1",
@@ -668,7 +695,25 @@ class LocalGeomorphologySolver:
             "combined_geomorphic_rms_m": float(
                 np.sqrt(np.mean(np.square(anchored - inherited_source)))
             ) if anchored.size else 0.0,
+            "pre_channel_routing_metrics": dict(
+                routed_before_channel.metadata.get("routing_metrics", {})
+            ),
+            "pre_channel_adaptive_meander_attempt": (
+                routed_before_channel.metadata.get("adaptive_meander_attempt")
+            ),
+            "pre_channel_routing_candidate_metrics": (
+                routed_before_channel.metadata.get("routing_candidate_metrics")
+            ),
             "final_routing_metrics": final_routing_metrics,
+            "adaptive_meander_attempt": final_hydro.metadata.get(
+                "adaptive_meander_attempt"
+            ),
+            "adaptive_meander_min_wavelength_m": final_hydro.metadata.get(
+                "adaptive_meander_min_wavelength_m"
+            ),
+            "routing_candidate_metrics": final_hydro.metadata.get(
+                "routing_candidate_metrics"
+            ),
             "final_stream_cells": int(
                 np.count_nonzero(np.asarray(final_hydro.streams))
             ),
@@ -701,6 +746,7 @@ class LocalGeomorphologySolver:
 
 
 __all__ = [
+    "LOCAL_GEOMORPHOLOGY_ALGORITHM_REVISION",
     "LocalGeomorphologyResult",
     "LocalGeomorphologySolver",
     "LocalGeomorphologySpec",

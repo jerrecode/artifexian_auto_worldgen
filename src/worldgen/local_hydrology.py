@@ -35,9 +35,12 @@ from .planet_tiles import (
     TileGeometry,
     TileKey,
     _cube_direction,
+    approximate_meters_per_sample,
     tile_geometry,
 )
 
+
+LOCAL_HYDROLOGY_ALGORITHM_REVISION = "competitive-flat-d16-routing-v4"
 
 _D8 = (
     (-1, -1),
@@ -101,8 +104,8 @@ class LocalHydrologySpec:
     priority_flood_epsilon_m: float = 0.01
     stream_quantile: float = 0.985
     fallback_runoff_base_fraction: float = 0.24
-    meander_strength: float = 0.78
-    meander_max_turn_deg: float = 55.0
+    meander_strength: float = 0.84
+    meander_max_turn_deg: float = 62.0
     meander_slope_scale: float = 0.012
     meander_discharge_power: float = 0.65
     major_river_corridor_cells: int = 7
@@ -507,6 +510,10 @@ def _flow_d16_open(
     *,
     preferred_angle_rad: np.ndarray | None = None,
     steering_weight: np.ndarray | None = None,
+    steering_score_floor: float = 0.10,
+    competitive_slope_fraction: float | None = None,
+    reference_max_slope: np.ndarray | None = None,
+    competitive_alignment_weight: float = 0.90,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Steepest-descent routing on a 16-direction queen+knight stencil.
 
@@ -515,6 +522,12 @@ def _flow_d16_open(
     below the source elevation, preventing the router from jumping across a ridge.
     Optional steering rotates the preferred direction on low-gradient, high-
     discharge reaches while every receiver remains strictly downhill.
+
+    Corrective routing may additionally restrict selection to a competitive set
+    of directions whose downhill slope is within a configured fraction of the
+    unsteered local maximum. Within that near-tie set, smooth angular preference
+    becomes the primary de-locking criterion. This targets Priority-Flood flats
+    without sacrificing steepest descent where alternatives are materially worse.
     """
     z = np.asarray(filled_elevation_m, dtype=np.float64)
     oc = np.asarray(ocean, dtype=bool)
@@ -536,6 +549,41 @@ def _flow_d16_open(
         raise ValueError("preferred_angle_rad must match elevation")
     if steer.shape != z.shape:
         raise ValueError("steering_weight must match elevation")
+    score_floor = float(steering_score_floor)
+    if not math.isfinite(score_floor) or not 0.0 <= score_floor <= 1.0:
+        raise ValueError("steering_score_floor must be finite and in [0,1]")
+    competitive_fraction = (
+        None
+        if competitive_slope_fraction is None
+        else float(competitive_slope_fraction)
+    )
+    if competitive_fraction is not None and not (
+        math.isfinite(competitive_fraction)
+        and 0.0 < competitive_fraction <= 1.0
+    ):
+        raise ValueError(
+            "competitive_slope_fraction must be finite and in (0,1]"
+        )
+    reference = (
+        None
+        if reference_max_slope is None
+        else np.asarray(reference_max_slope, dtype=np.float64)
+    )
+    if competitive_fraction is not None:
+        if reference is None or reference.shape != z.shape:
+            raise ValueError(
+                "reference_max_slope matching elevation is required for "
+                "competitive slope selection"
+            )
+        if preferred is None:
+            raise ValueError(
+                "preferred_angle_rad is required for competitive slope selection"
+            )
+    align_weight = float(competitive_alignment_weight)
+    if not math.isfinite(align_weight) or not 0.0 <= align_weight <= 1.0:
+        raise ValueError(
+            "competitive_alignment_weight must be finite and in [0,1]"
+        )
 
     best_score = np.zeros((h, w), dtype=np.float64)
     best_slope = np.zeros((h, w), dtype=np.float64)
@@ -577,6 +625,18 @@ def _flow_d16_open(
             corridor_limit = source - 0.015 * np.maximum(source - target, 0.0)
             valid &= corridor <= corridor_limit + 1.0e-8
 
+        reference_view = None
+        if competitive_fraction is not None:
+            reference_view = reference[sy0:sy1, sx0:sx1]
+            # The unsteered maximum is always part of this set. Directions with
+            # materially smaller descent are excluded, so steering cannot force a
+            # channel across the local relief merely to create curvature.
+            valid &= slope >= (
+                competitive_fraction
+                * np.maximum(reference_view, 0.0)
+                - 1.0e-15
+            )
+
         score = np.where(valid, slope, 0.0)
         if preferred is not None:
             delta = np.angle(
@@ -590,8 +650,37 @@ def _flow_d16_open(
             )
             alignment = np.square(0.5 + 0.5 * np.cos(delta))
             sw = steer[sy0:sy1, sx0:sx1]
-            directional = (1.0 - sw) + sw * (0.10 + 0.90 * alignment)
-            score *= directional
+            aligned = score_floor + (1.0 - score_floor) * alignment
+
+            if competitive_fraction is None:
+                directional = (1.0 - sw) + sw * aligned
+                score *= directional
+            else:
+                # In a near-tie set the raw slope differences mostly represent
+                # raster quantization of an almost-flat hydrologic surface. Blend
+                # normalized descent with angular preference, making alignment
+                # dominant only where meander steering is physically active.
+                relative = np.divide(
+                    slope,
+                    np.maximum(reference_view, 1.0e-30),
+                    out=np.zeros_like(slope),
+                    where=reference_view > 0.0,
+                )
+                local_alignment_weight = np.clip(
+                    align_weight
+                    * (0.35 + 0.65 * np.sqrt(sw)),
+                    0.0,
+                    1.0,
+                )
+                priority = (
+                    (1.0 - local_alignment_weight) * relative
+                    + local_alignment_weight * aligned
+                )
+                score = np.where(
+                    valid,
+                    np.maximum(reference_view, 0.0) * priority,
+                    0.0,
+                )
 
         view_best = best_score[sy0:sy1, sx0:sx1]
         better = score > view_best
@@ -646,35 +735,103 @@ def _meander_phase(
     discharge_index: np.ndarray,
     *,
     seed: int,
+    variant: int = 0,
+    minimum_wavelength_m: float = 0.0,
 ) -> np.ndarray:
-    """Absolute-coordinate meander phase with discharge-scaled wavelength."""
+    """Absolute-coordinate, scale-aware meander preference field.
+
+    Variant 0 preserves the historical long-wave field. Variants 1 and 2 add
+    independent shorter-wave components used only by corrective routing. The
+    fields remain globally deterministic and seamless; the corrective D16 selector
+    decides among genuinely competitive downhill receivers rather than changing
+    the terrain or permitting uphill flow.
+    """
     unit = np.asarray(xyz, dtype=np.float64)
     q = np.clip(np.asarray(discharge_index, dtype=np.float64), 0.0, 1.0)
     rng = np.random.default_rng(int(seed) ^ 0x4D45414E44455232)
-    axis = rng.normal(size=3)
-    axis /= max(float(np.linalg.norm(axis)), 1.0e-15)
-    tangent = axis - np.sum(unit * axis, axis=-1, keepdims=True) * unit
-    norm = np.linalg.norm(tangent, axis=-1, keepdims=True)
-    fallback_axis = np.array([0.0, 0.0, 1.0])
-    fallback = fallback_axis - (
-        np.sum(unit * fallback_axis, axis=-1, keepdims=True) * unit
-    )
-    tangent = np.where(norm > 1.0e-10, tangent, fallback)
-    tangent /= np.maximum(
-        np.linalg.norm(tangent, axis=-1, keepdims=True), 1.0e-12
-    )
-    wavelength_km = 18.0 + 165.0 * np.power(q, 0.72)
-    _cosine, sine, coherence = phase_cell_octave_xyz(
+
+    def tangent_from_axis(axis: np.ndarray) -> np.ndarray:
+        axis = np.asarray(axis, dtype=np.float64)
+        axis /= max(float(np.linalg.norm(axis)), 1.0e-15)
+        tangent = axis - np.sum(unit * axis, axis=-1, keepdims=True) * unit
+        norm = np.linalg.norm(tangent, axis=-1, keepdims=True)
+        fallback_axis = np.array([0.0, 0.0, 1.0])
+        fallback = fallback_axis - (
+            np.sum(unit * fallback_axis, axis=-1, keepdims=True) * unit
+        )
+        tangent = np.where(norm > 1.0e-10, tangent, fallback)
+        tangent /= np.maximum(
+            np.linalg.norm(tangent, axis=-1, keepdims=True),
+            1.0e-12,
+        )
+        return tangent
+
+    tangent0 = tangent_from_axis(rng.normal(size=3))
+    wavelength0_km = 18.0 + 165.0 * np.power(q, 0.72)
+    _c0, s0, coh0 = phase_cell_octave_xyz(
         unit,
         float(radius_m) / 1000.0,
-        wavelength_km,
-        tangent,
+        wavelength0_km,
+        tangent0,
         cell_scale=0.82,
         seed=int(seed) ^ 0x6D65616E,
         octave=31,
     )
-    return np.asarray(sine * coherence, dtype=np.float64)
+    primary = np.asarray(s0 * coh0, dtype=np.float64)
+    if int(variant) <= 0:
+        return primary
 
+    tangent1 = tangent_from_axis(rng.normal(size=3))
+    wavelength_floor_km = max(float(minimum_wavelength_m), 0.0) / 1000.0
+    wavelength1_km = np.maximum(
+        (
+            (7.0 + 58.0 * np.power(q, 0.62))
+            if int(variant) == 1
+            else (4.5 + 34.0 * np.power(q, 0.58))
+        ),
+        wavelength_floor_km,
+    )
+    _c1, s1, coh1 = phase_cell_octave_xyz(
+        unit,
+        float(radius_m) / 1000.0,
+        wavelength1_km,
+        tangent1,
+        cell_scale=0.70 if int(variant) == 1 else 0.62,
+        seed=(
+            int(seed)
+            ^ 0x73686F7274776176
+            ^ (int(variant) * 0x9E3779B1)
+        ),
+        octave=41 + int(variant),
+    )
+    short = np.asarray(s1 * coh1, dtype=np.float64)
+    if int(variant) == 1:
+        return np.clip(
+            0.55 * primary + 0.80 * short,
+            -1.0,
+            1.0,
+        )
+
+    tangent2 = tangent_from_axis(rng.normal(size=3))
+    wavelength2_km = np.maximum(
+        3.5 + 20.0 * np.power(q, 0.52),
+        wavelength_floor_km,
+    )
+    _c2, s2, coh2 = phase_cell_octave_xyz(
+        unit,
+        float(radius_m) / 1000.0,
+        wavelength2_km,
+        tangent2,
+        cell_scale=0.58,
+        seed=int(seed) ^ 0x6D6963726F6D6561,
+        octave=53,
+    )
+    micro = np.asarray(s2 * coh2, dtype=np.float64)
+    return np.clip(
+        0.35 * primary + 0.72 * short + 0.48 * micro,
+        -1.0,
+        1.0,
+    )
 
 def _major_river_guide(
     inherited_major_river: np.ndarray,
@@ -729,7 +886,8 @@ def _routing_metrics(
     radius_m: float,
     *,
     active_mask: np.ndarray | None = None,
-) -> dict[str, float | int | None]:
+    routing_surface_m: np.ndarray | None = None,
+) -> dict[str, object]:
     receiver = np.asarray(receiver_flat, dtype=np.int64)
     code = np.asarray(code16, dtype=np.int16).ravel()
     stream = np.asarray(streams, dtype=bool).ravel()
@@ -753,6 +911,13 @@ def _routing_metrics(
             "stream_transition_count": 0,
             "stream_turn_fraction_gt10deg": 0.0,
             "max_straight_run_cells": 0,
+            "max_straight_run_direction_code": None,
+            "max_straight_run_start_flat": None,
+            "max_straight_run_end_flat": None,
+            "max_straight_run_start_yx": None,
+            "max_straight_run_end_yx": None,
+            "max_straight_run_distance_m": 0.0,
+            "max_straight_run_downhill_alternatives": None,
             "median_sampled_sinuosity": None,
         }
 
@@ -780,6 +945,9 @@ def _routing_metrics(
         turn_fraction = 0.0
 
     max_straight = 0
+    max_straight_start: int | None = None
+    max_straight_end: int | None = None
+    max_straight_direction: int | None = None
     for start in nodes.tolist():
         direction = int(code[start])
         cur = int(start)
@@ -797,7 +965,143 @@ def _routing_metrics(
             cur = target
             if int(code[cur]) != direction:
                 break
-        max_straight = max(max_straight, run)
+        if run > max_straight:
+            max_straight = run
+            max_straight_start = int(start)
+            max_straight_end = int(cur)
+            max_straight_direction = int(direction)
+
+    max_straight_distance_m = 0.0
+    if max_straight_start is not None and max_straight > 0:
+        cur = int(max_straight_start)
+        for _ in range(int(max_straight)):
+            target = int(receiver[cur])
+            if target < 0 or target >= stream.size:
+                break
+            max_straight_distance_m += float(
+                _great_circle_distance_m(
+                    unit[cur][None, :],
+                    unit[target][None, :],
+                    radius_m,
+                )[0]
+            )
+            cur = target
+
+    downhill_alternatives: dict[str, object] | None = None
+    if (
+        routing_surface_m is not None
+        and max_straight_start is not None
+        and max_straight_direction is not None
+        and max_straight > 0
+    ):
+        surface = np.asarray(routing_surface_m, dtype=np.float64)
+        stream_shape = np.asarray(streams).shape
+        if surface.shape != stream_shape:
+            raise ValueError("routing_surface_m must match streams")
+        h, w = surface.shape
+        alt_counts: list[int] = []
+        best_ratios: list[float] = []
+        current_slopes: list[float] = []
+        cur = int(max_straight_start)
+        for _ in range(int(max_straight)):
+            y, x = divmod(cur, w)
+            target = int(receiver[cur])
+            if target < 0 or target >= stream.size:
+                break
+            ty, tx = divmod(target, w)
+            current_distance = float(
+                _great_circle_distance_m(
+                    unit[cur][None, :],
+                    unit[target][None, :],
+                    radius_m,
+                )[0]
+            )
+            current_slope = (
+                float(surface[y, x] - surface[ty, tx])
+                / max(current_distance, 1.0e-6)
+            )
+            current_slopes.append(current_slope)
+            alternatives: list[float] = []
+            for direction, (dy, dx) in enumerate(_D16):
+                if direction == int(max_straight_direction):
+                    continue
+                ny, nx = y + int(dy), x + int(dx)
+                if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                    continue
+                distance = float(
+                    _great_circle_distance_m(
+                        unit[cur][None, :],
+                        unit[ny * w + nx][None, :],
+                        radius_m,
+                    )[0]
+                )
+                slope = (
+                    float(surface[y, x] - surface[ny, nx])
+                    / max(distance, 1.0e-6)
+                )
+                if slope <= 0.0:
+                    continue
+                if max(abs(int(dy)), abs(int(dx))) > 1:
+                    sdy = int(np.sign(dy))
+                    sdx = int(np.sign(dx))
+                    if abs(int(dy)) == 2:
+                        mid_a = float(surface[y + sdy, x])
+                        mid_b = float(surface[y + sdy, x + sdx])
+                    else:
+                        mid_a = float(surface[y, x + sdx])
+                        mid_b = float(surface[y + sdy, x + sdx])
+                    corridor = min(mid_a, mid_b)
+                    source = float(surface[y, x])
+                    candidate = float(surface[ny, nx])
+                    corridor_limit = source - 0.015 * max(
+                        source - candidate, 0.0
+                    )
+                    if corridor > corridor_limit + 1.0e-8:
+                        continue
+                alternatives.append(float(slope))
+            alt_counts.append(len(alternatives))
+            best_alt = max(alternatives) if alternatives else 0.0
+            best_ratios.append(
+                best_alt / max(current_slope, 1.0e-30)
+                if current_slope > 0.0
+                else 0.0
+            )
+            cur = target
+
+        ratios = np.asarray(best_ratios, dtype=np.float64)
+        counts = np.asarray(alt_counts, dtype=np.int64)
+        slopes = np.asarray(current_slopes, dtype=np.float64)
+        downhill_alternatives = {
+            "samples": int(counts.size),
+            "cells_with_any_alternative": int(np.count_nonzero(counts > 0)),
+            "fraction_with_any_alternative": (
+                float(np.mean(counts > 0)) if counts.size else 0.0
+            ),
+            "median_alternative_count": (
+                float(np.median(counts)) if counts.size else 0.0
+            ),
+            "max_alternative_count": (
+                int(np.max(counts)) if counts.size else 0
+            ),
+            "median_best_alternative_to_current_slope_ratio": (
+                float(np.median(ratios)) if ratios.size else 0.0
+            ),
+            "p90_best_alternative_to_current_slope_ratio": (
+                float(np.quantile(ratios, 0.90)) if ratios.size else 0.0
+            ),
+            "fraction_best_alternative_ratio_ge_0_02": (
+                float(np.mean(ratios >= 0.02)) if ratios.size else 0.0
+            ),
+            "fraction_best_alternative_ratio_ge_0_05": (
+                float(np.mean(ratios >= 0.05)) if ratios.size else 0.0
+            ),
+            "fraction_best_alternative_ratio_ge_0_10": (
+                float(np.mean(ratios >= 0.10)) if ratios.size else 0.0
+            ),
+            "median_current_slope": (
+                float(np.median(slopes)) if slopes.size else 0.0
+            ),
+        }
 
     candidates = nodes[np.argsort(q[nodes], kind="stable")[-min(160, len(nodes)):]]
     sinuosity: list[float] = []
@@ -843,10 +1147,114 @@ def _routing_metrics(
         "stream_transition_count": transition_count,
         "stream_turn_fraction_gt10deg": turn_fraction,
         "max_straight_run_cells": int(max_straight),
+        "max_straight_run_direction_code": max_straight_direction,
+        "max_straight_run_start_flat": max_straight_start,
+        "max_straight_run_end_flat": max_straight_end,
+        "max_straight_run_start_yx": (
+            None
+            if max_straight_start is None
+            else [
+                int(max_straight_start // np.asarray(streams).shape[1]),
+                int(max_straight_start % np.asarray(streams).shape[1]),
+            ]
+        ),
+        "max_straight_run_end_yx": (
+            None
+            if max_straight_end is None
+            else [
+                int(max_straight_end // np.asarray(streams).shape[1]),
+                int(max_straight_end % np.asarray(streams).shape[1]),
+            ]
+        ),
+        "max_straight_run_distance_m": float(max_straight_distance_m),
+        "max_straight_run_downhill_alternatives": downhill_alternatives,
         "median_sampled_sinuosity": (
             float(np.median(sinuosity)) if sinuosity else None
         ),
     }
+
+
+def _straight_reach_bend_fields(
+    receiver_flat: np.ndarray,
+    code16: np.ndarray,
+    routing_metrics: Mapping[str, object],
+    *,
+    bend_sign: float,
+    target_max_run_cells: int = 220,
+    corridor_cells: float = 5.0,
+) -> tuple[np.ndarray, np.ndarray, dict[str, object]] | None:
+    """Build a smooth local steering bend around an over-long straight reach."""
+    code = np.asarray(code16, dtype=np.int16)
+    if code.ndim != 2:
+        raise ValueError("code16 must be 2-D")
+    receiver = np.asarray(receiver_flat, dtype=np.int64).ravel()
+    h, w = code.shape
+    run = int(routing_metrics.get("max_straight_run_cells", 0) or 0)
+    start = routing_metrics.get("max_straight_run_start_flat")
+    if run <= int(target_max_run_cells) or start is None:
+        return None
+    start = int(start)
+    if start < 0 or start >= receiver.size:
+        return None
+
+    chain: list[int] = [start]
+    cur = start
+    for _ in range(run):
+        target = int(receiver[cur])
+        if target < 0 or target >= receiver.size:
+            break
+        chain.append(target)
+        cur = target
+    if len(chain) < 5:
+        return None
+
+    excess = max(run - int(target_max_run_cells), 1)
+    half_span = int(np.clip(24 + excess // 3, 28, 72))
+    centre = (len(chain) - 1) // 2
+    lo = max(0, centre - half_span)
+    hi = min(len(chain) - 1, centre + half_span)
+    if hi - lo < 12:
+        return None
+
+    spine = np.zeros((h, w), dtype=bool)
+    offset = np.zeros((h, w), dtype=np.float64)
+    strength = np.zeros((h, w), dtype=np.float64)
+    max_turn_rad = math.radians(62.0)
+    sign = 1.0 if float(bend_sign) >= 0.0 else -1.0
+
+    for j in range(lo, hi + 1):
+        flat = int(chain[j])
+        y, x = divmod(flat, w)
+        t = (j - lo) / max(hi - lo, 1)
+        envelope = math.sin(math.pi * t)
+        spine[y, x] = True
+        offset[y, x] = sign * max_turn_rad * envelope
+        strength[y, x] = 0.995 * envelope * envelope
+
+    distance, nearest = ndimage.distance_transform_edt(
+        ~spine,
+        return_indices=True,
+    )
+    nearest_offset = offset[nearest[0], nearest[1]]
+    nearest_strength = strength[nearest[0], nearest[1]]
+    sigma = max(float(corridor_cells) * 0.45, 1.0)
+    decay = np.exp(-0.5 * np.square(distance / sigma))
+    active = distance <= float(corridor_cells)
+    bend_offset = np.where(active, nearest_offset * decay, 0.0)
+    bend_strength = np.where(active, nearest_strength * decay, 0.0)
+    info = {
+        "source_run_cells": int(run),
+        "source_run_start_flat": int(start),
+        "chain_samples": int(len(chain)),
+        "bend_chain_index_range": [int(lo), int(hi)],
+        "bend_sign": int(sign),
+        "maximum_preferred_turn_deg": 62.0,
+        "corridor_cells": float(corridor_cells),
+        "active_corridor_cells": int(
+            np.count_nonzero(bend_strength > 1.0e-6)
+        ),
+    }
+    return bend_offset, bend_strength, info
 
 
 def _sample_area_km2(xyz: np.ndarray, radius_m: float) -> np.ndarray:
@@ -999,7 +1407,21 @@ class LocalHydrologySolver:
         meta_path = self._metadata_path(key)
         if not meta_path.exists() or not all(path.exists() for path in paths.values()):
             return None
-        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        try:
+            metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return None
+        if metadata.get("key") != asdict(key):
+            return None
+        if metadata.get("source_sha256") != self.pyramid._source_hash():
+            return None
+        if metadata.get("spec") != asdict(self.spec):
+            return None
+        if (
+            metadata.get("algorithm_revision")
+            != LOCAL_HYDROLOGY_ALGORITHM_REVISION
+        ):
+            return None
         arrays = {
             name: np.load(path, mmap_mode="r", allow_pickle=False)
             for name, path in paths.items()
@@ -1115,85 +1537,235 @@ class LocalHydrologySolver:
         )
         local0 = _normalize_log(discharge0, ~ocean)
         base_angle = _flow_angles(code0)
-        phase = _meander_phase(
-            geom.xyz,
+        parent_discharge = self._parent_discharge_patch(geom)
+        sample_m = approximate_meters_per_sample(
             self.pyramid.planet_radius_m,
-            local0,
-            seed=int(self.pyramid._read_seed()),
+            key.level,
+            self.pyramid.spec.tile_size,
         )
-        meander = (
-            float(cfg.meander_strength)
-            * np.power(np.clip(local0, 0.0, 1.0), float(cfg.meander_discharge_power))
-            * np.exp(
+        corrective_min_wavelength_m = 4.5 * sample_m
+
+        def route_candidate(
+            attempt: int,
+            *,
+            lock_reference: dict[str, object] | None = None,
+            bend_sign: float = 1.0,
+        ):
+            phase_variant = min(int(attempt), 2)
+            phase = _meander_phase(
+                geom.xyz,
+                self.pyramid.planet_radius_m,
+                local0,
+                seed=int(self.pyramid._read_seed()),
+                variant=phase_variant,
+                minimum_wavelength_m=(
+                    corrective_min_wavelength_m if attempt > 0 else 0.0
+                ),
+            )
+            slope_factor = np.exp(
                 -np.maximum(best_slope0, 0.0)
                 / max(float(cfg.meander_slope_scale), 1.0e-12)
             )
-            * (~ocean)
-        )
-        # Major-river corridors permit a little more lateral migration because
-        # kilometre-scale alluvial channels are not expected to occupy the exact
-        # coarse parent-raster centreline.
-        meander *= 0.82 + 0.18 * guide
-        preferred = np.where(
-            np.isfinite(base_angle),
-            base_angle
-            + np.deg2rad(float(cfg.meander_max_turn_deg)) * phase * meander,
-            0.0,
-        )
-
-        receiver, code16, _best_slope = _flow_d16_open(
-            filled,
-            ocean,
-            geom.xyz,
-            self.pyramid.planet_radius_m,
-            preferred_angle_rad=preferred,
-            steering_weight=meander,
-        )
-        drainage, discharge = _accumulate_open(
-            filled, receiver, runoff, area, ocean
-        )
-        local_discharge = _normalize_log(discharge, ~ocean)
-
-        parent_discharge = self._parent_discharge_patch(geom)
-        # Preserve continental topology as a soft discharge prior, but only where
-        # the locally routed terrain already carries water. This avoids stamping
-        # the straight low-resolution parent mask into the refined stream raster.
-        parent_support = (
-            parent_discharge
-            * guide
-            * (0.28 + 0.72 * np.sqrt(np.clip(local_discharge, 0.0, 1.0)))
-        )
-        channel_score = np.maximum(local_discharge, parent_support)
-        land_values = channel_score[~ocean]
-        if land_values.size:
-            threshold = float(np.quantile(land_values, cfg.stream_quantile))
-            streams = (~ocean) & (
-                channel_score >= max(threshold, 1.0e-12)
-            )
-        else:
-            threshold = 1.0
-            streams = np.zeros_like(ocean)
-
-        corridor = (guide >= 0.28) & (~ocean) & (parent_discharge >= 0.12)
-        if np.any(corridor):
-            routed = local_discharge[corridor]
-            if routed.size:
-                corridor_threshold = float(np.quantile(routed, 0.76))
-                streams |= corridor & (
-                    local_discharge >= max(corridor_threshold, 1.0e-12)
+            if attempt > 0:
+                # Only corrective attempts retain a modest high-discharge steering
+                # floor on steeper reaches. Strictly-downhill receiver selection is
+                # still enforced by _flow_d16_open.
+                floor = (
+                    (0.14 if attempt == 1 else 0.24)
+                    * np.power(np.clip(local0, 0.0, 1.0), 1.25)
                 )
+                slope_factor = np.maximum(slope_factor, floor)
 
-        streams = _connect_stream_knight_moves(streams, receiver, code16)
+            strength_scale = 1.0 if attempt == 0 else (1.18 if attempt == 1 else 1.38)
+            meander = (
+                strength_scale
+                * float(cfg.meander_strength)
+                * np.power(
+                    np.clip(local0, 0.0, 1.0),
+                    float(cfg.meander_discharge_power),
+                )
+                * slope_factor
+                * (~ocean)
+            )
+            meander *= 0.82 + 0.18 * guide
+            meander = np.clip(meander, 0.0, 1.0)
+
+            # Rotation amplitude is less strongly attenuated than the slope-score
+            # steering itself, allowing the preferred direction to cross D16
+            # quantization boundaries without permitting uphill flow.
+            turn_weight = np.sqrt(meander) if attempt > 0 else meander
+            preferred = np.where(
+                np.isfinite(base_angle),
+                base_angle
+                + np.deg2rad(float(cfg.meander_max_turn_deg))
+                * phase
+                * turn_weight,
+                0.0,
+            )
+
+            lock_info = None
+            if lock_reference is not None:
+                fields = _straight_reach_bend_fields(
+                    np.asarray(lock_reference["receiver"]),
+                    np.asarray(lock_reference["code16"]),
+                    lock_reference["metrics"],
+                    bend_sign=bend_sign,
+                )
+                if fields is not None:
+                    bend_offset, bend_strength, lock_info = fields
+                    reference_angle = _flow_angles(
+                        np.asarray(lock_reference["code16"])
+                    )
+                    target_angle = np.where(
+                        np.isfinite(reference_angle),
+                        reference_angle + bend_offset,
+                        preferred,
+                    )
+                    delta = np.angle(
+                        np.exp(1j * (target_angle - preferred))
+                    )
+                    preferred = preferred + bend_strength * delta
+                    meander = np.maximum(meander, bend_strength)
+
+            receiver, code16, _best_slope = _flow_d16_open(
+                filled,
+                ocean,
+                geom.xyz,
+                self.pyramid.planet_radius_m,
+                preferred_angle_rad=preferred,
+                steering_weight=meander,
+                steering_score_floor=(
+                    0.10 if attempt == 0
+                    else 0.045 if attempt == 1
+                    else 0.018
+                ),
+                competitive_slope_fraction=(
+                    None if attempt == 0
+                    else 0.90 if attempt == 1
+                    else 0.80
+                ),
+                reference_max_slope=(
+                    None if attempt == 0 else best_slope0
+                ),
+                competitive_alignment_weight=(
+                    0.0 if attempt == 0
+                    else 0.84 if attempt == 1
+                    else 0.96
+                ),
+            )
+            drainage, discharge = _accumulate_open(
+                filled, receiver, runoff, area, ocean
+            )
+            local_discharge = _normalize_log(discharge, ~ocean)
+
+            parent_support = (
+                parent_discharge
+                * guide
+                * (0.28 + 0.72 * np.sqrt(np.clip(local_discharge, 0.0, 1.0)))
+            )
+            channel_score = np.maximum(local_discharge, parent_support)
+            land_values = channel_score[~ocean]
+            if land_values.size:
+                threshold = float(np.quantile(land_values, cfg.stream_quantile))
+                streams = (~ocean) & (
+                    channel_score >= max(threshold, 1.0e-12)
+                )
+            else:
+                threshold = 1.0
+                streams = np.zeros_like(ocean)
+
+            corridor = (
+                (guide >= 0.28)
+                & (~ocean)
+                & (parent_discharge >= 0.12)
+            )
+            if np.any(corridor):
+                routed = local_discharge[corridor]
+                if routed.size:
+                    corridor_threshold = float(np.quantile(routed, 0.76))
+                    streams |= corridor & (
+                        local_discharge >= max(corridor_threshold, 1.0e-12)
+                    )
+
+            streams = _connect_stream_knight_moves(streams, receiver, code16)
+            metrics = _routing_metrics(
+                receiver,
+                code16,
+                streams,
+                local_discharge,
+                geom.xyz,
+                self.pyramid.planet_radius_m,
+                routing_surface_m=filled,
+            )
+            return {
+                "attempt": int(attempt),
+                "receiver": receiver,
+                "code16": code16,
+                "drainage": drainage,
+                "local_discharge": local_discharge,
+                "streams": streams,
+                "meander": meander,
+                "threshold": threshold,
+                "metrics": metrics,
+                "lock_breaker": lock_info,
+            }
+
+        candidates = [route_candidate(0)]
+        if int(candidates[0]["metrics"]["max_straight_run_cells"]) > 220:
+            candidates.append(route_candidate(1))
+        if min(
+            int(candidate["metrics"]["max_straight_run_cells"])
+            for candidate in candidates
+        ) > 220:
+            candidates.append(route_candidate(2))
+
+        def candidate_rank(candidate):
+            metrics = candidate["metrics"]
+            straight = int(metrics["max_straight_run_cells"])
+            turn = float(metrics["stream_turn_fraction_gt10deg"])
+            sinuosity = metrics["median_sampled_sinuosity"]
+            sinuosity_value = 1.0 if sinuosity is None else float(sinuosity)
+            return (straight, -turn, -sinuosity_value)
+
+        selected = min(candidates, key=candidate_rank)
+        if int(selected["metrics"]["max_straight_run_cells"]) > 220:
+            reference = selected
+            candidates.append(
+                route_candidate(
+                    3,
+                    lock_reference=reference,
+                    bend_sign=1.0,
+                )
+            )
+            selected = min(candidates, key=candidate_rank)
+        if int(selected["metrics"]["max_straight_run_cells"]) > 220:
+            reference = min(
+                [
+                    candidate
+                    for candidate in candidates
+                    if int(candidate["attempt"]) <= 2
+                ],
+                key=candidate_rank,
+            )
+            candidates.append(
+                route_candidate(
+                    4,
+                    lock_reference=reference,
+                    bend_sign=-1.0,
+                )
+            )
+            selected = min(candidates, key=candidate_rank)
+
+        receiver = selected["receiver"]
+        code16 = selected["code16"]
+        drainage = selected["drainage"]
+        local_discharge = selected["local_discharge"]
+        streams = selected["streams"]
+        meander = selected["meander"]
+        threshold = float(selected["threshold"])
+        metrics = selected["metrics"]
         code8 = _compat_d8_codes(code16)
         angle = _flow_angles(code16)
-        metrics = _routing_metrics(
-            receiver,
-            code16,
-            streams,
-            local_discharge,
-            geom.xyz,
-            self.pyramid.planet_radius_m,
-        )
         arrays = {
             "filled_elevation_m": np.asarray(filled, dtype=np.float32),
             "flow_direction_d8": np.asarray(code8, dtype=np.int8),
@@ -1213,6 +1785,48 @@ class LocalHydrologySolver:
             "inherited_major_river_cells": int(np.count_nonzero(inherited_river)),
             "local_stream_cells": int(np.count_nonzero(streams)),
             "routing_metrics": metrics,
+            "adaptive_meander_attempt": int(selected["attempt"]),
+            "adaptive_meander_min_wavelength_m": float(
+                corrective_min_wavelength_m
+            ),
+            "meander_selector_semantics": (
+                "corrective attempts select only near-tied strictly-downhill "
+                "D16 receivers. If a measured straight reach still exceeds 220 "
+                "cells, a smooth localized bend is applied around that receiver "
+                "chain in both possible directions; only the objectively best "
+                "rerouted network is retained."
+            ),
+            "routing_candidate_metrics": [
+                {
+                    "attempt": int(candidate["attempt"]),
+                    "max_straight_run_cells": int(
+                        candidate["metrics"]["max_straight_run_cells"]
+                    ),
+                    "stream_turn_fraction_gt10deg": float(
+                        candidate["metrics"]["stream_turn_fraction_gt10deg"]
+                    ),
+                    "median_sampled_sinuosity": candidate["metrics"][
+                        "median_sampled_sinuosity"
+                    ],
+                    "steering_score_floor": (
+                        0.10 if int(candidate["attempt"]) == 0
+                        else 0.045 if int(candidate["attempt"]) == 1
+                        else 0.018
+                    ),
+                    "competitive_slope_fraction": (
+                        None if int(candidate["attempt"]) == 0
+                        else 0.90 if int(candidate["attempt"]) == 1
+                        else 0.80
+                    ),
+                    "competitive_alignment_weight": (
+                        None if int(candidate["attempt"]) == 0
+                        else 0.84 if int(candidate["attempt"]) == 1
+                        else 0.96
+                    ),
+                    "lock_breaker": candidate.get("lock_breaker"),
+                }
+                for candidate in candidates
+            ],
             "flow_direction_semantics": {
                 "type": "D16 queen+knight direction code with low-gradient meander steering",
                 "codes": {
@@ -1275,6 +1889,10 @@ class LocalHydrologySolver:
             geom.xyz,
             self.pyramid.planet_radius_m,
             active_mask=core_mask,
+            routing_surface_m=np.asarray(
+                arrays_patch["filled_elevation_m"],
+                dtype=np.float64,
+            ),
         )
 
         arrays = {
@@ -1284,6 +1902,7 @@ class LocalHydrologySolver:
         metadata = {
             "schema_version": 3,
             "key": asdict(key),
+            "algorithm_revision": LOCAL_HYDROLOGY_ALGORITHM_REVISION,
             "spec": asdict(self.spec),
             "source_sha256": self.pyramid._source_hash(),
             "patch_shape": [
@@ -1326,6 +1945,7 @@ class LocalHydrologySolver:
         metadata = {
             "schema_version": 2,
             "key": asdict(key),
+            "algorithm_revision": LOCAL_HYDROLOGY_ALGORITHM_REVISION,
             "spec": asdict(self.spec),
             "source_sha256": self.pyramid._source_hash(),
             "patch_shape": [int(elevation.shape[0]), int(elevation.shape[1])],
@@ -1347,6 +1967,7 @@ class LocalHydrologySolver:
 
 
 __all__ = [
+    "LOCAL_HYDROLOGY_ALGORITHM_REVISION",
     "LocalHydrologyResult",
     "LocalHydrologySolver",
     "LocalHydrologySpec",
