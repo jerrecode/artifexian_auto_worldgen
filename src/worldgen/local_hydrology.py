@@ -51,6 +51,9 @@ _D8 = (
 )
 
 
+_D8_NUMBA = np.asarray(_D8, dtype=np.int64)
+
+
 _D16 = _D8 + (
     (-2, -1),
     (-2, 1),
@@ -225,6 +228,164 @@ def _coastal_land(ocean: np.ndarray) -> np.ndarray:
     return result & land
 
 
+if njit is not None:
+    @njit(cache=True, nogil=True)
+    def _heap_less(
+        value_a: float,
+        index_a: int,
+        value_b: float,
+        index_b: int,
+    ) -> bool:
+        return value_a < value_b or (
+            value_a == value_b and index_a < index_b
+        )
+
+
+    @njit(cache=True, nogil=True)
+    def _heap_push(
+        heap_values: np.ndarray,
+        heap_indices: np.ndarray,
+        size: int,
+        value: float,
+        index: int,
+    ) -> int:
+        i = size
+        size += 1
+        while i > 0:
+            parent = (i - 1) // 2
+            pv = heap_values[parent]
+            pi = heap_indices[parent]
+            if not _heap_less(value, index, pv, pi):
+                break
+            heap_values[i] = pv
+            heap_indices[i] = pi
+            i = parent
+        heap_values[i] = value
+        heap_indices[i] = index
+        return size
+
+
+    @njit(cache=True, nogil=True)
+    def _heap_pop(
+        heap_values: np.ndarray,
+        heap_indices: np.ndarray,
+        size: int,
+    ) -> tuple[float, int, int]:
+        value = heap_values[0]
+        index = heap_indices[0]
+        size -= 1
+        if size > 0:
+            last_value = heap_values[size]
+            last_index = heap_indices[size]
+            i = 0
+            while True:
+                left = 2 * i + 1
+                if left >= size:
+                    break
+                right = left + 1
+                child = left
+                if right < size and _heap_less(
+                    heap_values[right],
+                    int(heap_indices[right]),
+                    heap_values[left],
+                    int(heap_indices[left]),
+                ):
+                    child = right
+                child_value = heap_values[child]
+                child_index = int(heap_indices[child])
+                if not _heap_less(
+                    child_value,
+                    child_index,
+                    last_value,
+                    last_index,
+                ):
+                    break
+                heap_values[i] = child_value
+                heap_indices[i] = child_index
+                i = child
+            heap_values[i] = last_value
+            heap_indices[i] = last_index
+        return value, int(index), size
+
+
+    @njit(cache=True, nogil=True)
+    def _priority_flood_numba_kernel(
+        elevation_m: np.ndarray,
+        ocean: np.ndarray,
+        seed: np.ndarray,
+        epsilon_m: float,
+    ) -> tuple[np.ndarray, bool]:
+        h, w = elevation_m.shape
+        count = h * w
+        out = elevation_m.copy()
+        visited = ocean.copy()
+        heap_values = np.empty(count, dtype=np.float64)
+        heap_indices = np.empty(count, dtype=np.int64)
+        size = 0
+
+        for y in range(h):
+            for x in range(w):
+                if seed[y, x] and not visited[y, x]:
+                    visited[y, x] = True
+                    idx = y * w + x
+                    size = _heap_push(
+                        heap_values,
+                        heap_indices,
+                        size,
+                        float(out[y, x]),
+                        idx,
+                    )
+
+        any_land = False
+        for y in range(h):
+            for x in range(w):
+                if not ocean[y, x]:
+                    any_land = True
+                    break
+            if any_land:
+                break
+        if size == 0:
+            return out, not any_land
+
+        while size > 0:
+            cur, idx, size = _heap_pop(
+                heap_values,
+                heap_indices,
+                size,
+            )
+            y = idx // w
+            x = idx - y * w
+            for direction in range(8):
+                dy = _D8_NUMBA[direction, 0]
+                dx = _D8_NUMBA[direction, 1]
+                ny = y + dy
+                nx = x + dx
+                if (
+                    ny < 0
+                    or ny >= h
+                    or nx < 0
+                    or nx >= w
+                    or visited[ny, nx]
+                ):
+                    continue
+                visited[ny, nx] = True
+                nz = float(out[ny, nx])
+                if nz <= cur:
+                    nz = cur + epsilon_m
+                    out[ny, nx] = nz
+                nidx = ny * w + nx
+                size = _heap_push(
+                    heap_values,
+                    heap_indices,
+                    size,
+                    nz,
+                    nidx,
+                )
+        return out, True
+else:
+    _priority_flood_numba_kernel = None
+
+
 def _priority_flood_open(
     elevation_m: np.ndarray,
     ocean: np.ndarray,
@@ -245,6 +406,20 @@ def _priority_flood_open(
     seed[-1, :] |= ~oc[-1, :]
     seed[:, 0] |= ~oc[:, 0]
     seed[:, -1] |= ~oc[:, -1]
+    eps = max(float(epsilon_m), 0.0)
+    if _priority_flood_numba_kernel is not None:
+        filled, ok = _priority_flood_numba_kernel(
+            np.ascontiguousarray(z, dtype=np.float64),
+            np.ascontiguousarray(oc, dtype=np.bool_),
+            np.ascontiguousarray(seed, dtype=np.bool_),
+            eps,
+        )
+        if not ok:
+            raise RuntimeError(
+                "local priority flood could not establish an open boundary"
+            )
+        return filled
+
     heap: list[tuple[float, int, int]] = []
     ys, xs = np.where(seed & ~visited)
     for y, x in zip(ys.tolist(), xs.tolist()):
@@ -252,7 +427,6 @@ def _priority_flood_open(
         heapq.heappush(heap, (float(z[y, x]), y, x))
     if not heap and not np.all(oc):
         raise RuntimeError("local priority flood could not establish an open boundary")
-    eps = max(float(epsilon_m), 0.0)
     while heap:
         cur, y, x = heapq.heappop(heap)
         for dy, dx in _D8:
