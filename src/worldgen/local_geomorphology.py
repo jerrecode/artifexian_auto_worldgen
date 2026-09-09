@@ -696,6 +696,15 @@ class LocalGeomorphologySolver:
                 np.sqrt(np.mean(np.square(anchored - inherited_source)))
             ) if anchored.size else 0.0,
             "final_routing_metrics": final_routing_metrics,
+            "adaptive_meander_attempt": final_hydro.metadata.get(
+                "adaptive_meander_attempt"
+            ),
+            "adaptive_meander_min_wavelength_m": final_hydro.metadata.get(
+                "adaptive_meander_min_wavelength_m"
+            ),
+            "routing_candidate_metrics": final_hydro.metadata.get(
+                "routing_candidate_metrics"
+            ),
             "final_stream_cells": int(
                 np.count_nonzero(np.asarray(final_hydro.streams))
             ),
