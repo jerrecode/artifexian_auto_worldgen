@@ -729,12 +729,30 @@ def _routing_metrics(
     radius_m: float,
     *,
     active_mask: np.ndarray | None = None,
-) -> dict[str, float | int | None]:
+    downhill_slope: np.ndarray | None = None,
+    meander_potential: np.ndarray | None = None,
+    meander_eligible_threshold: float = 0.15,
+) -> dict[str, object]:
     receiver = np.asarray(receiver_flat, dtype=np.int64)
     code = np.asarray(code16, dtype=np.int16).ravel()
     stream = np.asarray(streams, dtype=bool).ravel()
     q = np.asarray(discharge_index, dtype=np.float64).ravel()
     unit = np.asarray(xyz, dtype=np.float64).reshape((-1, 3))
+    slope_flat = (
+        None
+        if downhill_slope is None
+        else np.asarray(downhill_slope, dtype=np.float64).ravel()
+    )
+    meander_flat = (
+        None
+        if meander_potential is None
+        else np.asarray(meander_potential, dtype=np.float64).ravel()
+    )
+    if slope_flat is not None and slope_flat.shape != code.shape:
+        raise ValueError("downhill_slope must match flow-direction shape")
+    if meander_flat is not None and meander_flat.shape != code.shape:
+        raise ValueError("meander_potential must match flow-direction shape")
+    eligible_threshold = float(meander_eligible_threshold)
     active = stream & (code >= 0)
     if active_mask is not None:
         mask = np.asarray(active_mask, dtype=bool)
@@ -753,6 +771,16 @@ def _routing_metrics(
             "stream_transition_count": 0,
             "stream_turn_fraction_gt10deg": 0.0,
             "max_straight_run_cells": 0,
+            "max_straight_run_km": 0.0,
+            "max_straight_run_start": None,
+            "max_straight_run_direction": None,
+            "max_straight_run_discharge_index": None,
+            "max_straight_run_downhill_slope": None,
+            "max_straight_run_meander_potential": None,
+            "max_meander_eligible_straight_run_cells": 0,
+            "max_meander_eligible_straight_run_km": 0.0,
+            "max_meander_eligible_straight_run_start": None,
+            "meander_eligible_threshold": eligible_threshold,
             "median_sampled_sinuosity": None,
         }
 
@@ -780,10 +808,19 @@ def _routing_metrics(
         turn_fraction = 0.0
 
     max_straight = 0
+    max_straight_start: int | None = None
+    max_eligible_straight = 0
+    max_eligible_start: int | None = None
+
     for start in nodes.tolist():
         direction = int(code[start])
         cur = int(start)
         run = 0
+        eligible_run = 0
+        local_max_eligible = 0
+        local_eligible_start: int | None = None
+        eligible_segment_start: int | None = None
+
         while run < 512:
             target = int(receiver[cur])
             if (
@@ -793,11 +830,70 @@ def _routing_metrics(
                 or int(code[cur]) != direction
             ):
                 break
+
+            is_eligible = (
+                meander_flat is not None
+                and meander_flat[cur] >= eligible_threshold
+            )
+            if is_eligible:
+                if eligible_run == 0:
+                    eligible_segment_start = cur
+                eligible_run += 1
+                if eligible_run > local_max_eligible:
+                    local_max_eligible = eligible_run
+                    local_eligible_start = eligible_segment_start
+            else:
+                eligible_run = 0
+                eligible_segment_start = None
+
             run += 1
             cur = target
             if int(code[cur]) != direction:
                 break
-        max_straight = max(max_straight, run)
+
+        if run > max_straight:
+            max_straight = run
+            max_straight_start = int(start)
+        if local_max_eligible > max_eligible_straight:
+            max_eligible_straight = local_max_eligible
+            max_eligible_start = local_eligible_start
+
+    def run_details(start: int | None, run_count: int) -> dict[str, object]:
+        if start is None or run_count <= 0:
+            return {
+                "distance_km": 0.0,
+                "start": None,
+                "direction": None,
+                "discharge_index": None,
+                "downhill_slope": None,
+                "meander_potential": None,
+            }
+        h, w = np.asarray(streams).shape
+        cur = int(start)
+        distance_m = 0.0
+        direction = int(code[cur])
+        for _ in range(int(run_count)):
+            target = int(receiver[cur])
+            if target < 0 or target >= stream.size:
+                break
+            dot = float(np.clip(np.dot(unit[cur], unit[target]), -1.0, 1.0))
+            distance_m += float(radius_m) * math.acos(dot)
+            cur = target
+        return {
+            "distance_km": distance_m / 1000.0,
+            "start": [int(start // w), int(start % w)],
+            "direction": direction,
+            "discharge_index": float(q[start]),
+            "downhill_slope": (
+                None if slope_flat is None else float(slope_flat[start])
+            ),
+            "meander_potential": (
+                None if meander_flat is None else float(meander_flat[start])
+            ),
+        }
+
+    raw_details = run_details(max_straight_start, max_straight)
+    eligible_details = run_details(max_eligible_start, max_eligible_straight)
 
     candidates = nodes[np.argsort(q[nodes], kind="stable")[-min(160, len(nodes)):]]
     sinuosity: list[float] = []
@@ -843,6 +939,18 @@ def _routing_metrics(
         "stream_transition_count": transition_count,
         "stream_turn_fraction_gt10deg": turn_fraction,
         "max_straight_run_cells": int(max_straight),
+        "max_straight_run_km": float(raw_details["distance_km"]),
+        "max_straight_run_start": raw_details["start"],
+        "max_straight_run_direction": raw_details["direction"],
+        "max_straight_run_discharge_index": raw_details["discharge_index"],
+        "max_straight_run_downhill_slope": raw_details["downhill_slope"],
+        "max_straight_run_meander_potential": raw_details["meander_potential"],
+        "max_meander_eligible_straight_run_cells": int(max_eligible_straight),
+        "max_meander_eligible_straight_run_km": float(
+            eligible_details["distance_km"]
+        ),
+        "max_meander_eligible_straight_run_start": eligible_details["start"],
+        "meander_eligible_threshold": eligible_threshold,
         "median_sampled_sinuosity": (
             float(np.median(sinuosity)) if sinuosity else None
         ),
@@ -1141,7 +1249,7 @@ class LocalHydrologySolver:
             0.0,
         )
 
-        receiver, code16, _best_slope = _flow_d16_open(
+        receiver, code16, best_slope = _flow_d16_open(
             filled,
             ocean,
             geom.xyz,
@@ -1193,6 +1301,8 @@ class LocalHydrologySolver:
             local_discharge,
             geom.xyz,
             self.pyramid.planet_radius_m,
+            downhill_slope=best_slope,
+            meander_potential=meander,
         )
         arrays = {
             "filled_elevation_m": np.asarray(filled, dtype=np.float32),
@@ -1275,6 +1385,7 @@ class LocalHydrologySolver:
             geom.xyz,
             self.pyramid.planet_radius_m,
             active_mask=core_mask,
+            meander_potential=np.asarray(arrays_patch["meander_potential"]),
         )
 
         arrays = {
