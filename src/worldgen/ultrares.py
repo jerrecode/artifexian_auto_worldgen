@@ -37,7 +37,11 @@ import numpy as np
 from scipy import ndimage
 
 from .heightmap import write_heightmap_png16
-from .local_geomorphology import LocalGeomorphologySolver, LocalGeomorphologySpec
+from .local_geomorphology import (
+    LOCAL_GEOMORPHOLOGY_ALGORITHM_REVISION,
+    LocalGeomorphologySolver,
+    LocalGeomorphologySpec,
+)
 from .procedural_erosion import phase_cell_octave_xyz
 from .progress_telemetry import HierarchicalProgressTracker
 from .planet_tiles import (
@@ -850,6 +854,8 @@ def _tile_resume_valid(
     )
     if metadata.get("authority_sampling_revision") != expected_sampling_revision:
         return False
+    if metadata.get("algorithm_revision") != LOCAL_GEOMORPHOLOGY_ALGORITHM_REVISION:
+        return False
 
     expected_shape = (int(pyramid.spec.tile_size) + 1,) * 2
     expected_dtypes = {
@@ -879,6 +885,7 @@ def _tile_resume_valid(
         "key": asdict(key),
         "source_sha256": expected_source,
         "authority_sampling_revision": expected_sampling_revision,
+        "algorithm_revision": LOCAL_GEOMORPHOLOGY_ALGORITHM_REVISION,
         "geomorphology_spec": expected_spec,
         "retained_fields": list(ULTRARES_RESUME_FIELDS),
         "tile_size": int(pyramid.spec.tile_size),
