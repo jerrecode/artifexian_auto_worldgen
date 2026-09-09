@@ -1415,24 +1415,25 @@ def reconstruct_fullview_maps(
     combined.flush()
     del combined
 
-    # Rivers: materialize fullview while the local hydrology cache still exists.
+    # Rivers must come from the final-terrain reroute saved by geomorphology,
+    # never from the pre-erosion local_hydrology cache.
     drainage = sample(
-        "drainage_area_km2",
-        lambda key: _hydrology_path(pyramid, "drainage_area_km2", key),
+        "final_drainage_area_km2",
+        lambda key: _geomorph_path(pyramid, "final_drainage_area_km2", key),
         dtype="float32",
     )
     discharge = sample(
-        "discharge_index",
-        lambda key: _hydrology_path(pyramid, "discharge_index", key),
+        "final_discharge_index",
+        lambda key: _geomorph_path(pyramid, "final_discharge_index", key),
         dtype="float32",
     )
     streams = sample(
-        "streams",
-        lambda key: _hydrology_path(pyramid, "streams", key),
+        "final_streams",
+        lambda key: _geomorph_path(pyramid, "final_streams", key),
         mode="nearest",
         dtype="uint8",
     )
-    river_png = output / "04_rivers_deepest_tiles.png"
+    river_png = output / "04_rivers_final_d16.png"
     manifest.append(_render_river_composite(drainage, discharge, streams, river_png))
     manifest.append(
         _render_scalar(
