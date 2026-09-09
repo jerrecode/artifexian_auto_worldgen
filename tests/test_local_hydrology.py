@@ -198,3 +198,81 @@ def test_local_hydrology_cache_is_sparse_and_reusable(tmp_path):
     np.testing.assert_array_equal(first.flow_direction_d8, second.flow_direction_d8)
     np.testing.assert_array_equal(first.flow_direction_d16, second.flow_direction_d16)
     np.testing.assert_array_equal(first.streams, second.streams)
+
+
+def test_final_terrain_reroute_uses_halo_not_core_perimeter_outlets(tmp_path):
+    _world(tmp_path)
+    pyramid = PlanetTilePyramid(
+        tmp_path,
+        spec=TilePyramidSpec(
+            tile_size=32,
+            elevation_detail_strength=0.0,
+            maximum_level=4,
+        ),
+    )
+    solver = LocalHydrologySolver(
+        pyramid,
+        spec=LocalHydrologySpec(
+            halo_cells=6,
+            stream_quantile=0.94,
+        ),
+    )
+    key = TileKey("px", 1, 0, 0)
+    geom = tile_geometry(key, 32)
+    final_elevation = np.asarray(
+        pyramid._sample_source_field("elevation_m", geom),
+        dtype=np.float64,
+    )
+    result = solver.solve_elevation(key, final_elevation)
+
+    assert result.metadata["patch_shape"] == [45, 45]
+    assert result.metadata["core_shape"] == [33, 33]
+    assert "not an artificial outlet" in result.metadata["boundary_semantics"]
+
+    code = np.asarray(result.flow_direction_d16)
+    perimeter = np.concatenate(
+        (code[0, :], code[-1, :], code[1:-1, 0], code[1:-1, -1])
+    )
+    # Ocean cells may remain outlets, but a land tile edge is no longer forced
+    # wholesale to -1 merely because it is the exported core boundary.
+    assert np.any(perimeter >= 0)
+
+
+def test_routing_metrics_active_mask_counts_only_selected_source_cells():
+    z = np.array(
+        [
+            [9.0, 8.0, 7.0, 6.0],
+            [8.0, 7.0, 6.0, 5.0],
+            [7.0, 6.0, 5.0, 4.0],
+            [6.0, 5.0, 4.0, 3.0],
+        ]
+    )
+    yy, xx = np.mgrid[:4, :4]
+    xyz = np.stack(
+        (
+            (xx - 1.5) * 1e-4,
+            (yy - 1.5) * 1e-4,
+            np.ones((4, 4)),
+        ),
+        axis=-1,
+    )
+    xyz /= np.linalg.norm(xyz, axis=-1, keepdims=True)
+    ocean = np.zeros((4, 4), dtype=bool)
+    receiver, code16, _slope = _flow_d16_open(z, ocean, xyz, 1e6)
+    streams = code16 >= 0
+    discharge = np.ones((4, 4), dtype=np.float64)
+    active_mask = np.zeros((4, 4), dtype=bool)
+    active_mask[1:3, 1:3] = True
+
+    from worldgen.local_hydrology import _routing_metrics
+
+    metrics = _routing_metrics(
+        receiver,
+        code16,
+        streams,
+        discharge,
+        xyz,
+        1e6,
+        active_mask=active_mask,
+    )
+    assert metrics["stream_direction_count"] <= 4
