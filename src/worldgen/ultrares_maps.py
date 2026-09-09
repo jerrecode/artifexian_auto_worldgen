@@ -884,6 +884,7 @@ def _sample_deepest_to_npy(
     chunk_rows: int = 64,
     width: int | None = None,
     height: int | None = None,
+    value_scale: float = 1.0,
 ) -> Path:
     level = int(plan.finest_level)
     side = 1 << level
@@ -970,6 +971,8 @@ def _sample_deepest_to_npy(
                     + a[y1, x1] * fx * fy
                 )
             chunk[mask] = np.asarray(sampled, dtype=dtype)
+        if float(value_scale) != 1.0:
+            chunk = np.asarray(chunk, dtype=dtype) * float(value_scale)
         out[y_start:y_stop] = chunk
     out.flush()
     return output_path
@@ -1375,6 +1378,9 @@ def reconstruct_fullview_maps(
         *,
         mode: str = "linear",
         dtype: str | np.dtype | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        value_scale: float = 1.0,
     ) -> Path:
         return _sample_deepest_to_npy(
             plan,
@@ -1382,6 +1388,9 @@ def reconstruct_fullview_maps(
             temp / f"{name}.npy",
             mode=mode,
             output_dtype=dtype,
+            width=width,
+            height=height,
+            value_scale=value_scale,
         )
 
     # Terrain and erosion use the actual final deepest geomorphology tiles.
