@@ -62,3 +62,15 @@ def test_projected_internal_tile_seam_diagnostic_is_zero_on_uniform_render():
     assert abs(float(result["p95_abs_jump"])) <= 1.0e-12
     assert abs(float(result["median_jump_ratio_to_baseline"])) <= 1.0e-3
     assert abs(float(result["p95_jump_ratio_to_baseline"])) <= 1.0e-3
+
+
+def test_eighth_moment_detects_axis_plus_diagonal_d8_symmetry():
+    y, x = np.mgrid[:256, :256]
+    field = np.zeros((256, 256), dtype=np.float64)
+    field[:128] = np.sin(2.0 * np.pi * x[:128] / 12.0)
+    field[128:] = np.sin(
+        2.0 * np.pi * (x[128:] + y[128:]) / (12.0 * np.sqrt(2.0))
+    )
+    metrics = MODULE._gradient_angular_anisotropy(field)
+    assert metrics["angular_moment_4"] < 0.25
+    assert metrics["angular_moment_8"] > 0.80
