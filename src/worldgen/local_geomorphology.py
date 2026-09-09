@@ -22,9 +22,13 @@ from typing import Callable, Mapping
 import numpy as np
 from scipy import ndimage
 
-from .local_hydrology import LocalHydrologySolver, _sample_area_km2
+from .local_hydrology import (
+    LocalHydrologySolver,
+    _meander_phase,
+    _sample_area_km2,
+)
 from .local_orography import edge_anchor_taper, terrain_frame
-LOCAL_GEOMORPHOLOGY_ALGORITHM_REVISION = "metric-source-adaptive-river-v3"
+LOCAL_GEOMORPHOLOGY_ALGORITHM_REVISION = "metric-source-meander-carving-v4"
 
 
 from .planet_tiles import (
@@ -158,6 +162,83 @@ def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
             tmp.unlink()
         except FileNotFoundError:
             pass
+
+
+def _laterally_shift_channel_seed(
+    channel_seed: np.ndarray,
+    flow_angle_rad: np.ndarray,
+    signed_phase: np.ndarray,
+    discharge_index: np.ndarray,
+    *,
+    max_offset_cells: float,
+) -> np.ndarray:
+    """Bilinearly splat a channel seed along a signed flow-normal offset.
+
+    The shift is deterministic and continuous in absolute-coordinate phase. It
+    moves only the incision guide, not the terrain itself; the candidate terrain
+    is still rerouted afterwards and is accepted only when routing diagnostics
+    improve. Bilinear splatting avoids replacing one lattice artifact with a
+    nearest-neighbour staircase.
+    """
+    seed = np.clip(np.asarray(channel_seed, dtype=np.float64), 0.0, 1.0)
+    angle = np.asarray(flow_angle_rad, dtype=np.float64)
+    phase = np.clip(np.asarray(signed_phase, dtype=np.float64), -1.0, 1.0)
+    q = np.clip(np.asarray(discharge_index, dtype=np.float64), 0.0, 1.0)
+    if not (seed.shape == angle.shape == phase.shape == q.shape):
+        raise ValueError("shifted channel inputs must have equal shapes")
+    if seed.ndim != 2:
+        raise ValueError("shifted channel inputs must be 2-D")
+    offset_limit = float(max_offset_cells)
+    if not math.isfinite(offset_limit) or offset_limit < 0.0:
+        raise ValueError("max_offset_cells must be finite and non-negative")
+
+    h, w = seed.shape
+    yy, xx = np.indices(seed.shape, dtype=np.float64)
+    active = (seed > 0.0) & np.isfinite(angle)
+    if not np.any(active) or offset_limit <= 0.0:
+        return seed.copy()
+
+    # D16 angles are atan2(dy, dx). A left-hand flow normal is therefore
+    # (dy, dx)=(cos(angle), -sin(angle)).
+    offset = (
+        offset_limit
+        * phase
+        * (0.30 + 0.70 * np.sqrt(q))
+        * active
+    )
+    target_y = yy + np.cos(angle) * offset
+    target_x = xx - np.sin(angle) * offset
+
+    y0 = np.floor(target_y).astype(np.int64)
+    x0 = np.floor(target_x).astype(np.int64)
+    fy = target_y - y0
+    fx = target_x - x0
+    out = np.zeros_like(seed, dtype=np.float64)
+
+    for oy, ox, weight in (
+        (0, 0, (1.0 - fy) * (1.0 - fx)),
+        (0, 1, (1.0 - fy) * fx),
+        (1, 0, fy * (1.0 - fx)),
+        (1, 1, fy * fx),
+    ):
+        ty = y0 + oy
+        tx = x0 + ox
+        valid = (
+            active
+            & (ty >= 0)
+            & (ty < h)
+            & (tx >= 0)
+            & (tx < w)
+            & (weight > 0.0)
+        )
+        if not np.any(valid):
+            continue
+        np.add.at(
+            out,
+            (ty[valid], tx[valid]),
+            seed[valid] * weight[valid],
+        )
+    return np.clip(out, 0.0, 1.0)
 
 
 def _grid_angular_moments(field: np.ndarray) -> dict[str, float]:
@@ -566,6 +647,181 @@ class LocalGeomorphologySolver:
         anchored[:, -1] = base[:, -1]
 
         final_hydro = self.hydrology.solve_elevation(key, anchored)
+
+        # Symmetric incision can itself reinforce a raster-locked reach. If the
+        # *post-incision* network still contains an over-long straight run, try
+        # deterministic lateral-migration incision guides and keep only a
+        # demonstrably better rerouted terrain. Good tiles never enter this path.
+        channel_migration_candidates: list[dict[str, object]] = [
+            {
+                "attempt": 0,
+                "max_offset_cells": 0.0,
+                "extra_incision_max_m": 0.0,
+                "routing_metrics": dict(
+                    final_hydro.metadata.get("routing_metrics", {})
+                ),
+            }
+        ]
+        baseline_anchored = anchored
+        baseline_channel_incision = channel_incision
+        best_anchored = baseline_anchored
+        best_channel_incision = baseline_channel_incision
+        best_hydro = final_hydro
+
+        def _hydro_rank(hydro_result):
+            metrics = hydro_result.metadata.get("routing_metrics", {})
+            straight = int(metrics.get("max_straight_run_cells", 0) or 0)
+            turn = float(
+                metrics.get("stream_turn_fraction_gt10deg", 0.0) or 0.0
+            )
+            sinuosity = metrics.get("median_sampled_sinuosity")
+            sinuosity_value = (
+                1.0 if sinuosity is None else float(sinuosity)
+            )
+            return (straight, -turn, -sinuosity_value)
+
+        if _hydro_rank(final_hydro)[0] > 220:
+            q_corrective = np.clip(
+                np.asarray(final_hydro.discharge_index, dtype=np.float64),
+                0.0,
+                1.0,
+            )
+            streams_corrective = (
+                np.asarray(final_hydro.streams, dtype=bool)
+                & (baseline_anchored >= 0.0)
+            )
+            seed_corrective = (
+                np.power(
+                    q_corrective,
+                    float(cfg.final_channel_discharge_exponent),
+                )
+                * streams_corrective
+            )
+            sample_m_corrective = approximate_meters_per_sample(
+                self.pyramid.planet_radius_m,
+                key.level,
+                self.pyramid.spec.tile_size,
+            )
+            min_migration_wavelength_m = 12.0 * sample_m_corrective
+            current_best_rank = _hydro_rank(best_hydro)
+
+            for migration_attempt, max_offset_cells, depth_scale in (
+                (1, 1.6, 0.70),
+                (2, 2.7, 0.95),
+            ):
+                signed_phase = _meander_phase(
+                    geom.xyz,
+                    self.pyramid.planet_radius_m,
+                    q_corrective,
+                    seed=int(self.pyramid._read_seed()),
+                    variant=migration_attempt,
+                    minimum_wavelength_m=min_migration_wavelength_m,
+                )
+                shifted_seed = _laterally_shift_channel_seed(
+                    seed_corrective,
+                    np.asarray(
+                        final_hydro.flow_angle_rad,
+                        dtype=np.float64,
+                    ),
+                    signed_phase,
+                    q_corrective,
+                    max_offset_cells=max_offset_cells,
+                )
+                shifted_profile = np.maximum(
+                    shifted_seed,
+                    0.60
+                    * ndimage.gaussian_filter(
+                        shifted_seed,
+                        sigma=0.72,
+                        mode="nearest",
+                    ),
+                )
+                # Suppress additional incision on the already-carved centreline:
+                # the corrective pass should create a nearby competing thalweg,
+                # not simply deepen the same raster-aligned trench.
+                lateral_preference = np.clip(
+                    1.0 - 0.68 * np.clip(channel_profile, 0.0, 1.0),
+                    0.20,
+                    1.0,
+                )
+                extra_profile = (
+                    np.clip(shifted_profile, 0.0, 1.0)
+                    * lateral_preference
+                )
+                extra_incision = (
+                    float(cfg.final_channel_incision_m)
+                    * float(depth_scale)
+                    * extra_profile
+                    * taper
+                    * (baseline_anchored >= 0.0)
+                )
+                extra_incision[0, :] = 0.0
+                extra_incision[-1, :] = 0.0
+                extra_incision[:, 0] = 0.0
+                extra_incision[:, -1] = 0.0
+
+                candidate_anchored = baseline_anchored - extra_incision
+                candidate_anchored[0, :] = base[0, :]
+                candidate_anchored[-1, :] = base[-1, :]
+                candidate_anchored[:, 0] = base[:, 0]
+                candidate_anchored[:, -1] = base[:, -1]
+                candidate_hydro = self.hydrology.solve_elevation(
+                    key, candidate_anchored
+                )
+                candidate_metrics = dict(
+                    candidate_hydro.metadata.get("routing_metrics", {})
+                )
+                candidate_rank = _hydro_rank(candidate_hydro)
+                channel_migration_candidates.append(
+                    {
+                        "attempt": int(migration_attempt),
+                        "max_offset_cells": float(max_offset_cells),
+                        "minimum_wavelength_m": float(
+                            min_migration_wavelength_m
+                        ),
+                        "extra_incision_max_m": float(
+                            np.max(extra_incision)
+                        ),
+                        "extra_incision_rms_m": float(
+                            np.sqrt(np.mean(np.square(extra_incision)))
+                        ),
+                        "routing_metrics": candidate_metrics,
+                    }
+                )
+                if candidate_rank < current_best_rank:
+                    current_best_rank = candidate_rank
+                    best_anchored = candidate_anchored
+                    best_channel_incision = (
+                        baseline_channel_incision + extra_incision
+                    )
+                    best_hydro = candidate_hydro
+
+        anchored = best_anchored
+        channel_incision = best_channel_incision
+        final_hydro = best_hydro
+        selected_channel_migration_attempt = min(
+            channel_migration_candidates,
+            key=lambda row: (
+                int(
+                    row["routing_metrics"].get(
+                        "max_straight_run_cells", 0
+                    )
+                    or 0
+                ),
+                -float(
+                    row["routing_metrics"].get(
+                        "stream_turn_fraction_gt10deg", 0.0
+                    )
+                    or 0.0
+                ),
+                -float(
+                    row["routing_metrics"].get(
+                        "median_sampled_sinuosity", 1.0
+                    )
+                    or 1.0
+                ),
+            ),
+        )["attempt"]
         channel_volume_m3 = float(np.sum(channel_incision * area_m2))
         erosion_total = erosion + channel_incision
         eroded_volume_total_m3 = eroded_volume_m3 + channel_volume_m3
@@ -705,6 +961,10 @@ class LocalGeomorphologySolver:
                 routed_before_channel.metadata.get("routing_candidate_metrics")
             ),
             "final_routing_metrics": final_routing_metrics,
+            "channel_migration_attempt": int(
+                selected_channel_migration_attempt
+            ),
+            "channel_migration_candidates": channel_migration_candidates,
             "adaptive_meander_attempt": final_hydro.metadata.get(
                 "adaptive_meander_attempt"
             ),
