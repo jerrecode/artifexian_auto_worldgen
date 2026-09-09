@@ -33,6 +33,9 @@ concurrency:
 
 jobs:
   preflight:
+    # Historical branch retired: starting this revision cancels the obsolete long run,
+    # then skips all production work on this branch.
+    if: ${{ false }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
