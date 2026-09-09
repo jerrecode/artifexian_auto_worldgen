@@ -1728,6 +1728,34 @@ class LocalHydrologySolver:
             return (straight, -turn, -sinuosity_value)
 
         selected = min(candidates, key=candidate_rank)
+        if int(selected["metrics"]["max_straight_run_cells"]) > 220:
+            reference = selected
+            candidates.append(
+                route_candidate(
+                    3,
+                    lock_reference=reference,
+                    bend_sign=1.0,
+                )
+            )
+            selected = min(candidates, key=candidate_rank)
+        if int(selected["metrics"]["max_straight_run_cells"]) > 220:
+            reference = min(
+                [
+                    candidate
+                    for candidate in candidates
+                    if int(candidate["attempt"]) <= 2
+                ],
+                key=candidate_rank,
+            )
+            candidates.append(
+                route_candidate(
+                    4,
+                    lock_reference=reference,
+                    bend_sign=-1.0,
+                )
+            )
+            selected = min(candidates, key=candidate_rank)
+
         receiver = selected["receiver"]
         code16 = selected["code16"]
         drainage = selected["drainage"]
@@ -1763,8 +1791,10 @@ class LocalHydrologySolver:
             ),
             "meander_selector_semantics": (
                 "corrective attempts select only near-tied strictly-downhill "
-                "D16 receivers, then use smooth absolute-coordinate angular "
-                "preference as the dominant de-locking criterion"
+                "D16 receivers. If a measured straight reach still exceeds 220 "
+                "cells, a smooth localized bend is applied around that receiver "
+                "chain in both possible directions; only the objectively best "
+                "rerouted network is retained."
             ),
             "routing_candidate_metrics": [
                 {
@@ -1793,6 +1823,7 @@ class LocalHydrologySolver:
                         else 0.84 if int(candidate["attempt"]) == 1
                         else 0.96
                     ),
+                    "lock_breaker": candidate.get("lock_breaker"),
                 }
                 for candidate in candidates
             ],
