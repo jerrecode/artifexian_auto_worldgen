@@ -5,8 +5,10 @@ import json
 import numpy as np
 
 from worldgen.local_hydrology import (
+    _D16,
     LocalHydrologySolver,
     LocalHydrologySpec,
+    _flow_d16_open,
     _patch_geometry,
     _priority_flood_open,
     _resolved_elevation_patch,
@@ -82,7 +84,42 @@ def test_halo_resolved_elevation_core_matches_authoritative_tile(tmp_path):
     np.testing.assert_allclose(core, tile, rtol=0.0, atol=2e-4)
 
 
-def test_local_hydrology_returns_bounded_d8_and_inherited_runoff(tmp_path):
+def test_d16_router_uses_intermediate_directions_and_remains_downhill():
+    h = w = 21
+    yy, xx = np.meshgrid(
+        np.arange(h, dtype=np.float64),
+        np.arange(w, dtype=np.float64),
+        indexing="ij",
+    )
+    scale = 1.0e-4
+    xyz = np.stack(
+        (
+            (xx - w // 2) * scale,
+            (yy - h // 2) * scale,
+            np.ones((h, w), dtype=np.float64),
+        ),
+        axis=-1,
+    )
+    xyz /= np.linalg.norm(xyz, axis=-1, keepdims=True)
+    # Continuous downhill direction is approximately (+2 rows,+1 col), which
+    # D8 cannot represent but the queen+knight stencil can.
+    z = 5000.0 - 100.0 * yy - 50.0 * xx
+    ocean = np.zeros((h, w), dtype=bool)
+    receiver, code16, _slope = _flow_d16_open(
+        z, ocean, xyz, 1.0e6
+    )
+    center = (h // 2, w // 2)
+    direction = int(code16[center])
+    assert direction >= 8
+    assert _D16[direction] == (2, 1)
+
+    flat_z = z.ravel()
+    active = receiver >= 0
+    sources = np.flatnonzero(active)
+    assert np.all(flat_z[receiver[active]] < flat_z[sources])
+
+
+def test_local_hydrology_returns_bounded_d16_and_inherited_runoff(tmp_path):
     _world(tmp_path)
     pyramid = PlanetTilePyramid(
         tmp_path,
@@ -95,27 +132,51 @@ def test_local_hydrology_returns_bounded_d8_and_inherited_runoff(tmp_path):
     expected = (25, 25)
     assert result.filled_elevation_m.shape == expected
     assert result.flow_direction_d8.shape == expected
+    assert result.flow_direction_d16.shape == expected
+    assert result.flow_angle_rad.shape == expected
+    assert result.meander_potential.shape == expected
     assert result.runoff_mm_year.shape == expected
     assert result.drainage_area_km2.shape == expected
     assert result.discharge_index.shape == expected
     assert result.streams.shape == expected
     assert np.all((result.flow_direction_d8 >= -1) & (result.flow_direction_d8 <= 7))
+    assert np.all((result.flow_direction_d16 >= -1) & (result.flow_direction_d16 < len(_D16)))
+    assert np.all((result.meander_potential >= 0.0) & (result.meander_potential <= 1.0 + 1e-6))
     assert np.all(result.runoff_mm_year >= 0.0)
     assert np.all(result.drainage_area_km2 >= 0.0)
     assert np.all((result.discharge_index >= 0.0) & (result.discharge_index <= 1.0 + 1e-6))
     assert result.metadata["runoff_semantics"] == "inherited global runoff_mm_year"
-    assert result.metadata["flow_direction_semantics"]["not_global_flow_to"] is True
+    flow_meta = result.metadata["flow_direction_semantics"]
+    assert flow_meta["not_global_flow_to"] is True
+    assert flow_meta["strictly_downhill_receivers"] is True
+    assert flow_meta["long_move_ridge_jump_guard"] is True
+    assert "D16" in flow_meta["type"]
 
 
-def test_inherited_major_river_cells_are_always_preserved_as_streams(tmp_path):
+def test_inherited_major_river_is_soft_corridor_not_stamped_centerline(tmp_path):
     _world(tmp_path)
     pyramid = PlanetTilePyramid(tmp_path, spec=TilePyramidSpec(tile_size=32))
-    solver = LocalHydrologySolver(pyramid, spec=LocalHydrologySpec(halo_cells=6))
-    # Root +X includes longitude around 0 degrees where the synthetic major river lies.
+    solver = LocalHydrologySolver(
+        pyramid,
+        spec=LocalHydrologySpec(
+            halo_cells=6,
+            stream_quantile=0.94,
+            major_river_corridor_cells=7,
+        ),
+    )
+    # Root +X includes longitude around 0 degrees where the synthetic parent
+    # river lies. The refined channel only needs to remain in its corridor.
     result = solver.solve(TileKey("px", 0, 0, 0))
     inherited = np.asarray(result.inherited_major_river, dtype=bool)
+    streams = np.asarray(result.streams, dtype=bool)
     assert np.any(inherited)
-    assert np.all(np.asarray(result.streams, dtype=bool)[inherited])
+    assert np.any(streams)
+    from scipy import ndimage
+
+    corridor = ndimage.binary_dilation(inherited, iterations=7)
+    assert np.count_nonzero(streams & corridor) > 0
+    assert result.metadata["major_river_guide_cells"] >= np.count_nonzero(inherited)
+    assert "soft corridor" in result.metadata["boundary_semantics"]
 
 
 def test_local_hydrology_cache_is_sparse_and_reusable(tmp_path):
@@ -135,3 +196,5 @@ def test_local_hydrology_cache_is_sparse_and_reusable(tmp_path):
     second = solver.solve(key)
     np.testing.assert_array_equal(first.discharge_index, second.discharge_index)
     np.testing.assert_array_equal(first.flow_direction_d8, second.flow_direction_d8)
+    np.testing.assert_array_equal(first.flow_direction_d16, second.flow_direction_d16)
+    np.testing.assert_array_equal(first.streams, second.streams)
