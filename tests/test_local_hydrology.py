@@ -313,3 +313,36 @@ def test_routing_metrics_eighth_moment_catches_balanced_axis_diagonal_lattice():
     )
     assert metrics["directional_fourfold_anisotropy"] < 0.05
     assert metrics["directional_eighth_anisotropy"] > 0.95
+
+
+def test_accumulation_backend_matches_python_recurrence_when_numba_available():
+    from worldgen.local_hydrology import (
+        _accumulate_topological_numba,
+        _accumulate_topological_python,
+    )
+
+    # 0->2, 1->2, 2->3, 3 outlet. Order is upstream to downstream.
+    order = np.array([0, 1, 2, 3], dtype=np.int64)
+    receiver = np.array([2, 2, 3, -1], dtype=np.int64)
+    drainage_py = np.array([1.0, 2.0, 4.0, 8.0], dtype=np.float64)
+    discharge_py = np.array([10.0, 20.0, 40.0, 80.0], dtype=np.float64)
+    _accumulate_topological_python(
+        order,
+        receiver,
+        drainage_py,
+        discharge_py,
+    )
+    np.testing.assert_allclose(drainage_py, [1.0, 2.0, 7.0, 15.0])
+    np.testing.assert_allclose(discharge_py, [10.0, 20.0, 70.0, 150.0])
+
+    if _accumulate_topological_numba is not None:
+        drainage_nb = np.array([1.0, 2.0, 4.0, 8.0], dtype=np.float64)
+        discharge_nb = np.array([10.0, 20.0, 40.0, 80.0], dtype=np.float64)
+        _accumulate_topological_numba(
+            order,
+            receiver,
+            drainage_nb,
+            discharge_nb,
+        )
+        np.testing.assert_array_equal(drainage_nb, drainage_py)
+        np.testing.assert_array_equal(discharge_nb, discharge_py)
