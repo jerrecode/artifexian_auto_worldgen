@@ -24,7 +24,7 @@ from scipy import ndimage
 
 from .local_hydrology import LocalHydrologySolver, _sample_area_km2
 from .local_orography import edge_anchor_taper, terrain_frame
-LOCAL_GEOMORPHOLOGY_ALGORITHM_REVISION = "metric-source-adaptive-river-v3"
+LOCAL_GEOMORPHOLOGY_ALGORITHM_REVISION = "metric-source-streamwise-meander-v4"
 
 
 from .planet_tiles import (
