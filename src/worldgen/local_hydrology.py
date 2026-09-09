@@ -40,7 +40,7 @@ from .planet_tiles import (
 )
 
 
-LOCAL_HYDROLOGY_ALGORITHM_REVISION = "competitive-flat-d16-routing-v3"
+LOCAL_HYDROLOGY_ALGORITHM_REVISION = "competitive-flat-d16-routing-v4"
 
 _D8 = (
     (-1, -1),
@@ -1172,6 +1172,89 @@ def _routing_metrics(
             float(np.median(sinuosity)) if sinuosity else None
         ),
     }
+
+
+def _straight_reach_bend_fields(
+    receiver_flat: np.ndarray,
+    code16: np.ndarray,
+    routing_metrics: Mapping[str, object],
+    *,
+    bend_sign: float,
+    target_max_run_cells: int = 220,
+    corridor_cells: float = 5.0,
+) -> tuple[np.ndarray, np.ndarray, dict[str, object]] | None:
+    """Build a smooth local steering bend around an over-long straight reach."""
+    code = np.asarray(code16, dtype=np.int16)
+    if code.ndim != 2:
+        raise ValueError("code16 must be 2-D")
+    receiver = np.asarray(receiver_flat, dtype=np.int64).ravel()
+    h, w = code.shape
+    run = int(routing_metrics.get("max_straight_run_cells", 0) or 0)
+    start = routing_metrics.get("max_straight_run_start_flat")
+    if run <= int(target_max_run_cells) or start is None:
+        return None
+    start = int(start)
+    if start < 0 or start >= receiver.size:
+        return None
+
+    chain: list[int] = [start]
+    cur = start
+    for _ in range(run):
+        target = int(receiver[cur])
+        if target < 0 or target >= receiver.size:
+            break
+        chain.append(target)
+        cur = target
+    if len(chain) < 5:
+        return None
+
+    excess = max(run - int(target_max_run_cells), 1)
+    half_span = int(np.clip(24 + excess // 3, 28, 72))
+    centre = (len(chain) - 1) // 2
+    lo = max(0, centre - half_span)
+    hi = min(len(chain) - 1, centre + half_span)
+    if hi - lo < 12:
+        return None
+
+    spine = np.zeros((h, w), dtype=bool)
+    offset = np.zeros((h, w), dtype=np.float64)
+    strength = np.zeros((h, w), dtype=np.float64)
+    max_turn_rad = math.radians(62.0)
+    sign = 1.0 if float(bend_sign) >= 0.0 else -1.0
+
+    for j in range(lo, hi + 1):
+        flat = int(chain[j])
+        y, x = divmod(flat, w)
+        t = (j - lo) / max(hi - lo, 1)
+        envelope = math.sin(math.pi * t)
+        spine[y, x] = True
+        offset[y, x] = sign * max_turn_rad * envelope
+        strength[y, x] = 0.995 * envelope * envelope
+
+    distance, nearest = ndimage.distance_transform_edt(
+        ~spine,
+        return_indices=True,
+    )
+    nearest_offset = offset[nearest[0], nearest[1]]
+    nearest_strength = strength[nearest[0], nearest[1]]
+    sigma = max(float(corridor_cells) * 0.45, 1.0)
+    decay = np.exp(-0.5 * np.square(distance / sigma))
+    active = distance <= float(corridor_cells)
+    bend_offset = np.where(active, nearest_offset * decay, 0.0)
+    bend_strength = np.where(active, nearest_strength * decay, 0.0)
+    info = {
+        "source_run_cells": int(run),
+        "source_run_start_flat": int(start),
+        "chain_samples": int(len(chain)),
+        "bend_chain_index_range": [int(lo), int(hi)],
+        "bend_sign": int(sign),
+        "maximum_preferred_turn_deg": 62.0,
+        "corridor_cells": float(corridor_cells),
+        "active_corridor_cells": int(
+            np.count_nonzero(bend_strength > 1.0e-6)
+        ),
+    }
+    return bend_offset, bend_strength, info
 
 
 def _sample_area_km2(xyz: np.ndarray, radius_m: float) -> np.ndarray:
