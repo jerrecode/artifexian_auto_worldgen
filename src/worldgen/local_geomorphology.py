@@ -156,52 +156,66 @@ def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
             pass
 
 
-def _fourfold_grid_moment(field: np.ndarray) -> dict[str, float]:
-    """Measure systematic 0/45/90-degree imprint relative to the tile lattice.
+def _grid_angular_moments(field: np.ndarray) -> dict[str, float]:
+    """Measure fourth/eighth angular locking relative to the tile lattice.
 
-    The complex fourth angular moment cancels physically oriented ridges across
-    differently oriented tiles but reinforces square-grid alignment.  We retain
-    the unnormalized sums so the planet-wide audit can combine tiles correctly.
+    Fourth-order symmetry detects ordinary square-axis bias.  Eighth-order
+    symmetry additionally detects a balanced axis+diagonal D8/D16 imprint that
+    can cancel in the fourth moment while remaining visibly grid-aligned.
+    Unnormalized sums are retained so the planet-wide audit can combine tiles.
     """
     a = np.asarray(field, dtype=np.float64)
     if min(a.shape) > 24:
         a = a[8:-8:3, 8:-8:3]
+
+    empty = {
+        "fourth_real": 0.0,
+        "fourth_imag": 0.0,
+        "eighth_real": 0.0,
+        "eighth_imag": 0.0,
+        "weight": 0.0,
+        "local_fourth_magnitude": 0.0,
+        "local_eighth_magnitude": 0.0,
+    }
     if min(a.shape) < 3:
-        return {
-            "real": 0.0,
-            "imag": 0.0,
-            "weight": 0.0,
-            "local_magnitude": 0.0,
-        }
+        return dict(empty)
+
     gy, gx = np.gradient(a)
     weight = np.hypot(gx, gy)
     finite = np.isfinite(weight) & np.isfinite(gx) & np.isfinite(gy)
     if not np.any(finite):
-        return {
-            "real": 0.0,
-            "imag": 0.0,
-            "weight": 0.0,
-            "local_magnitude": 0.0,
-        }
+        return dict(empty)
+
     threshold = float(np.percentile(weight[finite], 45.0))
     active = finite & (weight > max(threshold, 1.0e-12))
     if not np.any(active):
-        return {
-            "real": 0.0,
-            "imag": 0.0,
-            "weight": 0.0,
-            "local_magnitude": 0.0,
-        }
+        return dict(empty)
+
     angle = np.arctan2(gy[active], gx[active])
     w = weight[active]
-    moment = np.sum(w * np.exp(4j * angle))
     total = float(np.sum(w))
-    normalized = moment / max(total, 1.0e-30)
+    fourth = np.sum(w * np.exp(4j * angle))
+    eighth = np.sum(w * np.exp(8j * angle))
+    denom = max(total, 1.0e-30)
     return {
-        "real": float(np.real(moment)),
-        "imag": float(np.imag(moment)),
+        "fourth_real": float(np.real(fourth)),
+        "fourth_imag": float(np.imag(fourth)),
+        "eighth_real": float(np.real(eighth)),
+        "eighth_imag": float(np.imag(eighth)),
         "weight": total,
-        "local_magnitude": float(abs(normalized)),
+        "local_fourth_magnitude": float(abs(fourth) / denom),
+        "local_eighth_magnitude": float(abs(eighth) / denom),
+    }
+
+
+def _fourfold_grid_moment(field: np.ndarray) -> dict[str, float]:
+    """Backward-compatible fourth-moment view of the full angular diagnostic."""
+    metrics = _grid_angular_moments(field)
+    return {
+        "real": float(metrics["fourth_real"]),
+        "imag": float(metrics["fourth_imag"]),
+        "weight": float(metrics["weight"]),
+        "local_magnitude": float(metrics["local_fourth_magnitude"]),
     }
 
 
@@ -518,7 +532,13 @@ class LocalGeomorphologySolver:
         final_routing_metrics = dict(
             final_hydro.metadata.get("routing_metrics", {})
         )
-        grid_moment = _fourfold_grid_moment(tectonic_microdetail)
+        grid_angular = _grid_angular_moments(tectonic_microdetail)
+        grid_moment = {
+            "real": float(grid_angular["fourth_real"]),
+            "imag": float(grid_angular["fourth_imag"]),
+            "weight": float(grid_angular["weight"]),
+            "local_magnitude": float(grid_angular["local_fourth_magnitude"]),
+        }
         _final_normal, final_slope_deg, _ge, _gs = terrain_frame(
             geom.xyz, anchored, self.pyramid.planet_radius_m
         )
@@ -609,6 +629,7 @@ class LocalGeomorphologySolver:
                 np.max(np.abs(tectonic_microdetail))
             ) if tectonic_microdetail.size else 0.0,
             "terrain_grid_fourfold_moment": grid_moment,
+            "terrain_grid_angular_moments": grid_angular,
             "land_area_m2": land_area_m2,
             "mountain_area_above_1500_m_m2": mountain_area_1500_m2,
             "mountain_area_above_2500_m_m2": mountain_area_2500_m2,
