@@ -28,6 +28,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import time
 from threading import local
 from typing import Any, Iterable, Mapping
 
@@ -662,6 +663,7 @@ def generate_finest_geomorphology(
     thread_state = local()
     completed = 0
     progress_path = _progress_path(pyramid.world_root)
+    started = time.monotonic()
 
     def solver() -> LocalGeomorphologySolver:
         value = getattr(thread_state, "solver", None)
@@ -725,17 +727,35 @@ def generate_finest_geomorphology(
         return key
 
     def publish(last: TileKey | None, state: str) -> None:
-        _atomic_json(
-            progress_path,
-            {
-                "state": state,
-                "completed": completed,
-                "total": len(keys),
-                "last_key": asdict(last) if last is not None else None,
-                "finest_level": int(plan.finest_level),
-                "tile_size": int(plan.tile_size),
-            },
-        )
+        elapsed = max(time.monotonic() - started, 0.0)
+        rate = completed / elapsed if completed > 0 and elapsed > 0.0 else 0.0
+        remaining = max(len(keys) - completed, 0)
+        eta_seconds = remaining / rate if rate > 0.0 else None
+        payload = {
+            "state": state,
+            "completed": completed,
+            "total": len(keys),
+            "last_key": asdict(last) if last is not None else None,
+            "finest_level": int(plan.finest_level),
+            "tile_size": int(plan.tile_size),
+            "elapsed_seconds": elapsed,
+            "tiles_per_second": rate,
+            "eta_seconds": eta_seconds,
+        }
+        _atomic_json(progress_path, payload)
+        if completed > 0 or state != "running":
+            eta_text = (
+                "unknown"
+                if eta_seconds is None
+                else f"{eta_seconds / 60.0:.1f} min"
+            )
+            print(
+                "[ultrares] "
+                f"{state}: {completed}/{len(keys)} tiles "
+                f"({100.0 * completed / max(len(keys), 1):.1f}%), "
+                f"{elapsed / 60.0:.1f} min elapsed, ETA {eta_text}",
+                flush=True,
+            )
 
     last_key: TileKey | None = None
     publish(None, "running")
