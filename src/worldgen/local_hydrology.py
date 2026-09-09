@@ -646,34 +646,86 @@ def _meander_phase(
     discharge_index: np.ndarray,
     *,
     seed: int,
+    variant: int = 0,
 ) -> np.ndarray:
-    """Absolute-coordinate meander phase with discharge-scaled wavelength."""
+    """Absolute-coordinate meander phase with adaptive multi-scale variants.
+
+    Variant 0 preserves the historical long-wave field. Variants 1 and 2 add
+    independent shorter-wave components used only when measured routing contains
+    an over-long raster-locked reach. All fields are absolute-coordinate and
+    deterministic, so neighbouring tiles receive compatible steering.
+    """
     unit = np.asarray(xyz, dtype=np.float64)
     q = np.clip(np.asarray(discharge_index, dtype=np.float64), 0.0, 1.0)
     rng = np.random.default_rng(int(seed) ^ 0x4D45414E44455232)
-    axis = rng.normal(size=3)
-    axis /= max(float(np.linalg.norm(axis)), 1.0e-15)
-    tangent = axis - np.sum(unit * axis, axis=-1, keepdims=True) * unit
-    norm = np.linalg.norm(tangent, axis=-1, keepdims=True)
-    fallback_axis = np.array([0.0, 0.0, 1.0])
-    fallback = fallback_axis - (
-        np.sum(unit * fallback_axis, axis=-1, keepdims=True) * unit
-    )
-    tangent = np.where(norm > 1.0e-10, tangent, fallback)
-    tangent /= np.maximum(
-        np.linalg.norm(tangent, axis=-1, keepdims=True), 1.0e-12
-    )
-    wavelength_km = 18.0 + 165.0 * np.power(q, 0.72)
-    _cosine, sine, coherence = phase_cell_octave_xyz(
+
+    def tangent_from_axis(axis: np.ndarray) -> np.ndarray:
+        axis = np.asarray(axis, dtype=np.float64)
+        axis /= max(float(np.linalg.norm(axis)), 1.0e-15)
+        tangent = axis - np.sum(unit * axis, axis=-1, keepdims=True) * unit
+        norm = np.linalg.norm(tangent, axis=-1, keepdims=True)
+        fallback_axis = np.array([0.0, 0.0, 1.0])
+        fallback = fallback_axis - (
+            np.sum(unit * fallback_axis, axis=-1, keepdims=True) * unit
+        )
+        tangent = np.where(norm > 1.0e-10, tangent, fallback)
+        tangent /= np.maximum(
+            np.linalg.norm(tangent, axis=-1, keepdims=True), 1.0e-12
+        )
+        return tangent
+
+    tangent0 = tangent_from_axis(rng.normal(size=3))
+    wavelength0_km = 18.0 + 165.0 * np.power(q, 0.72)
+    _c0, s0, coh0 = phase_cell_octave_xyz(
         unit,
         float(radius_m) / 1000.0,
-        wavelength_km,
-        tangent,
+        wavelength0_km,
+        tangent0,
         cell_scale=0.82,
         seed=int(seed) ^ 0x6D65616E,
         octave=31,
     )
-    return np.asarray(sine * coherence, dtype=np.float64)
+    primary = np.asarray(s0 * coh0, dtype=np.float64)
+    if int(variant) <= 0:
+        return primary
+
+    tangent1 = tangent_from_axis(rng.normal(size=3))
+    wavelength1_km = (
+        (7.0 + 58.0 * np.power(q, 0.62))
+        if int(variant) == 1
+        else (4.5 + 34.0 * np.power(q, 0.58))
+    )
+    _c1, s1, coh1 = phase_cell_octave_xyz(
+        unit,
+        float(radius_m) / 1000.0,
+        wavelength1_km,
+        tangent1,
+        cell_scale=0.70 if int(variant) == 1 else 0.62,
+        seed=(int(seed) ^ 0x73686F7274776176 ^ (int(variant) * 0x9E3779B1)),
+        octave=41 + int(variant),
+    )
+    short = np.asarray(s1 * coh1, dtype=np.float64)
+
+    if int(variant) == 1:
+        return np.clip(0.55 * primary + 0.80 * short, -1.0, 1.0)
+
+    tangent2 = tangent_from_axis(rng.normal(size=3))
+    wavelength2_km = 3.5 + 20.0 * np.power(q, 0.52)
+    _c2, s2, coh2 = phase_cell_octave_xyz(
+        unit,
+        float(radius_m) / 1000.0,
+        wavelength2_km,
+        tangent2,
+        cell_scale=0.58,
+        seed=int(seed) ^ 0x6D6963726F6D6561,
+        octave=53,
+    )
+    micro = np.asarray(s2 * coh2, dtype=np.float64)
+    return np.clip(
+        0.35 * primary + 0.72 * short + 0.48 * micro,
+        -1.0,
+        1.0,
+    )
 
 
 def _major_river_guide(
@@ -1115,90 +1167,148 @@ class LocalHydrologySolver:
         )
         local0 = _normalize_log(discharge0, ~ocean)
         base_angle = _flow_angles(code0)
-        phase = _meander_phase(
-            geom.xyz,
-            self.pyramid.planet_radius_m,
-            local0,
-            seed=int(self.pyramid._read_seed()),
-        )
-        slope_meander_factor = (
-            0.12
-            + 0.88
-            * np.exp(
+        parent_discharge = self._parent_discharge_patch(geom)
+
+        def route_candidate(attempt: int):
+            phase = _meander_phase(
+                geom.xyz,
+                self.pyramid.planet_radius_m,
+                local0,
+                seed=int(self.pyramid._read_seed()),
+                variant=attempt,
+            )
+            slope_factor = np.exp(
                 -np.maximum(best_slope0, 0.0)
                 / max(float(cfg.meander_slope_scale), 1.0e-12)
             )
-        )
-        meander = (
-            float(cfg.meander_strength)
-            * np.power(np.clip(local0, 0.0, 1.0), float(cfg.meander_discharge_power))
-            * slope_meander_factor
-            * (~ocean)
-        )
-        # Major-river corridors permit a little more lateral migration because
-        # kilometre-scale alluvial channels are not expected to occupy the exact
-        # coarse parent-raster centreline.
-        meander *= 0.82 + 0.18 * guide
-        preferred = np.where(
-            np.isfinite(base_angle),
-            base_angle
-            + np.deg2rad(float(cfg.meander_max_turn_deg)) * phase * meander,
-            0.0,
-        )
-
-        receiver, code16, _best_slope = _flow_d16_open(
-            filled,
-            ocean,
-            geom.xyz,
-            self.pyramid.planet_radius_m,
-            preferred_angle_rad=preferred,
-            steering_weight=meander,
-        )
-        drainage, discharge = _accumulate_open(
-            filled, receiver, runoff, area, ocean
-        )
-        local_discharge = _normalize_log(discharge, ~ocean)
-
-        parent_discharge = self._parent_discharge_patch(geom)
-        # Preserve continental topology as a soft discharge prior, but only where
-        # the locally routed terrain already carries water. This avoids stamping
-        # the straight low-resolution parent mask into the refined stream raster.
-        parent_support = (
-            parent_discharge
-            * guide
-            * (0.28 + 0.72 * np.sqrt(np.clip(local_discharge, 0.0, 1.0)))
-        )
-        channel_score = np.maximum(local_discharge, parent_support)
-        land_values = channel_score[~ocean]
-        if land_values.size:
-            threshold = float(np.quantile(land_values, cfg.stream_quantile))
-            streams = (~ocean) & (
-                channel_score >= max(threshold, 1.0e-12)
-            )
-        else:
-            threshold = 1.0
-            streams = np.zeros_like(ocean)
-
-        corridor = (guide >= 0.28) & (~ocean) & (parent_discharge >= 0.12)
-        if np.any(corridor):
-            routed = local_discharge[corridor]
-            if routed.size:
-                corridor_threshold = float(np.quantile(routed, 0.76))
-                streams |= corridor & (
-                    local_discharge >= max(corridor_threshold, 1.0e-12)
+            if attempt > 0:
+                # Only corrective attempts retain a modest high-discharge steering
+                # floor on steeper reaches. Strictly-downhill receiver selection is
+                # still enforced by _flow_d16_open.
+                floor = (
+                    (0.14 if attempt == 1 else 0.24)
+                    * np.power(np.clip(local0, 0.0, 1.0), 1.25)
                 )
+                slope_factor = np.maximum(slope_factor, floor)
 
-        streams = _connect_stream_knight_moves(streams, receiver, code16)
+            strength_scale = 1.0 if attempt == 0 else (1.18 if attempt == 1 else 1.38)
+            meander = (
+                strength_scale
+                * float(cfg.meander_strength)
+                * np.power(
+                    np.clip(local0, 0.0, 1.0),
+                    float(cfg.meander_discharge_power),
+                )
+                * slope_factor
+                * (~ocean)
+            )
+            meander *= 0.82 + 0.18 * guide
+            meander = np.clip(meander, 0.0, 1.0)
+
+            # Rotation amplitude is less strongly attenuated than the slope-score
+            # steering itself, allowing the preferred direction to cross D16
+            # quantization boundaries without permitting uphill flow.
+            turn_weight = np.sqrt(meander) if attempt > 0 else meander
+            preferred = np.where(
+                np.isfinite(base_angle),
+                base_angle
+                + np.deg2rad(float(cfg.meander_max_turn_deg))
+                * phase
+                * turn_weight,
+                0.0,
+            )
+
+            receiver, code16, _best_slope = _flow_d16_open(
+                filled,
+                ocean,
+                geom.xyz,
+                self.pyramid.planet_radius_m,
+                preferred_angle_rad=preferred,
+                steering_weight=meander,
+            )
+            drainage, discharge = _accumulate_open(
+                filled, receiver, runoff, area, ocean
+            )
+            local_discharge = _normalize_log(discharge, ~ocean)
+
+            parent_support = (
+                parent_discharge
+                * guide
+                * (0.28 + 0.72 * np.sqrt(np.clip(local_discharge, 0.0, 1.0)))
+            )
+            channel_score = np.maximum(local_discharge, parent_support)
+            land_values = channel_score[~ocean]
+            if land_values.size:
+                threshold = float(np.quantile(land_values, cfg.stream_quantile))
+                streams = (~ocean) & (
+                    channel_score >= max(threshold, 1.0e-12)
+                )
+            else:
+                threshold = 1.0
+                streams = np.zeros_like(ocean)
+
+            corridor = (
+                (guide >= 0.28)
+                & (~ocean)
+                & (parent_discharge >= 0.12)
+            )
+            if np.any(corridor):
+                routed = local_discharge[corridor]
+                if routed.size:
+                    corridor_threshold = float(np.quantile(routed, 0.76))
+                    streams |= corridor & (
+                        local_discharge >= max(corridor_threshold, 1.0e-12)
+                    )
+
+            streams = _connect_stream_knight_moves(streams, receiver, code16)
+            metrics = _routing_metrics(
+                receiver,
+                code16,
+                streams,
+                local_discharge,
+                geom.xyz,
+                self.pyramid.planet_radius_m,
+            )
+            return {
+                "attempt": int(attempt),
+                "receiver": receiver,
+                "code16": code16,
+                "drainage": drainage,
+                "local_discharge": local_discharge,
+                "streams": streams,
+                "meander": meander,
+                "threshold": threshold,
+                "metrics": metrics,
+            }
+
+        candidates = [route_candidate(0)]
+        if int(candidates[0]["metrics"]["max_straight_run_cells"]) > 220:
+            candidates.append(route_candidate(1))
+        if min(
+            int(candidate["metrics"]["max_straight_run_cells"])
+            for candidate in candidates
+        ) > 220:
+            candidates.append(route_candidate(2))
+
+        def candidate_rank(candidate):
+            metrics = candidate["metrics"]
+            straight = int(metrics["max_straight_run_cells"])
+            turn = float(metrics["stream_turn_fraction_gt10deg"])
+            sinuosity = metrics["median_sampled_sinuosity"]
+            sinuosity_value = 1.0 if sinuosity is None else float(sinuosity)
+            return (straight, -turn, -sinuosity_value)
+
+        selected = min(candidates, key=candidate_rank)
+        receiver = selected["receiver"]
+        code16 = selected["code16"]
+        drainage = selected["drainage"]
+        local_discharge = selected["local_discharge"]
+        streams = selected["streams"]
+        meander = selected["meander"]
+        threshold = float(selected["threshold"])
+        metrics = selected["metrics"]
         code8 = _compat_d8_codes(code16)
         angle = _flow_angles(code16)
-        metrics = _routing_metrics(
-            receiver,
-            code16,
-            streams,
-            local_discharge,
-            geom.xyz,
-            self.pyramid.planet_radius_m,
-        )
         arrays = {
             "filled_elevation_m": np.asarray(filled, dtype=np.float32),
             "flow_direction_d8": np.asarray(code8, dtype=np.int8),
@@ -1218,6 +1328,22 @@ class LocalHydrologySolver:
             "inherited_major_river_cells": int(np.count_nonzero(inherited_river)),
             "local_stream_cells": int(np.count_nonzero(streams)),
             "routing_metrics": metrics,
+            "adaptive_meander_attempt": int(selected["attempt"]),
+            "routing_candidate_metrics": [
+                {
+                    "attempt": int(candidate["attempt"]),
+                    "max_straight_run_cells": int(
+                        candidate["metrics"]["max_straight_run_cells"]
+                    ),
+                    "stream_turn_fraction_gt10deg": float(
+                        candidate["metrics"]["stream_turn_fraction_gt10deg"]
+                    ),
+                    "median_sampled_sinuosity": candidate["metrics"][
+                        "median_sampled_sinuosity"
+                    ],
+                }
+                for candidate in candidates
+            ],
             "flow_direction_semantics": {
                 "type": "D16 queen+knight direction code with low-gradient meander steering",
                 "codes": {
