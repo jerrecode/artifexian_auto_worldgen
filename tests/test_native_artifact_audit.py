@@ -51,3 +51,14 @@ def test_fourfold_gradient_diagnostic_distinguishes_axis_grid_from_mixed_relief(
     )
     mixed_metric = MODULE._fourfold_gradient_anisotropy(mixed)
     assert mixed_metric["fourfold_anisotropy"] < grid_metric["fourfold_anisotropy"]
+
+
+def test_projected_internal_tile_seam_diagnostic_is_zero_on_uniform_render():
+    values = np.full((256, 512), 37.0, dtype=np.float64)
+    result = MODULE._river_tile_seam_diagnostic(values, level=3, samples_per_curve=96)
+    assert result["level"] == 3
+    assert result["sample_count"] > 0
+    assert result["median_abs_jump"] == 0.0
+    assert result["p95_abs_jump"] == 0.0
+    assert result["median_jump_ratio_to_baseline"] == 0.0
+    assert result["p95_jump_ratio_to_baseline"] == 0.0
