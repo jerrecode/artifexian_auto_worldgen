@@ -10,7 +10,7 @@ physical authority and are sampled through the deepest tile geometry without
 inventing sub-grid deposits/events.
 """
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import json
 import math
@@ -24,7 +24,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from scipy import ndimage
 
-from .heightmap import write_heightmap_png16
+from .heightmap import write_heightmap_png16, write_heightmap_tiff32
 from .local_downscaling import LocalClimateSpec
 from .local_orography import (
     OrographicDownscalingSpec,
@@ -431,7 +431,7 @@ def generate_climate_surface_products(
     pyramid: UltraResolutionTilePyramid,
     plan: UltraResolutionPlan,
 ) -> dict[str, object]:
-    """Recompute terrain-sensitive local climate/surface fields on final eroded z2 terrain."""
+    """Recompute terrain-sensitive local climate/surface fields on final deepest terrain."""
     climate_cfg = LocalClimateSpec().validate()
     oro_cfg = OrographicDownscalingSpec().validate()
     surface_cfg = LocalSurfaceSpec().validate()
