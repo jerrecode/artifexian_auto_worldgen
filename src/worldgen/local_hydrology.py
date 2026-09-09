@@ -548,6 +548,8 @@ def _routing_metrics(
     discharge_index: np.ndarray,
     xyz: np.ndarray,
     radius_m: float,
+    *,
+    active_mask: np.ndarray | None = None,
 ) -> dict[str, float | int | None]:
     receiver = np.asarray(receiver_flat, dtype=np.int64)
     code = np.asarray(code16, dtype=np.int16).ravel()
@@ -555,6 +557,11 @@ def _routing_metrics(
     q = np.asarray(discharge_index, dtype=np.float64).ravel()
     unit = np.asarray(xyz, dtype=np.float64).reshape((-1, 3))
     active = stream & (code >= 0)
+    if active_mask is not None:
+        mask = np.asarray(active_mask, dtype=bool)
+        if mask.shape != np.asarray(streams).shape:
+            raise ValueError("active_mask must match streams")
+        active &= mask.ravel()
     if not np.any(active):
         return {
             "directional_fourfold_anisotropy": 0.0,
@@ -999,36 +1006,76 @@ class LocalHydrologySolver:
         key: TileKey,
         elevation_m: np.ndarray,
     ) -> LocalHydrologyResult:
-        """Route directly over a supplied final terrain tile without caching.
+        """Route over final terrain with a deterministic halo and no core-edge outlets.
 
-        This second-pass API is used after geomorphic displacement so the visible
-        river network is guaranteed to conform to the final terrain rather than to
-        the pre-erosion parent surface.
+        The supplied tile is inserted into the same halo geometry used by the
+        pre-erosion local solve.  Outside the core, the halo is reconstructed from
+        the globally continuous inherited terrain plus native absolute-XYZ
+        microrelief.  Because geomorphic perturbations are explicitly anchored to
+        zero at every tile edge, this gives a continuous boundary neighbourhood
+        without depending on neighbour generation order.
+
+        Only the halo perimeter is open.  The exported tile perimeter therefore
+        behaves as ordinary interior routing context rather than as an artificial
+        row of outlets, substantially reducing river terminations and grid seams.
         """
         key.validate()
         n = int(self.pyramid.spec.tile_size)
+        halo = int(self.spec.halo_cells)
         elevation = np.asarray(elevation_m, dtype=np.float64)
         if elevation.shape != (n + 1, n + 1):
             raise ValueError(
                 f"final terrain shape must be {(n + 1, n + 1)}, got {elevation.shape}"
             )
-        geom = tile_geometry(key, n)
-        arrays, route_meta, _receiver = self._route_elevation(
-            key, geom, elevation
+
+        geom = _patch_geometry(key, n, halo)
+        patch_elevation = _resolved_elevation_patch(self.pyramid, key, geom)
+        core = (slice(halo, halo + n + 1), slice(halo, halo + n + 1))
+        patch_elevation = np.asarray(patch_elevation, dtype=np.float64).copy()
+        patch_elevation[core] = elevation
+
+        arrays_patch, route_meta, receiver = self._route_elevation(
+            key, geom, patch_elevation
         )
+
+        core_mask = np.zeros(patch_elevation.shape, dtype=bool)
+        core_mask[core] = True
+        route_meta = dict(route_meta)
+        route_meta["routing_metrics"] = _routing_metrics(
+            receiver,
+            np.asarray(arrays_patch["flow_direction_d16"]),
+            np.asarray(arrays_patch["streams"]),
+            np.asarray(arrays_patch["discharge_index"]),
+            geom.xyz,
+            self.pyramid.planet_radius_m,
+            active_mask=core_mask,
+        )
+
+        arrays = {
+            name: np.asarray(values[core], dtype=values.dtype)
+            for name, values in arrays_patch.items()
+        }
         metadata = {
-            "schema_version": 2,
+            "schema_version": 3,
             "key": asdict(key),
             "spec": asdict(self.spec),
             "source_sha256": self.pyramid._source_hash(),
-            "patch_shape": [n + 1, n + 1],
+            "patch_shape": [
+                int(patch_elevation.shape[0]),
+                int(patch_elevation.shape[1]),
+            ],
             "core_shape": [n + 1, n + 1],
             **route_meta,
             "boundary_semantics": (
-                "final-terrain reroute uses the tile perimeter as an open outlet; "
-                "continental topology is retained as a broad parent-river corridor"
+                "final-terrain reroute uses a deterministic inherited-terrain halo; "
+                "only the halo perimeter is open, so the exported tile perimeter "
+                "is not an artificial outlet"
             ),
-            "terrain_semantics": "routing evaluated after all local terrain detail and erosion",
+            "terrain_semantics": (
+                "core routing is evaluated after all local terrain detail and erosion; "
+                "halo context uses globally continuous inherited terrain plus native "
+                "absolute-XYZ microrelief"
+            ),
         }
         return LocalHydrologyResult(metadata=metadata, **arrays)
 
