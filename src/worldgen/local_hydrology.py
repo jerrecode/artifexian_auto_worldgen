@@ -689,35 +689,129 @@ def _flow_angles(code16: np.ndarray) -> np.ndarray:
     return out
 
 
+def _smoothed_flow_tangent_xyz(
+    receiver_flat: np.ndarray,
+    xyz: np.ndarray,
+    *,
+    sigma_cells: float = 4.0,
+) -> np.ndarray:
+    """Continuous-ish downstream tangent field for meander phase advection.
+
+    The raw preliminary D16 receiver direction is projected into each cell's
+    tangent plane, spatially smoothed to suppress lattice quantization, then
+    reprojected and normalized. Invalid/outlet cells receive a deterministic
+    tangent fallback.
+    """
+    unit = np.asarray(xyz, dtype=np.float64)
+    if unit.ndim != 3 or unit.shape[-1] != 3:
+        raise ValueError("xyz must have shape (h,w,3)")
+    h, w, _ = unit.shape
+    receiver = np.asarray(receiver_flat, dtype=np.int64).ravel()
+    if receiver.size != h * w:
+        raise ValueError("receiver_flat must match xyz grid size")
+
+    flat = unit.reshape((-1, 3))
+    tangent = np.zeros_like(flat)
+    valid = (receiver >= 0) & (receiver < flat.shape[0])
+    if np.any(valid):
+        src = flat[valid]
+        target = flat[receiver[valid]]
+        projected = target - np.sum(target * src, axis=-1, keepdims=True) * src
+        tangent[valid] = projected
+
+    tangent = tangent.reshape((h, w, 3))
+    sigma = max(float(sigma_cells), 0.0)
+    if sigma > 0.0:
+        tangent = np.stack(
+            (
+                ndimage.gaussian_filter(
+                    tangent[..., component],
+                    sigma=sigma,
+                    mode="nearest",
+                )
+                for component in range(3)
+            ),
+            axis=-1,
+        )
+
+    # Reproject after smoothing because averaging tangent vectors on a curved
+    # surface introduces a small radial component.
+    tangent -= np.sum(tangent * unit, axis=-1, keepdims=True) * unit
+    norm = np.linalg.norm(tangent, axis=-1, keepdims=True)
+
+    fallback_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    fallback = fallback_axis - (
+        np.sum(unit * fallback_axis, axis=-1, keepdims=True) * unit
+    )
+    fallback_norm = np.linalg.norm(fallback, axis=-1, keepdims=True)
+    alternate_axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    alternate = alternate_axis - (
+        np.sum(unit * alternate_axis, axis=-1, keepdims=True) * unit
+    )
+    fallback = np.where(fallback_norm > 1.0e-10, fallback, alternate)
+    fallback /= np.maximum(
+        np.linalg.norm(fallback, axis=-1, keepdims=True),
+        1.0e-12,
+    )
+
+    tangent = np.where(norm > 1.0e-12, tangent, fallback)
+    tangent /= np.maximum(
+        np.linalg.norm(tangent, axis=-1, keepdims=True),
+        1.0e-12,
+    )
+    return np.asarray(tangent, dtype=np.float64)
+
+
 def _meander_phase(
     xyz: np.ndarray,
     radius_m: float,
     discharge_index: np.ndarray,
     *,
     seed: int,
+    flow_tangent_xyz: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Absolute-coordinate meander phase with discharge-scaled wavelength."""
+    """Absolute-coordinate meander phase advected along local downstream flow."""
     unit = np.asarray(xyz, dtype=np.float64)
     q = np.clip(np.asarray(discharge_index, dtype=np.float64), 0.0, 1.0)
-    rng = np.random.default_rng(int(seed) ^ 0x4D45414E44455232)
-    axis = rng.normal(size=3)
-    axis /= max(float(np.linalg.norm(axis)), 1.0e-15)
-    tangent = axis - np.sum(unit * axis, axis=-1, keepdims=True) * unit
-    norm = np.linalg.norm(tangent, axis=-1, keepdims=True)
-    fallback_axis = np.array([0.0, 0.0, 1.0])
+
+    if flow_tangent_xyz is None:
+        # Deterministic fallback retained for callers without a receiver graph.
+        rng = np.random.default_rng(int(seed) ^ 0x4D45414E44455232)
+        axis = rng.normal(size=3)
+        axis /= max(float(np.linalg.norm(axis)), 1.0e-15)
+        phase_direction = (
+            axis
+            - np.sum(unit * axis, axis=-1, keepdims=True) * unit
+        )
+    else:
+        phase_direction = np.asarray(flow_tangent_xyz, dtype=np.float64)
+        if phase_direction.shape != unit.shape:
+            raise ValueError("flow_tangent_xyz must match xyz")
+
+    # The phase-cell kernel's projection vector controls where phase advances.
+    # Using the smoothed downstream tangent makes phase oscillate along a reach
+    # instead of accidentally staying nearly constant when a global projection
+    # happens to lie perpendicular to that river.
+    phase_direction -= (
+        np.sum(phase_direction * unit, axis=-1, keepdims=True) * unit
+    )
+    norm = np.linalg.norm(phase_direction, axis=-1, keepdims=True)
+    fallback_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
     fallback = fallback_axis - (
         np.sum(unit * fallback_axis, axis=-1, keepdims=True) * unit
     )
-    tangent = np.where(norm > 1.0e-10, tangent, fallback)
-    tangent /= np.maximum(
-        np.linalg.norm(tangent, axis=-1, keepdims=True), 1.0e-12
+    phase_direction = np.where(norm > 1.0e-10, phase_direction, fallback)
+    phase_direction /= np.maximum(
+        np.linalg.norm(phase_direction, axis=-1, keepdims=True),
+        1.0e-12,
     )
+
     wavelength_km = 18.0 + 165.0 * np.power(q, 0.72)
     _cosine, sine, coherence = phase_cell_octave_xyz(
         unit,
         float(radius_m) / 1000.0,
         wavelength_km,
-        tangent,
+        phase_direction,
         cell_scale=0.82,
         seed=int(seed) ^ 0x6D65616E,
         octave=31,
@@ -1272,11 +1366,17 @@ class LocalHydrologySolver:
         )
         local0 = _normalize_log(discharge0, ~ocean)
         base_angle = _flow_angles(code0)
+        flow_tangent = _smoothed_flow_tangent_xyz(
+            receiver0,
+            geom.xyz,
+            sigma_cells=4.0,
+        )
         phase = _meander_phase(
             geom.xyz,
             self.pyramid.planet_radius_m,
             local0,
             seed=int(self.pyramid._read_seed()),
+            flow_tangent_xyz=flow_tangent,
         )
         meander = (
             float(cfg.meander_strength)
@@ -1373,6 +1473,10 @@ class LocalHydrologySolver:
             "inherited_major_river_cells": int(np.count_nonzero(inherited_river)),
             "local_stream_cells": int(np.count_nonzero(streams)),
             "routing_metrics": metrics,
+            "meander_phase_semantics": (
+                "absolute-coordinate phase-cell forcing projected along a "
+                "Gaussian-smoothed preliminary downstream tangent field"
+            ),
             "flow_direction_semantics": {
                 "type": "D16 queen+knight direction code with low-gradient meander steering",
                 "codes": {
