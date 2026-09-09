@@ -1536,8 +1536,8 @@ def audit_ultra_resolution(
     fine_limit_m = cfg.min_samples_per_wavelength * plan.finest_m_per_sample
 
     # The selected high-resolution deliverable is 2x the ordinary fullview.
-    # z3 terrain is another factor of two finer than that output, so a four-native-
-    # sample wavelength has a one-output-pixel half-wave (Nyquist saturation).
+    # The native product remains 2x the ordinary fullview. At z3 the safe four-
+    # sample half-wave is ~1 native pixel; at z2 it is ~2 native pixels.
     native_output_width = int(plan.fullview_width * 2)
     native_output_height = int(plan.fullview_height * 2)
     native_output_m_per_pixel = (
@@ -1794,8 +1794,8 @@ def audit_ultra_resolution(
             plan.actual_subsection_multiplier + 1.0e-9
             >= cfg.subsection_linear_multiplier
         ),
-        "native_heightmap_bandwidth_saturated": (
-            0.90 <= feature_pixels <= 1.15
+        "native_heightmap_bandwidth_supported": (
+            0.90 <= feature_pixels <= 2.30
         ),
         "new_high_frequency_terrain_exists": aggregate_band > 0.25,
         "tectonic_microdetail_active": aggregate_microdetail > 1.0,
@@ -1964,8 +1964,10 @@ def _prepare_ultra_resolution(
             "semantics": {
                 "base_fullview": "4x-linear terrain base reconstructed from deeper solved tiles",
                 "subsections": (
-                    "requested >=3x subsection refinement selects the next power-of-two LOD; "
-                    "for the Earth production profile this is z3, 4x finer than the 8192 base"
+                    f"requested >= {float(cfg.subsection_linear_multiplier):g}x subsection "
+                    f"refinement selects discrete cube-sphere LOD z{int(plan.finest_level)}; "
+                    f"actual refinement is {float(plan.actual_subsection_multiplier):g}x "
+                    "relative to the reconstructed base"
                 ),
                 "detail": (
                     "globally continuous tectonic microrelief fills newly resolvable terrain "
