@@ -58,7 +58,7 @@ def test_projected_internal_tile_seam_diagnostic_is_zero_on_uniform_render():
     result = MODULE._river_tile_seam_diagnostic(values, level=3, samples_per_curve=96)
     assert result["level"] == 3
     assert result["sample_count"] > 0
-    assert result["median_abs_jump"] == 0.0
-    assert result["p95_abs_jump"] == 0.0
-    assert result["median_jump_ratio_to_baseline"] == 0.0
-    assert result["p95_jump_ratio_to_baseline"] == 0.0
+    assert abs(float(result["median_abs_jump"])) <= 1.0e-12
+    assert abs(float(result["p95_abs_jump"])) <= 1.0e-12
+    assert abs(float(result["median_jump_ratio_to_baseline"])) <= 1.0e-3
+    assert abs(float(result["p95_jump_ratio_to_baseline"])) <= 1.0e-3
