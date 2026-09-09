@@ -4,7 +4,10 @@ import json
 
 import numpy as np
 
-from worldgen.local_geomorphology import LocalGeomorphologySolver
+from worldgen.local_geomorphology import (
+    LocalGeomorphologySolver,
+    _grid_angular_moments,
+)
 from worldgen.local_hydrology import _sample_area_km2
 from worldgen.planet_tiles import PlanetTilePyramid, TileKey, TilePyramidSpec, tile_geometry
 from worldgen.river_constraints import RiverConstraintGenerator
