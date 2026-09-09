@@ -5,9 +5,10 @@ import math
 
 import numpy as np
 
-from worldgen.planet_tiles import PlanetTilePyramid, TilePyramidSpec
+from worldgen.planet_tiles import PlanetTilePyramid, TileKey, TilePyramidSpec, tile_geometry
 from worldgen.ultrares import (
     UltraResolutionSpec,
+    UltraResolutionTilePyramid,
     _merge_children_downsample,
     derive_scale_aware_geomorphology_spec,
     make_ultra_resolution_plan,
@@ -36,6 +37,13 @@ def _write_source(root) -> None:
         stream_order=np.zeros((h, w), dtype=np.uint8),
         discharge_index=np.zeros((h, w), dtype=np.float32),
         river_width_proxy=np.zeros((h, w), dtype=np.float32),
+        mountain_strength=np.full((h, w), 0.72, dtype=np.float32),
+        ruggedness=np.full((h, w), 0.55, dtype=np.float32),
+        convergence_strength=np.full((h, w), 0.48, dtype=np.float32),
+        strain_field=np.full((h, w), 0.36, dtype=np.float32),
+        paleo_convergence=np.full((h, w), 0.25, dtype=np.float32),
+        orogen_age_myr=np.full((h, w), 140.0, dtype=np.float32),
+        stress_field=np.full((h, w), 0.42, dtype=np.float32),
     )
     (root / "world.json").write_text(
         json.dumps(
@@ -136,3 +144,56 @@ def test_parent_reconstruction_is_exact_bottom_up_decimation():
     )
     parent = _merge_children_downsample(children)
     np.testing.assert_array_equal(parent, fine[::2, ::2])
+
+
+def test_fractional_subsection_request_advances_to_discrete_lod(tmp_path):
+    _write_source(tmp_path)
+    cfg = UltraResolutionSpec(
+        base_linear_multiplier=4.0,
+        subsection_linear_multiplier=3.0,
+        tile_size=64,
+        terrain_detail_strength=1.0,
+    )
+    pyramid = UltraResolutionTilePyramid(
+        tmp_path,
+        spec=TilePyramidSpec(
+            tile_size=64,
+            elevation_detail_strength=1.0,
+            maximum_level=6,
+        ),
+    )
+    plan = make_ultra_resolution_plan(pyramid, cfg)
+    assert plan.base_level == 0
+    # Cube-sphere LODs halve ground spacing, so a requested 3x refinement
+    # necessarily advances by two levels and yields 4x native sampling.
+    assert plan.finest_level == 2
+    assert plan.actual_subsection_multiplier >= 3.0
+    assert math.isclose(plan.actual_subsection_multiplier, 4.0, rel_tol=1e-12)
+
+
+def test_xyz_microrelief_is_nontrivial_and_exactly_shared_across_tile_edge(tmp_path):
+    _write_source(tmp_path)
+    pyramid = UltraResolutionTilePyramid(
+        tmp_path,
+        spec=TilePyramidSpec(
+            tile_size=32,
+            elevation_detail_strength=1.0,
+            detail_hurst_exponent=0.65,
+            maximum_level=6,
+        ),
+    )
+    left = TileKey("px", 2, 1, 1)
+    right = TileKey("px", 2, 2, 1)
+    g_left = tile_geometry(left, 32)
+    g_right = tile_geometry(right, 32)
+    d_left = pyramid._spectral_detail(g_left.xyz, left.level)
+    d_right = pyramid._spectral_detail(g_right.xyz, right.level)
+
+    assert float(np.std(d_left)) > 0.5
+    assert float(np.max(np.abs(d_left))) > 1.0
+    np.testing.assert_allclose(
+        d_left[:, -1],
+        d_right[:, 0],
+        rtol=0.0,
+        atol=1.0e-9,
+    )

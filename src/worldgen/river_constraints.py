@@ -18,6 +18,7 @@ import tempfile
 from typing import Mapping
 
 import numpy as np
+from scipy import ndimage
 
 from .lod import parent_chain
 from .planet_tiles import PlanetTilePyramid, TileKey, tile_geometry
@@ -26,8 +27,11 @@ from .planet_tiles import PlanetTilePyramid, TileKey, tile_geometry
 @dataclass(slots=True, frozen=True)
 class RiverConstraintSpec:
     minimum_major_stream_order: int = 3
-    minimum_channel_depth_m: float = 1.0
-    maximum_channel_depth_m: float = 35.0
+    minimum_channel_depth_m: float = 0.5
+    maximum_channel_depth_m: float = 8.0
+    corridor_half_width_cells: int = 7
+    corridor_sigma_cells: float = 3.0
+    corridor_mask_threshold: float = 0.12
 
     def validate(self) -> "RiverConstraintSpec":
         if int(self.minimum_major_stream_order) < 1:
@@ -36,6 +40,12 @@ class RiverConstraintSpec:
             raise ValueError("minimum_channel_depth_m must be finite and non-negative")
         if not math.isfinite(float(self.maximum_channel_depth_m)) or self.maximum_channel_depth_m < self.minimum_channel_depth_m:
             raise ValueError("maximum_channel_depth_m must be finite and >= minimum_channel_depth_m")
+        if not 1 <= int(self.corridor_half_width_cells) <= 64:
+            raise ValueError("corridor_half_width_cells must be in [1,64]")
+        if not math.isfinite(float(self.corridor_sigma_cells)) or self.corridor_sigma_cells <= 0.0:
+            raise ValueError("corridor_sigma_cells must be positive")
+        if not 0.0 < float(self.corridor_mask_threshold) < 1.0:
+            raise ValueError("corridor_mask_threshold must be in (0,1)")
         return self
 
 
@@ -150,20 +160,63 @@ class RiverConstraintGenerator:
         order = np.maximum(self._sample_optional("stream_order", geom), 0.0)
         discharge = np.clip(self._sample_optional("discharge_index", geom), 0.0, None)
         width = np.clip(self._sample_optional("river_width_proxy", geom), 0.0, None)
-        major = (rivers >= 0.5) | (order >= int(self.spec.minimum_major_stream_order))
-        major &= elevation >= 0.0
+        major_raw = (
+            (rivers >= 0.5)
+            | (order >= int(self.spec.minimum_major_stream_order))
+        )
+        major_raw &= elevation >= 0.0
 
         max_order = max(float(np.max(order)), 1.0)
         order_norm = np.clip(order / max_order, 0.0, 1.0)
         discharge_norm = np.clip(discharge, 0.0, 1.0)
-        width_norm = width / max(float(np.max(width)), 1.0e-12) if np.any(width > 0) else np.zeros_like(width)
-        strength = np.maximum.reduce((order_norm, discharge_norm, np.clip(width_norm, 0.0, 1.0)))
-        strength *= major
-        depth = self.spec.minimum_channel_depth_m + (
-            self.spec.maximum_channel_depth_m - self.spec.minimum_channel_depth_m
-        ) * strength
-        depth *= major
-        floor = elevation - depth
+        width_norm = (
+            width / max(float(np.max(width)), 1.0e-12)
+            if np.any(width > 0)
+            else np.zeros_like(width)
+        )
+        raw_strength = np.maximum.reduce(
+            (order_norm, discharge_norm, np.clip(width_norm, 0.0, 1.0))
+        )
+        raw_strength *= major_raw
+
+        if np.any(major_raw):
+            distance = ndimage.distance_transform_edt(~major_raw)
+            sigma = max(float(self.spec.corridor_sigma_cells), 0.5)
+            support = np.exp(-0.5 * np.square(distance / sigma))
+            support[
+                distance > float(self.spec.corridor_half_width_cells)
+            ] = 0.0
+            # Carry the parent river importance laterally into the corridor while
+            # allowing the local D16 hydrology to choose its actual centreline.
+            strength_seed = ndimage.maximum_filter(
+                raw_strength,
+                size=2 * int(self.spec.corridor_half_width_cells) + 1,
+                mode="nearest",
+            )
+            strength = (
+                np.clip(strength_seed, 0.0, 1.0)
+                * support
+                * (elevation >= 0.0)
+            )
+        else:
+            support = np.zeros_like(elevation, dtype=np.float64)
+            strength = np.zeros_like(elevation, dtype=np.float64)
+        major = (
+            support >= float(self.spec.corridor_mask_threshold)
+        ) & (elevation >= 0.0)
+
+        depth = (
+            float(self.spec.minimum_channel_depth_m)
+            + (
+                float(self.spec.maximum_channel_depth_m)
+                - float(self.spec.minimum_channel_depth_m)
+            )
+            * np.clip(strength, 0.0, 1.0)
+        )
+        # This is a shallow topology guide, not the final channel. The actual
+        # centreline and final incision are recomputed on evolved high-resolution
+        # terrain after geomorphology.
+        floor = elevation - depth * np.clip(strength, 0.0, 1.0)
 
         arrays = {
             "major_river_mask": major.astype(np.bool_),
@@ -177,15 +230,18 @@ class RiverConstraintGenerator:
             _atomic_save_npy(self._path(key, name), values)
         ancestry = [asdict(parent) for parent in parent_chain(key)]
         metadata = {
-            "schema_version": 1,
+            "schema_version": 2,
             "key": asdict(key),
             "quadtree_ancestry_root_to_parent": ancestry,
             "source_sha256": self.pyramid._source_hash(),
             "spec": asdict(self.spec),
-            "major_river_cells": int(np.count_nonzero(major)),
+            "raw_parent_river_cells": int(np.count_nonzero(major_raw)),
+            "major_river_corridor_cells": int(np.count_nonzero(major)),
             "semantics": (
-                "continental river topology projected from the global hydrology authority; "
-                "local solvers may refine tributaries/channel morphology but must preserve these major-channel constraints"
+                "continental river topology is projected as a shallow broad corridor; "
+                "the high-resolution D16 solver selects a terrain-conforming and "
+                "meandering centreline inside that corridor rather than copying the "
+                "coarse parent raster line"
             ),
         }
         _atomic_json(self._metadata_path(key), metadata)

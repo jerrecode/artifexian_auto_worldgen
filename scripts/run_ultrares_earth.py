@@ -23,8 +23,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=int, default=2)
     p.add_argument("--tile-size", type=int, default=1024)
     p.add_argument("--base-multiplier", type=float, default=4.0)
-    p.add_argument("--subsection-multiplier", type=float, default=2.0)
+    p.add_argument("--subsection-multiplier", type=float, default=3.0)
     p.add_argument("--min-samples-per-wavelength", type=float, default=4.0)
+    p.add_argument("--terrain-detail-strength", type=float, default=1.15)
     p.add_argument("--no-compact", action="store_true")
     p.add_argument("--keep-source-maps", action="store_true")
     return p
@@ -44,6 +45,7 @@ def main(argv: list[str] | None = None) -> int:
         subsection_linear_multiplier=args.subsection_multiplier,
         tile_size=args.tile_size,
         min_samples_per_wavelength=args.min_samples_per_wavelength,
+        terrain_detail_strength=args.terrain_detail_strength,
         workers=args.workers,
     )
     report = run_ultra_resolution(root, spec=spec)

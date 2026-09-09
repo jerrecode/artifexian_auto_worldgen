@@ -4,7 +4,10 @@ import json
 
 import numpy as np
 
-from worldgen.local_geomorphology import LocalGeomorphologySolver
+from worldgen.local_geomorphology import (
+    LocalGeomorphologySolver,
+    _grid_angular_moments,
+)
 from worldgen.local_hydrology import _sample_area_km2
 from worldgen.planet_tiles import PlanetTilePyramid, TileKey, TilePyramidSpec, tile_geometry
 from worldgen.river_constraints import RiverConstraintGenerator
@@ -106,6 +109,23 @@ def test_local_geomorphology_is_watertight_mass_accounted_and_river_constrained(
     assert abs(float(result.metadata["procedural_area_weighted_mean_m"])) <= 1.0e-12
     assert result.metadata["procedural_semantics"].startswith("zero-area-mean")
     assert result.metadata["procedural_octaves_executed"] >= 1
+    assert np.isfinite(np.asarray(result.tectonic_microdetail_m)).all()
+    assert np.all(np.asarray(result.channel_incision_m) >= 0.0)
+    assert result.final_streams.shape == evolved.shape
+    assert result.final_drainage_area_km2.shape == evolved.shape
+    assert result.final_discharge_index.shape == evolved.shape
+    assert result.final_flow_direction_d16.shape == evolved.shape
+    assert result.final_meander_potential.shape == evolved.shape
+    assert np.all(
+        (np.asarray(result.final_flow_direction_d16) >= -1)
+        & (np.asarray(result.final_flow_direction_d16) <= 15)
+    )
+    routing = result.metadata["final_routing_metrics"]
+    assert routing["directional_fourfold_anisotropy"] >= 0.0
+    assert routing["max_straight_run_cells"] >= 0
+    assert result.metadata["final_hydrology_semantics"].startswith(
+        "D16 terrain-conforming routing"
+    )
 
 
 def test_local_geomorphology_cache_is_deterministic(tmp_path):
@@ -120,4 +140,24 @@ def test_local_geomorphology_cache_is_deterministic(tmp_path):
     first_elevation = np.asarray(first.elevation_m).copy()
     second = solver.solve(key)
     np.testing.assert_array_equal(np.asarray(second.elevation_m), first_elevation)
+    np.testing.assert_array_equal(
+        np.asarray(second.final_flow_direction_d16),
+        np.asarray(first.final_flow_direction_d16),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(second.final_streams),
+        np.asarray(first.final_streams),
+    )
     assert second.metadata == first.metadata
+
+
+def test_terrain_eighth_moment_catches_balanced_axis_diagonal_grid():
+    y, x = np.mgrid[:256, :256]
+    field = np.zeros((256, 256), dtype=np.float64)
+    field[:128] = np.sin(2.0 * np.pi * x[:128] / 12.0)
+    field[128:] = np.sin(
+        2.0 * np.pi * (x[128:] + y[128:]) / (12.0 * np.sqrt(2.0))
+    )
+    metrics = _grid_angular_moments(field)
+    assert metrics["local_fourth_magnitude"] < 0.25
+    assert metrics["local_eighth_magnitude"] > 0.80

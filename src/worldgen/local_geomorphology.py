@@ -52,6 +52,8 @@ class LocalGeomorphologySpec:
     procedural_lacunarity: float = 2.0
     procedural_cell_scale: float = 0.72
     procedural_steering_strength: float = 0.28
+    final_channel_incision_m: float = 10.0
+    final_channel_discharge_exponent: float = 1.15
 
     def validate(self) -> "LocalGeomorphologySpec":
         for name in (
@@ -91,6 +93,12 @@ class LocalGeomorphologySpec:
             raise ValueError("procedural_lacunarity must be > 1")
         if not math.isfinite(float(self.procedural_steering_strength)) or float(self.procedural_steering_strength) < 0.0:
             raise ValueError("procedural_steering_strength must be finite and non-negative")
+        if not math.isfinite(float(self.final_channel_incision_m)) or not (
+            0.0 <= float(self.final_channel_incision_m) <= 50.0
+        ):
+            raise ValueError("final_channel_incision_m must be in [0,50]")
+        if not 0.25 <= float(self.final_channel_discharge_exponent) <= 3.0:
+            raise ValueError("final_channel_discharge_exponent must be in [0.25,3]")
         return self
 
 
@@ -102,6 +110,13 @@ class LocalGeomorphologyResult:
     hillslope_adjustment_m: np.ndarray
     procedural_detail_m: np.ndarray
     procedural_coherence: np.ndarray
+    tectonic_microdetail_m: np.ndarray
+    channel_incision_m: np.ndarray
+    final_drainage_area_km2: np.ndarray
+    final_discharge_index: np.ndarray
+    final_streams: np.ndarray
+    final_flow_direction_d16: np.ndarray
+    final_meander_potential: np.ndarray
     major_river_constraint: np.ndarray
     metadata: Mapping[str, object]
 
@@ -141,6 +156,69 @@ def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
             pass
 
 
+def _grid_angular_moments(field: np.ndarray) -> dict[str, float]:
+    """Measure fourth/eighth angular locking relative to the tile lattice.
+
+    Fourth-order symmetry detects ordinary square-axis bias.  Eighth-order
+    symmetry additionally detects a balanced axis+diagonal D8/D16 imprint that
+    can cancel in the fourth moment while remaining visibly grid-aligned.
+    Unnormalized sums are retained so the planet-wide audit can combine tiles.
+    """
+    a = np.asarray(field, dtype=np.float64)
+    if min(a.shape) > 24:
+        a = a[8:-8:3, 8:-8:3]
+
+    empty = {
+        "fourth_real": 0.0,
+        "fourth_imag": 0.0,
+        "eighth_real": 0.0,
+        "eighth_imag": 0.0,
+        "weight": 0.0,
+        "local_fourth_magnitude": 0.0,
+        "local_eighth_magnitude": 0.0,
+    }
+    if min(a.shape) < 3:
+        return dict(empty)
+
+    gy, gx = np.gradient(a)
+    weight = np.hypot(gx, gy)
+    finite = np.isfinite(weight) & np.isfinite(gx) & np.isfinite(gy)
+    if not np.any(finite):
+        return dict(empty)
+
+    threshold = float(np.percentile(weight[finite], 45.0))
+    active = finite & (weight > max(threshold, 1.0e-12))
+    if not np.any(active):
+        return dict(empty)
+
+    angle = np.arctan2(gy[active], gx[active])
+    w = weight[active]
+    total = float(np.sum(w))
+    fourth = np.sum(w * np.exp(4j * angle))
+    eighth = np.sum(w * np.exp(8j * angle))
+    denom = max(total, 1.0e-30)
+    return {
+        "fourth_real": float(np.real(fourth)),
+        "fourth_imag": float(np.imag(fourth)),
+        "eighth_real": float(np.real(eighth)),
+        "eighth_imag": float(np.imag(eighth)),
+        "weight": total,
+        "local_fourth_magnitude": float(abs(fourth) / denom),
+        "local_eighth_magnitude": float(abs(eighth) / denom),
+    }
+
+
+def _fourfold_grid_moment(field: np.ndarray) -> dict[str, float]:
+    """Backward-compatible fourth-moment view of the full angular diagnostic."""
+    metrics = _grid_angular_moments(field)
+    return {
+        "real": float(metrics["fourth_real"]),
+        "imag": float(metrics["fourth_imag"]),
+        "weight": float(metrics["weight"]),
+        "local_magnitude": float(metrics["local_fourth_magnitude"]),
+    }
+
+
 class LocalGeomorphologySolver:
     def __init__(
         self,
@@ -174,6 +252,13 @@ class LocalGeomorphologySolver:
             "hillslope_adjustment_m",
             "procedural_detail_m",
             "procedural_coherence",
+            "tectonic_microdetail_m",
+            "channel_incision_m",
+            "final_drainage_area_km2",
+            "final_discharge_index",
+            "final_streams",
+            "final_flow_direction_d16",
+            "final_meander_potential",
             "major_river_constraint",
         )
         paths = {name: self._path(key, name) for name in names}
@@ -187,6 +272,13 @@ class LocalGeomorphologySolver:
             hillslope_adjustment_m=np.load(paths["hillslope_adjustment_m"], mmap_mode="r", allow_pickle=False),
             procedural_detail_m=np.load(paths["procedural_detail_m"], mmap_mode="r", allow_pickle=False),
             procedural_coherence=np.load(paths["procedural_coherence"], mmap_mode="r", allow_pickle=False),
+            tectonic_microdetail_m=np.load(paths["tectonic_microdetail_m"], mmap_mode="r", allow_pickle=False),
+            channel_incision_m=np.load(paths["channel_incision_m"], mmap_mode="r", allow_pickle=False),
+            final_drainage_area_km2=np.load(paths["final_drainage_area_km2"], mmap_mode="r", allow_pickle=False),
+            final_discharge_index=np.load(paths["final_discharge_index"], mmap_mode="r", allow_pickle=False),
+            final_streams=np.load(paths["final_streams"], mmap_mode="r", allow_pickle=False),
+            final_flow_direction_d16=np.load(paths["final_flow_direction_d16"], mmap_mode="r", allow_pickle=False),
+            final_meander_potential=np.load(paths["final_meander_potential"], mmap_mode="r", allow_pickle=False),
             major_river_constraint=np.load(paths["major_river_constraint"], mmap_mode="r", allow_pickle=False),
             metadata=json.loads(meta.read_text(encoding="utf-8")),
         )
@@ -199,6 +291,11 @@ class LocalGeomorphologySolver:
         cfg = self.spec
         geom = tile_geometry(key, self.pyramid.spec.tile_size)
         base = np.asarray(self.pyramid.load_field(key, "elevation_m"), dtype=np.float64)
+        inherited_source = np.asarray(
+            self.pyramid._sample_source_field("elevation_m", geom),
+            dtype=np.float64,
+        )
+        tectonic_microdetail = base - inherited_source
         land = base >= 0.0
         taper = edge_anchor_taper(base.shape, cfg.edge_anchor_cells)
         area_km2 = _sample_area_km2(geom.xyz, self.pyramid.planet_radius_m)
@@ -263,12 +360,12 @@ class LocalGeomorphologySolver:
         procedural_coherence = np.zeros_like(base)
         executed_octaves = 0
         executed_wavelengths_m: list[float] = []
+        sample_m = approximate_meters_per_sample(
+            self.pyramid.planet_radius_m,
+            key.level,
+            self.pyramid.spec.tile_size,
+        )
         if cfg.procedural_detail_enabled and np.any(land):
-            sample_m = approximate_meters_per_sample(
-                self.pyramid.planet_radius_m,
-                key.level,
-                self.pyramid.spec.tile_size,
-            )
             base_wavelength_m = sample_m * float(cfg.procedural_base_wavelength_samples)
             runoff_n = 1.0 - np.exp(
                 -np.maximum(np.asarray(hydro.runoff_mm_year, dtype=np.float64), 0.0) / 650.0
@@ -373,23 +470,119 @@ class LocalGeomorphologySolver:
         anchored[:, 0] = base[:, 0]
         anchored[:, -1] = base[:, -1]
 
+        # The first local drainage graph controlled erosion, but phase-cell detail
+        # and hillslope evolution have since changed the surface. Re-route over the
+        # actual final terrain, carve only a shallow discharge-scaled channel, then
+        # route once more so the exported river network is guaranteed to descend on
+        # and conform to the terrain that users actually see.
+        routed_before_channel = self.hydrology.solve_elevation(key, anchored)
+        q_pre = np.clip(
+            np.asarray(routed_before_channel.discharge_index, dtype=np.float64),
+            0.0,
+            1.0,
+        )
+        stream_pre = (
+            np.asarray(routed_before_channel.streams, dtype=bool)
+            & (anchored >= 0.0)
+        )
+        channel_seed = (
+            np.power(q_pre, float(cfg.final_channel_discharge_exponent))
+            * stream_pre
+        )
+        # A sub-pixel river still influences the local valley floor. A narrow
+        # Gaussian footprint avoids one-cell notches while retaining the routed
+        # centreline and never broadening channels into artificial valleys.
+        channel_profile = np.maximum(
+            channel_seed,
+            0.62 * ndimage.gaussian_filter(
+                channel_seed.astype(np.float64),
+                sigma=0.55,
+                mode="nearest",
+            ),
+        )
+        channel_incision = (
+            float(cfg.final_channel_incision_m)
+            * np.clip(channel_profile, 0.0, 1.0)
+            * taper
+            * (anchored >= 0.0)
+        )
+        channel_incision[0, :] = 0.0
+        channel_incision[-1, :] = 0.0
+        channel_incision[:, 0] = 0.0
+        channel_incision[:, -1] = 0.0
+        anchored = anchored - channel_incision
+        anchored[0, :] = base[0, :]
+        anchored[-1, :] = base[-1, :]
+        anchored[:, 0] = base[:, 0]
+        anchored[:, -1] = base[:, -1]
+
+        final_hydro = self.hydrology.solve_elevation(key, anchored)
+        channel_volume_m3 = float(np.sum(channel_incision * area_m2))
+        erosion_total = erosion + channel_incision
+        eroded_volume_total_m3 = eroded_volume_m3 + channel_volume_m3
+        exported_volume_total_m3 = exported_volume_m3 + channel_volume_m3
         closure = (
-            abs(eroded_volume_m3 - deposited_volume_m3 - exported_volume_m3)
-            / max(eroded_volume_m3, 1.0)
+            abs(
+                eroded_volume_total_m3
+                - deposited_volume_m3
+                - exported_volume_total_m3
+            )
+            / max(eroded_volume_total_m3, 1.0)
+        )
+        final_routing_metrics = dict(
+            final_hydro.metadata.get("routing_metrics", {})
+        )
+        grid_angular = _grid_angular_moments(tectonic_microdetail)
+        grid_moment = {
+            "real": float(grid_angular["fourth_real"]),
+            "imag": float(grid_angular["fourth_imag"]),
+            "weight": float(grid_angular["weight"]),
+            "local_magnitude": float(grid_angular["local_fourth_magnitude"]),
+        }
+        _final_normal, final_slope_deg, _ge, _gs = terrain_frame(
+            geom.xyz, anchored, self.pyramid.planet_radius_m
+        )
+        final_land = anchored >= 0.0
+        land_area_m2 = float(np.sum(area_m2 * final_land))
+        mountain_area_1500_m2 = float(
+            np.sum(area_m2 * final_land * (anchored >= 1500.0))
+        )
+        mountain_area_2500_m2 = float(
+            np.sum(area_m2 * final_land * (anchored >= 2500.0))
+        )
+        rugged_area_m2 = float(
+            np.sum(area_m2 * final_land * (final_slope_deg >= 10.0))
         )
         arrays = {
-            "elevation_m": anchored.astype(np.float32),
-            "erosion_m": erosion.astype(np.float32),
+            # Preserve native numerical height precision. Derived display rasters
+            # may quantize explicitly, but the authoritative terrain does not.
+            "elevation_m": anchored.astype(np.float64),
+            "erosion_m": erosion_total.astype(np.float32),
             "deposition_m": deposition.astype(np.float32),
             "hillslope_adjustment_m": hillslope.astype(np.float32),
             "procedural_detail_m": procedural.astype(np.float32),
             "procedural_coherence": procedural_coherence.astype(np.float32),
+            "tectonic_microdetail_m": tectonic_microdetail.astype(np.float32),
+            "channel_incision_m": channel_incision.astype(np.float32),
+            "final_drainage_area_km2": np.asarray(
+                final_hydro.drainage_area_km2, dtype=np.float32
+            ),
+            "final_discharge_index": np.asarray(
+                final_hydro.discharge_index, dtype=np.float32
+            ),
+            "final_streams": np.asarray(final_hydro.streams, dtype=np.bool_),
+            "final_flow_direction_d16": np.asarray(
+                final_hydro.flow_direction_d16, dtype=np.int8
+            ),
+            "final_meander_potential": np.asarray(
+                final_hydro.meander_potential, dtype=np.float32
+            ),
             "major_river_constraint": major.astype(np.bool_),
         }
         for name, values in arrays.items():
             _atomic_save_npy(self._path(key, name), values)
         metadata = {
-            "schema_version": 1,
+            "schema_version": 2,
             "key": asdict(key),
             "source_sha256": self.pyramid._source_hash(),
             "spec": asdict(cfg),
@@ -397,9 +590,15 @@ class LocalGeomorphologySolver:
                 "hydrology": "local_hydrology_v1",
                 "river_constraints": "river_constraints_v1",
             },
-            "eroded_sediment_volume_m3": eroded_volume_m3,
+            "eroded_sediment_volume_m3": eroded_volume_total_m3,
             "deposited_sediment_volume_m3": deposited_volume_m3,
-            "exported_sediment_volume_m3": exported_volume_m3,
+            "exported_sediment_volume_m3": exported_volume_total_m3,
+            "pre_final_channel_eroded_volume_m3": eroded_volume_m3,
+            "final_channel_incision_volume_m3": channel_volume_m3,
+            "final_channel_incision_max_m": float(np.max(channel_incision)),
+            "final_channel_incision_rms_m": float(
+                np.sqrt(np.mean(np.square(channel_incision)))
+            ),
             "sediment_closure_relative": closure,
             "major_river_constraint_cells": int(np.count_nonzero(major)),
             "procedural_detail_enabled": bool(cfg.procedural_detail_enabled),
@@ -418,14 +617,30 @@ class LocalGeomorphologySolver:
             "tile_meters_per_sample_approx": (
                 float(sample_m) if cfg.procedural_detail_enabled and np.any(land) else None
             ),
-            "physical_erosion_max_m": float(np.max(erosion)) if erosion.size else 0.0,
-            "physical_erosion_rms_m": float(np.sqrt(np.mean(np.square(erosion)))) if erosion.size else 0.0,
+            "physical_erosion_max_m": float(np.max(erosion_total)) if erosion_total.size else 0.0,
+            "physical_erosion_rms_m": float(np.sqrt(np.mean(np.square(erosion_total)))) if erosion_total.size else 0.0,
             "physical_deposition_rms_m": float(np.sqrt(np.mean(np.square(deposition)))) if deposition.size else 0.0,
             "procedural_max_absolute_detail_m": float(np.max(np.abs(procedural))),
             "procedural_detail_rms_m": float(np.sqrt(np.mean(np.square(procedural)))) if procedural.size else 0.0,
+            "tectonic_microdetail_rms_m": float(
+                np.sqrt(np.mean(np.square(tectonic_microdetail)))
+            ) if tectonic_microdetail.size else 0.0,
+            "tectonic_microdetail_max_abs_m": float(
+                np.max(np.abs(tectonic_microdetail))
+            ) if tectonic_microdetail.size else 0.0,
+            "terrain_grid_fourfold_moment": grid_moment,
+            "terrain_grid_angular_moments": grid_angular,
+            "land_area_m2": land_area_m2,
+            "mountain_area_above_1500_m_m2": mountain_area_1500_m2,
+            "mountain_area_above_2500_m_m2": mountain_area_2500_m2,
+            "rugged_land_area_slope_ge_10deg_m2": rugged_area_m2,
             "combined_geomorphic_rms_m": float(
-                np.sqrt(np.mean(np.square(anchored - base)))
+                np.sqrt(np.mean(np.square(anchored - inherited_source)))
             ) if anchored.size else 0.0,
+            "final_routing_metrics": final_routing_metrics,
+            "final_stream_cells": int(
+                np.count_nonzero(np.asarray(final_hydro.streams))
+            ),
             "legacy_and_procedural_simultaneous": bool(
                 np.any(erosion > 1.0e-9) and np.any(np.abs(procedural) > 1.0e-9)
             ),
@@ -439,9 +654,14 @@ class LocalGeomorphologySolver:
                 "finite-domain anchoring; excluded from the physical sediment mass ledger"
             ),
             "boundary_semantics": "all geomorphic terrain perturbations vanish on the tile perimeter; output core remains watertight with independently generated neighbours",
+            "final_hydrology_semantics": (
+                "D16 terrain-conforming routing is recomputed after hillslope, "
+                "procedural erosion and shallow channel incision; parent rivers are "
+                "soft topology corridors rather than stamped centrelines"
+            ),
             "limitations": [
-                "single bounded local evolution pass uses the current local drainage graph rather than iterating hydrology to full landscape equilibrium",
-                "continental drainage/discharge remains inherited from the global hierarchy",
+                "finite-domain drainage remains constrained by tile/open-boundary context rather than being a second independent continental solve",
+                "meander steering is scale-aware channel geometry, not a time-resolved lateral-migration simulation",
             ],
         }
         _atomic_json(self._metadata_path(key), metadata)

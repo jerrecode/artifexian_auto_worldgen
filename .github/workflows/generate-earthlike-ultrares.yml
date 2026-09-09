@@ -4,17 +4,24 @@ name: Earth-like ultra-resolution multiscale production
 on:
   push:
     branches:
-      - earthlike-ultrares-multiscale
+      - terrain-fidelity-rivers-v2
     paths:
       - '.github/workflows/generate-earthlike-ultrares.yml'
       - 'src/worldgen/ultrares.py'
       - 'src/worldgen/ultrares_maps.py'
       - 'src/worldgen/local_geomorphology.py'
+      - 'src/worldgen/local_hydrology.py'
+      - 'src/worldgen/river_constraints.py'
+      - 'src/worldgen/heightmap.py'
+      - 'pyproject.toml'
       - 'scripts/run_ultrares_earth.py'
       - 'scripts/render_ultrares_maps.py'
       - 'scripts/build_ultrares_earth_config.py'
       - 'tests/test_ultrares.py'
       - 'tests/test_ultrares_maps.py'
+      - 'tests/test_local_hydrology.py'
+      - 'tests/test_local_geomorphology.py'
+      - 'tests/test_heightmap.py'
   workflow_dispatch:
 
 permissions:
@@ -26,6 +33,9 @@ concurrency:
 
 jobs:
   preflight:
+    # Historical branch retired: starting this revision cancels the obsolete long run,
+    # then skips all production work on this branch.
+    if: ${{ false }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -51,6 +61,7 @@ jobs:
           python -m pytest -q \
             tests/test_ultrares.py \
             tests/test_ultrares_maps.py \
+            tests/test_heightmap.py \
             tests/test_local_geomorphology.py \
             tests/test_local_hydrology.py \
             tests/test_refinement.py \
@@ -113,11 +124,11 @@ jobs:
           python scripts/audit_generated_world.py "$ROOT"             --output "$ROOT/source_scientific_audit.json" | tee "$ROOT/source_scientific_audit.log"
           python scripts/audit_planetary_optics.py "$ROOT"             --output "$ROOT/source_optics_audit.json" --enforce | tee "$ROOT/source_optics_audit.log"
 
-      - name: Generate 4x base and 2x deeper terrain subsections
+      - name: Generate 4x base and z3 native terrain authority
         shell: bash
         run: |
           set -euxo pipefail
-          /usr/bin/time -v python scripts/run_ultrares_earth.py "$ROOT"             --workers 2             --tile-size 1024             --base-multiplier 4             --subsection-multiplier 2             --min-samples-per-wavelength 4             2>&1 | tee "$ROOT/ultrares-console.log"
+          /usr/bin/time -v python scripts/run_ultrares_earth.py "$ROOT"             --workers 2             --tile-size 1024             --base-multiplier 4             --subsection-multiplier 3             --min-samples-per-wavelength 4             --terrain-detail-strength 1.15             2>&1 | tee "$ROOT/ultrares-console.log"
 
       - name: Enforce final ultra-resolution contract
         shell: bash
@@ -135,8 +146,13 @@ jobs:
           assert audit["all_checks_passed"], audit["checks"]
           assert plan["fullview_width"] == 8192 and plan["fullview_height"] == 4096, plan
           assert plan["actual_base_multiplier"] >= 4.0 - 1e-9, plan
-          assert plan["actual_subsection_multiplier"] >= 2.0 - 1e-9, plan
-          assert plan["finest_tile_count"] == 96, plan
+          assert plan["actual_subsection_multiplier"] >= 3.0 - 1e-9, plan
+          assert plan["finest_level"] == 3, plan
+          assert plan["finest_tile_count"] == 384, plan
+          sampling = audit["sampling"]
+          assert sampling["native_output_resolution"] == [16384, 8192], sampling
+          feature_px = float(sampling["minimum_feature_width_in_native_output_pixels"])
+          assert 0.90 <= feature_px <= 1.15, sampling
 
           height = root / "ultrares" / "fullview" / "height_grayscale_16bit.png"
           with Image.open(height) as im:
@@ -152,6 +168,16 @@ jobs:
           }, indent=2, sort_keys=True))
           PY
 
+      - name: Release reconstruction scratch before map rebuild
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf "$ROOT/ultrares/reconstructed/erosion_m"
+          rm -rf "$ROOT/ultrares/reconstructed/procedural_detail_m"
+          rm -rf "$ROOT/ultrares/fullview"
+          df -h .
+          du -sh "$ROOT" "$ROOT/ultrares" || true
+
       - name: Rebuild all requested full-view maps from deepest tiles
         shell: bash
         run: |
@@ -164,22 +190,26 @@ jobs:
         run: |
           set -euxo pipefail
           python - <<'PY'
-          import json, os
+          import json, os, struct
           from pathlib import Path
+          import numpy as np
           from PIL import Image
+          import tifffile
 
           root = Path(os.environ["ROOT"])
           maps = root / "ultrares" / "fullview_maps"
           manifest = json.loads((maps / "map_manifest.json").read_text())
           assert manifest["resolution"] == [8192, 4096], manifest["resolution"]
-          assert manifest["deepest_tile_count"] == 96
+          assert manifest["deepest_tile_count"] == 384
           rows = manifest["files"]
-          assert len(rows) >= 38, len(rows)
+          assert len(rows) >= 40, len(rows)
           names = {row["file"] for row in rows}
           required = {
               "00_terrain_relief.png",
               "01_terrain_heightmap_grayscale16.png",
-              "04_rivers_deepest_tiles.png",
+              "01b_terrain_heightmap_grayscale32_native.tif",
+              "04_rivers_final_d16.png",
+              "04a_rivers_final_d16_native.png",
               "07_temperature_annual_heatmap.png",
               "08_precipitation_annual.png",
               "09_humidity_proxy_annual.png",
@@ -189,21 +219,63 @@ jobs:
               "19_true_color_refined.png",
               "20_erosion_legacy_stream_power.png",
               "21_erosion_procedural_phase_cell.png",
-              "22_erosion_combined_geomorphic_delta.png",
+              "22_erosion_combined_legacy_procedural_delta.png",
               "23_weather_hazards_with_legend.png",
               "30_resources_dominant_with_legend.png",
           }
           assert required <= names, sorted(required - names)
+
           for row in rows:
               path = maps / row["file"]
               assert path.exists() and path.stat().st_size > 0, path
-              with Image.open(path) as im:
-                  assert im.size == (8192, 4096), (path.name, im.size)
-          with Image.open(maps / "01_terrain_heightmap_grayscale16.png") as im:
-              assert im.mode in {"I;16", "I"}, im.mode
+              if path.suffix.lower() == ".png":
+                  expected = (
+                      (16384, 8192)
+                      if path.name == "04a_rivers_final_d16_native.png"
+                      else (8192, 4096)
+                  )
+                  with Image.open(path) as im:
+                      assert im.size == expected, (path.name, im.size, expected)
+
+          height16 = maps / "01_terrain_heightmap_grayscale16.png"
+          payload = height16.read_bytes()[:29]
+          assert payload[:8] == b"\x89PNG\r\n\x1a\n"
+          width, height, bit_depth, color_type, _, _, _ = struct.unpack(
+              ">IIBBBBB", payload[16:29]
+          )
+          assert (width, height) == (8192, 4096)
+          assert bit_depth == 16 and color_type == 0
+
+          height32 = maps / "01b_terrain_heightmap_grayscale32_native.tif"
+          with tifffile.TiffFile(height32) as tif:
+              page = tif.pages[0]
+              assert tuple(page.shape) == (8192, 16384), page.shape
+              assert page.dtype == np.dtype(np.uint32), page.dtype
+              assert int(page.samplesperpixel) == 1
+              assert str(page.photometric.name).upper() == "MINISBLACK"
+
+          height_meta = json.loads(
+              (maps / "01b_terrain_heightmap_grayscale32_native.json").read_text()
+          )
+          assert height_meta["channels"] == 1
+          assert height_meta["tiff_bits_per_sample"] == 32
+          assert float(height_meta["quantization_step_m"]) < 1.0e-3
+
+          audit = json.loads(
+              (root / "ultrares" / "terrain_detail_audit.json").read_text()
+          )
+          assert audit["all_checks_passed"], audit["checks"]
+          aggregate = audit["aggregate"]
           print(json.dumps({
               "map_count": len(rows),
-              "resolution": manifest["resolution"],
+              "ordinary_resolution": manifest["resolution"],
+              "native_resolution": [16384, 8192],
+              "terrain_grid_anisotropy": aggregate["terrain_square_grid_fourfold_anisotropy"],
+              "river_grid_anisotropy": aggregate["river_square_grid_fourfold_anisotropy"],
+              "river_sinuosity": aggregate["river_mean_tile_median_sinuosity"],
+              "river_max_straight_run_cells": aggregate["river_max_straight_run_cells"],
+              "land_fraction_above_1500_m": aggregate["land_fraction_above_1500_m"],
+              "land_fraction_above_2500_m": aggregate["land_fraction_above_2500_m"],
               "files": sorted(names),
           }, indent=2))
           PY
@@ -215,12 +287,35 @@ jobs:
           DERIVED="$ROOT/tiles/cubesphere_v1/derived"
           rm -rf             "$DERIVED/local_hydrology_v1"             "$DERIVED/river_constraints_v1"
           rm -rf "$ROOT/tiles/cubesphere_v1/fields"
-          for field in deposition_m hillslope_adjustment_m procedural_coherence major_river_constraint; do
+          for field in deposition_m hillslope_adjustment_m procedural_coherence tectonic_microdetail_m channel_incision_m final_flow_direction_d16 final_meander_potential major_river_constraint; do
             rm -rf "$DERIVED/local_geomorphology_v1/$field"
           done
           rm -rf             "$ROOT/ultrares/reconstructed/deposition_m"             "$ROOT/ultrares/reconstructed/hillslope_adjustment_m"
           find "$ROOT" -type f -printf '%P\t%s\n' | sort > "$ROOT/ultrares/file_inventory.tsv"
           du -sh "$ROOT" "$ROOT/ultrares" "$DERIVED/local_geomorphology_v1"
+
+      - name: Upload native 32-bit single-channel heightmap
+        uses: actions/upload-artifact@v4
+        with:
+          name: earthlike-native-height-16384x8192-u32
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            ${{ env.ROOT }}/ultrares/fullview_maps/01b_terrain_heightmap_grayscale32_native.tif
+            ${{ env.ROOT }}/ultrares/fullview_maps/01b_terrain_heightmap_grayscale32_native.json
+            ${{ env.ROOT }}/ultrares/fullview_maps/map_manifest.json
+
+      - name: Upload native final D16 river map
+        uses: actions/upload-artifact@v4
+        with:
+          name: earthlike-native-rivers-16384x8192
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            ${{ env.ROOT }}/ultrares/fullview_maps/04a_rivers_final_d16_native.png
+            ${{ env.ROOT }}/ultrares/fullview_maps/map_manifest.json
 
       - name: Upload core full-view maps
         uses: actions/upload-artifact@v4

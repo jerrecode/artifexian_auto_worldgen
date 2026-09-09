@@ -10,7 +10,7 @@ physical authority and are sampled through the deepest tile geometry without
 inventing sub-grid deposits/events.
 """
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import json
 import math
@@ -24,7 +24,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from scipy import ndimage
 
-from .heightmap import write_heightmap_png16
+from .heightmap import write_heightmap_png16, write_heightmap_tiff32
 from .local_downscaling import LocalClimateSpec
 from .local_orography import (
     OrographicDownscalingSpec,
@@ -45,6 +45,7 @@ from .ultrares import (
     UltraResolutionPlan,
     UltraResolutionTilePyramid,
     _inverse_cube_coordinates,
+    _reconstructed_path,
 )
 
 
@@ -431,7 +432,7 @@ def generate_climate_surface_products(
     pyramid: UltraResolutionTilePyramid,
     plan: UltraResolutionPlan,
 ) -> dict[str, object]:
-    """Recompute terrain-sensitive local climate/surface fields on final eroded z2 terrain."""
+    """Recompute terrain-sensitive local climate/surface fields on final deepest terrain."""
     climate_cfg = LocalClimateSpec().validate()
     oro_cfg = OrographicDownscalingSpec().validate()
     surface_cfg = LocalSurfaceSpec().validate()
@@ -453,10 +454,15 @@ def generate_climate_surface_products(
         "true_color_rgb",
     )
 
-    for key in _level_keys(plan.finest_level):
+    product_level = int(plan.base_level)
+    for key in _level_keys(product_level):
         geom = tile_geometry(key, pyramid.spec.tile_size)
         final_elevation = np.asarray(
-            np.load(_geomorph_path(pyramid, "elevation_m", key), mmap_mode="r", allow_pickle=False),
+            np.load(
+                _reconstructed_path(root, key, "elevation_m"),
+                mmap_mode="r",
+                allow_pickle=False,
+            ),
             dtype=np.float64,
         )
         inherited_elevation = np.asarray(
@@ -690,7 +696,11 @@ def generate_climate_surface_products(
     metadata = {
         "category": "climate_surface",
         "fields": list(fields),
-        "source": "deepest final geomorphology elevation plus inherited global climate boundary state",
+        "product_level": product_level,
+        "source": (
+            "terrain propagated upward from deepest final geomorphology to the "
+            "8192-class base LOD plus inherited global climate boundary state"
+        ),
         "terrain_sensitive_recomputed": True,
         "true_color_semantics": (
             "global physical appearance recolored only by locally recomputed vegetation, "
@@ -731,7 +741,8 @@ def generate_weather_products(
             1.0e-12,
         )
 
-    for key in _level_keys(plan.finest_level):
+    product_level = int(plan.base_level)
+    for key in _level_keys(product_level):
         geom = tile_geometry(key, pyramid.spec.tile_size)
         surface_root = root / "ultrares" / "deepest_products" / "climate_surface"
         moisture = np.asarray(
@@ -805,6 +816,7 @@ def generate_weather_products(
 
     metadata = {
         "category": "weather",
+        "product_level": product_level,
         "fields": list(WEATHER_GROUPS) + ["dominant_weather_code", "dominant_weather_strength"],
         "source_percentile_scales": scales,
         "semantics": (
@@ -824,7 +836,8 @@ def generate_resource_products(
     root = pyramid.world_root
     available = set(pyramid._source_metadata()[1])
     used: dict[str, list[str]] = {}
-    for key in _level_keys(plan.finest_level):
+    product_level = int(plan.base_level)
+    for key in _level_keys(product_level):
         geom = tile_geometry(key, pyramid.spec.tile_size)
         groups: list[np.ndarray] = []
         for group, candidates in RESOURCE_GROUPS.items():
@@ -862,6 +875,7 @@ def generate_resource_products(
 
     metadata = {
         "category": "resources",
+        "product_level": product_level,
         "groups": {key: list(value) for key, value in RESOURCE_GROUPS.items()},
         "available_group_inputs": used,
         "semantics": (
@@ -882,8 +896,12 @@ def _sample_deepest_to_npy(
     mode: str = "linear",
     output_dtype: np.dtype | str | None = None,
     chunk_rows: int = 64,
+    width: int | None = None,
+    height: int | None = None,
+    value_scale: float = 1.0,
+    level: int | None = None,
 ) -> Path:
-    level = int(plan.finest_level)
+    level = int(plan.finest_level if level is None else level)
     side = 1 << level
     n = int(plan.tile_size)
     first = np.asarray(
@@ -893,12 +911,13 @@ def _sample_deepest_to_npy(
         raise ValueError(f"deepest tile shape must begin {(n + 1, n + 1)}, got {first.shape}")
     trailing = first.shape[2:]
     dtype = np.dtype(output_dtype or first.dtype)
-    shape = (int(plan.fullview_height), int(plan.fullview_width), *trailing)
+    width = int(plan.fullview_width if width is None else width)
+    height = int(plan.fullview_height if height is None else height)
+    if width < 2 or height < 1 or width != 2 * height:
+        raise ValueError("equirectangular output must be a positive canonical 2:1 raster")
+    shape = (height, width, *trailing)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     out = np.lib.format.open_memmap(output_path, mode="w+", dtype=dtype, shape=shape)
-
-    width = int(plan.fullview_width)
-    height = int(plan.fullview_height)
     lon = -math.pi + (np.arange(width, dtype=np.float64) + 0.5) * (2.0 * math.pi / width)
     cos_lon = np.cos(lon)
     sin_lon = np.sin(lon)
@@ -967,6 +986,8 @@ def _sample_deepest_to_npy(
                     + a[y1, x1] * fx * fy
                 )
             chunk[mask] = np.asarray(sampled, dtype=dtype)
+        if float(value_scale) != 1.0:
+            chunk = np.asarray(chunk, dtype=dtype) * float(value_scale)
         out[y_start:y_stop] = chunk
     out.flush()
     return output_path
@@ -1215,19 +1236,56 @@ def _render_river_composite(
     streams_path: Path,
     png_path: Path,
 ) -> dict[str, object]:
+    """Render very large river maps in bounded memory."""
     drainage = np.load(drainage_path, mmap_mode="r", allow_pickle=False)
     discharge = np.load(discharge_path, mmap_mode="r", allow_pickle=False)
     streams = np.load(streams_path, mmap_mode="r", allow_pickle=False)
-    d = np.log1p(np.maximum(np.asarray(drainage, dtype=np.float64), 0.0))
-    _, d_hi = _sample_percentiles(d, 1.0, 99.8)
-    dn = np.clip(d / max(d_hi, 1.0e-12), 0.0, 1.0)
-    qn = np.clip(np.asarray(discharge, dtype=np.float64), 0.0, 1.0)
-    intensity = np.clip((0.65 * dn + 0.35 * qn) * (0.15 + 0.85 * (np.asarray(streams) > 0)), 0.0, 1.0)
-    rgb = _ramp(intensity, PALETTES["water"])
-    image = Image.fromarray(rgb, mode="RGB")
+    if drainage.shape != discharge.shape or drainage.shape != streams.shape:
+        raise ValueError("river map arrays must have identical shapes")
+
+    sample = np.log1p(
+        np.maximum(np.asarray(drainage[::8, ::8], dtype=np.float64), 0.0)
+    )
+    finite = sample[np.isfinite(sample)]
+    d_hi = float(np.percentile(finite, 99.8)) if finite.size else 1.0
+    d_hi = max(d_hi, 1.0e-12)
+
+    tmp = png_path.with_suffix(".river.rgb.tmp")
+    rgb = np.memmap(
+        tmp,
+        mode="w+",
+        dtype=np.uint8,
+        shape=(drainage.shape[0], drainage.shape[1], 3),
+    )
+    for y0 in range(0, drainage.shape[0], 128):
+        y1 = min(drainage.shape[0], y0 + 128)
+        d = np.log1p(
+            np.maximum(
+                np.asarray(drainage[y0:y1], dtype=np.float64),
+                0.0,
+            )
+        )
+        dn = np.clip(d / d_hi, 0.0, 1.0)
+        qn = np.clip(
+            np.asarray(discharge[y0:y1], dtype=np.float64),
+            0.0,
+            1.0,
+        )
+        channel = np.asarray(streams[y0:y1]) > 0
+        # Keep drainage context visible but make the actual routed centreline the
+        # dominant feature, so sinuosity is not hidden by broad accumulation.
+        intensity = np.clip(
+            (0.42 * dn + 0.58 * qn)
+            * (0.055 + 0.945 * channel),
+            0.0,
+            1.0,
+        )
+        rgb[y0:y1] = _ramp(intensity, PALETTES["water"])
+    rgb.flush()
+    image = Image.fromarray(np.asarray(rgb), mode="RGB")
     _draw_scalar_legend(
         image,
-        title="Deepest-tile river / drainage hierarchy",
+        title="Final-terrain D16 river / drainage hierarchy",
         units="relative",
         lo=0.0,
         hi=1.0,
@@ -1235,9 +1293,12 @@ def _render_river_composite(
     )
     png_path.parent.mkdir(parents=True, exist_ok=True)
     image.save(png_path, format="PNG", compress_level=6)
+    del image
+    del rgb
+    tmp.unlink(missing_ok=True)
     return {
         "file": png_path.name,
-        "title": "Deepest-tile river / drainage hierarchy",
+        "title": "Final-terrain D16 river / drainage hierarchy",
         "resolution": [int(drainage.shape[1]), int(drainage.shape[0])],
     }
 
@@ -1325,6 +1386,8 @@ def reconstruct_fullview_maps(
     output.mkdir(parents=True, exist_ok=True)
     temp.mkdir(parents=True, exist_ok=True)
     manifest: list[dict[str, object]] = []
+    native_width = int(plan.fullview_width * 2)
+    native_height = int(plan.fullview_height * 2)
 
     def sample(
         name: str,
@@ -1332,6 +1395,10 @@ def reconstruct_fullview_maps(
         *,
         mode: str = "linear",
         dtype: str | np.dtype | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        value_scale: float = 1.0,
+        level: int | None = None,
     ) -> Path:
         return _sample_deepest_to_npy(
             plan,
@@ -1339,48 +1406,94 @@ def reconstruct_fullview_maps(
             temp / f"{name}.npy",
             mode=mode,
             output_dtype=dtype,
+            width=width,
+            height=height,
+            value_scale=value_scale,
+            level=level,
         )
 
     # Terrain and erosion use the actual final deepest geomorphology tiles.
     elev = sample("elevation_m", lambda key: _geomorph_path(pyramid, "elevation_m", key), dtype="float32")
     erosion = sample("erosion_m", lambda key: _geomorph_path(pyramid, "erosion_m", key), dtype="float32")
     proc = sample("procedural_detail_m", lambda key: _geomorph_path(pyramid, "procedural_detail_m", key), dtype="float32")
-    base = sample("base_elevation_m", lambda key: _base_tile_path(pyramid, "elevation_m", key), dtype="float32")
-    combined_path = temp / "combined_geomorphic_delta_m.npy"
+    combined_path = temp / "combined_erosion_morphology_delta_m.npy"
     combined = np.lib.format.open_memmap(
         combined_path,
         mode="w+",
         dtype=np.float32,
         shape=(plan.fullview_height, plan.fullview_width),
     )
-    e_arr = np.load(elev, mmap_mode="r", allow_pickle=False)
-    b_arr = np.load(base, mmap_mode="r", allow_pickle=False)
+    erosion_arr = np.load(erosion, mmap_mode="r", allow_pickle=False)
+    proc_arr = np.load(proc, mmap_mode="r", allow_pickle=False)
     for start in range(0, plan.fullview_height, 128):
         stop = min(plan.fullview_height, start + 128)
-        combined[start:stop] = np.asarray(e_arr[start:stop], dtype=np.float32) - np.asarray(
-            b_arr[start:stop], dtype=np.float32
+        combined[start:stop] = (
+            np.asarray(proc_arr[start:stop], dtype=np.float32)
+            - np.asarray(erosion_arr[start:stop], dtype=np.float32)
         )
     combined.flush()
     del combined
 
-    # Rivers: materialize fullview while the local hydrology cache still exists.
+    # Emit native height first. Once its TIFF exists, the multi-gigabyte z3
+    # elevation/erosion/procedural authorities are no longer needed because their
+    # 8192 scratch products above and reconstructed z1 elevation remain available.
+    native_elev_km = sample(
+        "native_elevation_km",
+        lambda key: _geomorph_path(pyramid, "elevation_m", key),
+        dtype="float64",
+        width=native_width,
+        height=native_height,
+        value_scale=0.001,
+    )
+    native_tiff = output / "01b_terrain_heightmap_grayscale32_native.tif"
+    native_tiff_meta = output / "01b_terrain_heightmap_grayscale32_native.json"
+    native_height_meta = write_heightmap_tiff32(
+        native_tiff,
+        np.load(native_elev_km, mmap_mode="r", allow_pickle=False),
+        metadata_path=native_tiff_meta,
+        chunk_rows=96,
+    )
+    manifest.append({
+        "file": native_tiff.name,
+        "metadata_file": native_tiff_meta.name,
+        "title": "Native final terrain heightmap",
+        "encoding": (
+            "single-channel min-is-black uint32 BigTIFF; global min->0 "
+            "global max->4294967295"
+        ),
+        "channels": 1,
+        "bits_per_sample": 32,
+        "quantization_step_m": float(native_height_meta["quantization_step_m"]),
+        "resolution": [native_width, native_height],
+    })
+    _remove_fullview_temp(native_elev_km)
+
+    if cleanup_heavy_solver_caches:
+        for field in ("elevation_m", "erosion_m", "procedural_detail_m"):
+            shutil.rmtree(
+                pyramid.root / "derived" / "local_geomorphology_v1" / field,
+                ignore_errors=True,
+            )
+
+    # Rivers must come from the final-terrain reroute saved by geomorphology,
+    # never from the pre-erosion local_hydrology cache.
     drainage = sample(
-        "drainage_area_km2",
-        lambda key: _hydrology_path(pyramid, "drainage_area_km2", key),
+        "final_drainage_area_km2",
+        lambda key: _geomorph_path(pyramid, "final_drainage_area_km2", key),
         dtype="float32",
     )
     discharge = sample(
-        "discharge_index",
-        lambda key: _hydrology_path(pyramid, "discharge_index", key),
+        "final_discharge_index",
+        lambda key: _geomorph_path(pyramid, "final_discharge_index", key),
         dtype="float32",
     )
     streams = sample(
-        "streams",
-        lambda key: _hydrology_path(pyramid, "streams", key),
+        "final_streams",
+        lambda key: _geomorph_path(pyramid, "final_streams", key),
         mode="nearest",
         dtype="uint8",
     )
-    river_png = output / "04_rivers_deepest_tiles.png"
+    river_png = output / "04_rivers_final_d16.png"
     manifest.append(_render_river_composite(drainage, discharge, streams, river_png))
     manifest.append(
         _render_scalar(
@@ -1405,9 +1518,59 @@ def reconstruct_fullview_maps(
         )
     )
     _remove_fullview_temp(drainage, discharge, streams)
+
+    # Native river image preserves z3 sinuosity instead of collapsing it back to
+    # the 8192-wide climate-product raster.
+    native_drainage = sample(
+        "native_final_drainage_area_km2",
+        lambda key: _geomorph_path(pyramid, "final_drainage_area_km2", key),
+        dtype="float32",
+        width=native_width,
+        height=native_height,
+    )
+    native_discharge = sample(
+        "native_final_discharge_index",
+        lambda key: _geomorph_path(pyramid, "final_discharge_index", key),
+        dtype="float32",
+        width=native_width,
+        height=native_height,
+    )
+    native_streams = sample(
+        "native_final_streams",
+        lambda key: _geomorph_path(pyramid, "final_streams", key),
+        mode="nearest",
+        dtype="uint8",
+        width=native_width,
+        height=native_height,
+    )
+    manifest.append(
+        _render_river_composite(
+            native_drainage,
+            native_discharge,
+            native_streams,
+            output / "04a_rivers_final_d16_native.png",
+        )
+    )
+    _remove_fullview_temp(native_drainage, native_discharge, native_streams)
+
     if cleanup_heavy_solver_caches:
-        shutil.rmtree(pyramid.root / "derived" / "local_hydrology_v1", ignore_errors=True)
-        shutil.rmtree(pyramid.root / "derived" / "river_constraints_v1", ignore_errors=True)
+        for field in (
+            "final_drainage_area_km2",
+            "final_discharge_index",
+            "final_streams",
+        ):
+            shutil.rmtree(
+                pyramid.root / "derived" / "local_geomorphology_v1" / field,
+                ignore_errors=True,
+            )
+        shutil.rmtree(
+            pyramid.root / "derived" / "local_hydrology_v1",
+            ignore_errors=True,
+        )
+        shutil.rmtree(
+            pyramid.root / "derived" / "river_constraints_v1",
+            ignore_errors=True,
+        )
 
     # Recompute terrain-sensitive climate/surface products using final elevation.
     generate_climate_surface_products(pyramid, plan)
@@ -1429,6 +1592,7 @@ def reconstruct_fullview_maps(
             lambda key, field=field: _field_path(root, "climate_surface", field, key),
             mode=mode,
             dtype=dtype,
+            level=plan.base_level,
         )
 
     # Terrain render now uses slope recomputed against final eroded terrain.
@@ -1447,6 +1611,7 @@ def reconstruct_fullview_maps(
         "encoding": "lossless 16-bit grayscale; global min->0 global max->65535",
         "resolution": [plan.fullview_width, plan.fullview_height],
     })
+
     manifest.insert(2, _render_scalar(
         elev,
         output / "02_elevation_heatmap.png",
@@ -1607,8 +1772,8 @@ def reconstruct_fullview_maps(
             ),
             _render_scalar(
                 combined_path,
-                output / "22_erosion_combined_geomorphic_delta.png",
-                title="Combined local geomorphic terrain delta",
+                output / "22_erosion_combined_legacy_procedural_delta.png",
+                title="Combined legacy-incision + procedural erosion displacement",
                 units="m",
                 palette="signed",
                 signed=True,
@@ -1635,6 +1800,7 @@ def reconstruct_fullview_maps(
             lambda key, field=field: _field_path(root, "weather", field, key),
             mode="nearest" if field == "dominant_weather_code" else "linear",
             dtype="uint8" if field == "dominant_weather_code" else "float32",
+            level=plan.base_level,
         )
     weather_labels = {i: name.replace("_", " ") for i, name in enumerate(WEATHER_GROUPS)}
     manifest.append(
@@ -1676,6 +1842,7 @@ def reconstruct_fullview_maps(
             lambda key, field=field: _field_path(root, "resources", field, key),
             mode="nearest" if field == "dominant_resource_code" else "linear",
             dtype="uint8" if field == "dominant_resource_code" else "float32",
+            level=plan.base_level,
         )
     resource_labels = {i: name.replace("_", " / ") for i, name in enumerate(RESOURCE_GROUPS)}
     manifest.append(
@@ -1710,7 +1877,6 @@ def reconstruct_fullview_maps(
 
     # Scientific temporary fullview arrays used only to render images can now go.
     _remove_fullview_temp(
-        base,
         erosion,
         proc,
         combined_path,
