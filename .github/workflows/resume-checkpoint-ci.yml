@@ -1,0 +1,51 @@
+name: Ultrares resumability validation
+
+on:
+  push:
+    branches:
+      - ultrares-resumable-shards
+    paths:
+      - '.github/workflows/resume-checkpoint-ci.yml'
+      - '.github/workflows/generate-earthlike-ultrares.yml'
+      - 'src/worldgen/ultrares.py'
+      - 'scripts/run_ultrares_earth.py'
+      - 'tests/test_ultrares.py'
+  pull_request:
+    paths:
+      - '.github/workflows/generate-earthlike-ultrares.yml'
+      - 'src/worldgen/ultrares.py'
+      - 'scripts/run_ultrares_earth.py'
+      - 'tests/test_ultrares.py'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      MPLBACKEND: Agg
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_MAX_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install test stack
+        run: |
+          set -euxo pipefail
+          python -m pip install --disable-pip-version-check -e '.[performance,jit,storage,thermodynamics,render,dev]'
+          python -m pip check
+      - name: Compile changed Python
+        run: |
+          set -euxo pipefail
+          python -m py_compile src/worldgen/ultrares.py scripts/run_ultrares_earth.py tests/test_ultrares.py
+      - name: Run focused ultra-resolution tests
+        run: |
+          set -euxo pipefail
+          python -m pytest -q tests/test_ultrares.py

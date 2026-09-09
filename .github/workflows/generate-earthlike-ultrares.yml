@@ -1,5 +1,5 @@
 name: Earth-like ultra-resolution multiscale production
-# Produces full-view physical map images reconstructed from deepest terrain tiles.
+# Resumable production: compact global authority -> deterministic z3 shards -> audit/rebuild.
 
 on:
   push:
@@ -28,20 +28,28 @@ on:
 permissions:
   contents: read
 
+# Never throw away hours of deterministic production merely because a new commit lands.
 concurrency:
   group: earthlike-ultrares-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
+
+env:
+  MPLBACKEND: Agg
+  WORLDGEN_DISTANCE_CACHE_MB: '128'
+  OMP_NUM_THREADS: '1'
+  OPENBLAS_NUM_THREADS: '1'
+  MKL_NUM_THREADS: '1'
+  NUMEXPR_MAX_THREADS: '1'
+  NUMBA_CACHE_DIR: ${{ github.workspace }}/.numba-cache
+  SEED: '2026090707'
+  ROOT: output/earthlike-ultrares-2026090707
+  CONFIG: validation-configs/earthlike-ultrares-2026090707.yaml
+  SHARD_COUNT: '24'
 
 jobs:
   preflight:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    env:
-      MPLBACKEND: Agg
-      OMP_NUM_THREADS: '1'
-      OPENBLAS_NUM_THREADS: '1'
-      MKL_NUM_THREADS: '1'
-      NUMEXPR_MAX_THREADS: '1'
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-python@v7.0.0
@@ -53,7 +61,7 @@ jobs:
           set -euxo pipefail
           python -m pip install --disable-pip-version-check -e '.[performance,jit,storage,thermodynamics,render,dev]'
           python -m pip check
-      - name: Run multiscale and erosion regression gates
+      - name: Run multiscale, resume, and erosion regression gates
         run: |
           set -euxo pipefail
           python -m pytest -q \
@@ -68,66 +76,192 @@ jobs:
             tests/test_pipeline_procedural_erosion.py \
             tests/test_diagnostics_surface_liquids.py
 
-  produce:
+  source:
     needs: preflight
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
-    env:
-      MPLBACKEND: Agg
-      WORLDGEN_DISTANCE_CACHE_MB: '128'
-      OMP_NUM_THREADS: '1'
-      OPENBLAS_NUM_THREADS: '1'
-      MKL_NUM_THREADS: '1'
-      NUMEXPR_MAX_THREADS: '1'
-      NUMBA_CACHE_DIR: ${{ github.workspace }}/.numba-cache
-      SEED: '2026090707'
-      ROOT: output/earthlike-ultrares-2026090707
-      CONFIG: validation-configs/earthlike-ultrares-2026090707.yaml
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.12'
           cache: pip
-
       - name: Install production stack
         run: |
           set -euxo pipefail
           python -m pip install --disable-pip-version-check -e '.[performance,jit,storage,thermodynamics,render]'
-          python -m pip install --disable-pip-version-check pytest
           python -m pip check
-
       - name: Build full-detail Earth source profile
         run: |
           set -euxo pipefail
           mkdir -p validation-configs
-          python scripts/build_ultrares_earth_config.py             --base config/ultra_detail.yaml             --out "$CONFIG"             --seed "$SEED"
-
+          python scripts/build_ultrares_earth_config.py \
+            --base config/ultra_detail.yaml \
+            --out "$CONFIG" \
+            --seed "$SEED"
       - name: Validate source runtime plan
         run: |
           set -euxo pipefail
-          worldgen --runtime-info --dry-run             --config "$CONFIG" --seed "$SEED" --resolution 2048x1024             --workers 4 --worker-cap 4 --threads-per-worker 1             --memory-per-worker-mb 1350
-
+          worldgen --runtime-info --dry-run \
+            --config "$CONFIG" --seed "$SEED" --resolution 2048x1024 \
+            --workers 4 --worker-cap 4 --threads-per-worker 1 \
+            --memory-per-worker-mb 1350
       - name: Generate globally coupled full-detail Earth source
         shell: bash
         run: |
           set -euxo pipefail
           rm -rf "$ROOT"
           mkdir -p "$ROOT"
-          /usr/bin/time -v worldgen generate             --config "$CONFIG"             --seed "$SEED"             --resolution 2048x1024             --out "$ROOT"             --workers 4 --worker-cap 4 --threads-per-worker 1             --memory-per-worker-mb 1350             --checkpoint-dir "$ROOT/checkpoints" --checkpoint-max-gb 18             --compress-npz             --diagnostics --manifest --hash-outputs             --max-png-megapixels 120             --timings-json "$ROOT/timings_cli.json"             --progress-detail -vv             --log-file "$ROOT/generation.log" --log-json             2>&1 | tee "$ROOT/generation-console.log"
-
+          /usr/bin/time -v worldgen generate \
+            --config "$CONFIG" \
+            --seed "$SEED" \
+            --resolution 2048x1024 \
+            --out "$ROOT" \
+            --workers 4 --worker-cap 4 --threads-per-worker 1 \
+            --memory-per-worker-mb 1350 \
+            --checkpoint-dir "$ROOT/checkpoints" --checkpoint-max-gb 18 \
+            --compress-npz \
+            --diagnostics --manifest --hash-outputs \
+            --max-png-megapixels 120 \
+            --timings-json "$ROOT/timings_cli.json" \
+            --progress-detail -vv \
+            --log-file "$ROOT/generation.log" --log-json \
+            2>&1 | tee "$ROOT/generation-console.log"
       - name: Audit global source before compaction
         run: |
           set -euxo pipefail
-          python scripts/audit_generated_world.py "$ROOT"             --output "$ROOT/source_scientific_audit.json" | tee "$ROOT/source_scientific_audit.log"
-          python scripts/audit_planetary_optics.py "$ROOT"             --output "$ROOT/source_optics_audit.json" --enforce | tee "$ROOT/source_optics_audit.log"
+          python scripts/audit_generated_world.py "$ROOT" \
+            --output "$ROOT/source_scientific_audit.json" \
+            | tee "$ROOT/source_scientific_audit.log"
+          python scripts/audit_planetary_optics.py "$ROOT" \
+            --output "$ROOT/source_optics_audit.json" --enforce \
+            | tee "$ROOT/source_optics_audit.log"
+      - name: Compact deterministic ultra-resolution authority
+        run: |
+          set -euxo pipefail
+          python scripts/run_ultrares_earth.py "$ROOT" --mode compact \
+            2>&1 | tee "$ROOT/authority-compaction.log"
+      - name: Upload compact source authority
+        uses: actions/upload-artifact@v4
+        with:
+          name: earthlike-ultrares-source-2026090707
+          path: ${{ env.ROOT }}/
+          retention-days: 3
+          compression-level: 3
+          overwrite: true
+          if-no-files-found: error
 
-      - name: Generate 4x base and z3 native terrain authority
+  terrain:
+    needs: source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install production stack
+        run: |
+          set -euxo pipefail
+          python -m pip install --disable-pip-version-check -e '.[performance,jit,storage,thermodynamics,render]'
+          python -m pip check
+      - name: Restore compact source authority
+        uses: actions/download-artifact@v4
+        with:
+          name: earthlike-ultrares-source-2026090707
+          path: ${{ env.ROOT }}
+      - name: Restore prior partial shard checkpoint when rerunning
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: earthlike-ultrares-terrain-shard-${{ matrix.shard }}-of-24
+          path: ${{ env.ROOT }}
+      - name: Generate resumable z3 terrain shard
         shell: bash
         run: |
           set -euxo pipefail
-          /usr/bin/time -v python scripts/run_ultrares_earth.py "$ROOT"             --workers 2             --tile-size 1024             --base-multiplier 4             --subsection-multiplier 3             --min-samples-per-wavelength 4             --terrain-detail-strength 1.15             2>&1 | tee "$ROOT/ultrares-console.log"
+          /usr/bin/time -v python scripts/run_ultrares_earth.py "$ROOT" \
+            --mode shard \
+            --no-compact \
+            --workers 2 \
+            --tile-size 1024 \
+            --base-multiplier 4 \
+            --subsection-multiplier 3 \
+            --min-samples-per-wavelength 4 \
+            --terrain-detail-strength 1.15 \
+            --shard-index "${{ matrix.shard }}" \
+            --shard-count "$SHARD_COUNT" \
+            2>&1 | tee "$ROOT/ultrares-shard-${{ matrix.shard }}.log"
+      - name: Persist shard restart authority
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: earthlike-ultrares-terrain-shard-${{ matrix.shard }}-of-24
+          retention-days: 3
+          compression-level: 3
+          overwrite: true
+          if-no-files-found: warn
+          path: |
+            ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/
+            ${{ env.ROOT }}/ultrares/tile_checkpoints/
+            ${{ env.ROOT }}/ultrares/progress-shard-*.json
+            ${{ env.ROOT }}/ultrares/shard-*.json
+            ${{ env.ROOT }}/ultrares-shard-*.log
 
+  finalize:
+    needs: [source, terrain]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install production stack
+        run: |
+          set -euxo pipefail
+          python -m pip install --disable-pip-version-check -e '.[performance,jit,storage,thermodynamics,render]'
+          python -m pip install --disable-pip-version-check pytest
+          python -m pip check
+      - name: Restore compact source authority
+        uses: actions/download-artifact@v4
+        with:
+          name: earthlike-ultrares-source-2026090707
+          path: ${{ env.ROOT }}
+      - name: Gather all terrain shard authorities
+        uses: actions/download-artifact@v4
+        with:
+          pattern: earthlike-ultrares-terrain-shard-*-of-24
+          path: ${{ env.ROOT }}
+          merge-multiple: true
+      - name: Rebuild deterministic source profile for provenance
+        run: |
+          set -euxo pipefail
+          mkdir -p validation-configs
+          python scripts/build_ultrares_earth_config.py \
+            --base config/ultra_detail.yaml \
+            --out "$CONFIG" \
+            --seed "$SEED"
+      - name: Validate all 384 checkpoints and reconstruct ultra-resolution authority
+        shell: bash
+        run: |
+          set -euxo pipefail
+          /usr/bin/time -v python scripts/run_ultrares_earth.py "$ROOT" \
+            --mode finalize \
+            --workers 2 \
+            --tile-size 1024 \
+            --base-multiplier 4 \
+            --subsection-multiplier 3 \
+            --min-samples-per-wavelength 4 \
+            --terrain-detail-strength 1.15 \
+            2>&1 | tee "$ROOT/ultrares-finalize.log"
       - name: Enforce final ultra-resolution contract
         shell: bash
         run: |
@@ -159,13 +293,8 @@ jobs:
           elev = np.load(root / "ultrares" / "fullview" / "elevation_m.npy", mmap_mode="r")
           assert elev.shape == (4096, 8192)
           assert np.isfinite(elev).all()
-          print(json.dumps({
-              "plan": plan,
-              "aggregate": audit["aggregate"],
-              "checks": audit["checks"],
-          }, indent=2, sort_keys=True))
+          print(json.dumps({"plan": plan, "aggregate": audit["aggregate"], "checks": audit["checks"]}, indent=2, sort_keys=True))
           PY
-
       - name: Release reconstruction scratch before map rebuild
         shell: bash
         run: |
@@ -175,14 +304,12 @@ jobs:
           rm -rf "$ROOT/ultrares/fullview"
           df -h .
           du -sh "$ROOT" "$ROOT/ultrares" || true
-
       - name: Rebuild all requested full-view maps from deepest tiles
         shell: bash
         run: |
           set -euxo pipefail
           /usr/bin/time -v python scripts/render_ultrares_maps.py "$ROOT" \
             2>&1 | tee "$ROOT/ultrares-map-render.log"
-
       - name: Validate reconstructed map suite
         shell: bash
         run: |
@@ -224,74 +351,54 @@ jobs:
           assert required <= names, sorted(required - names)
 
           for row in rows:
-              path = maps / row["file"]
-              assert path.exists() and path.stat().st_size > 0, path
-              if path.suffix.lower() == ".png":
-                  expected = (
-                      (16384, 8192)
-                      if path.name == "04a_rivers_final_d16_native.png"
-                      else (8192, 4096)
-                  )
-                  with Image.open(path) as im:
-                      assert im.size == expected, (path.name, im.size, expected)
+              p = maps / row["file"]
+              assert p.exists() and p.stat().st_size > 0, p
+              if p.suffix.lower() == ".png":
+                  expected = (16384, 8192) if p.name == "04a_rivers_final_d16_native.png" else (8192, 4096)
+                  with Image.open(p) as im:
+                      assert im.size == expected, (p.name, im.size, expected)
 
-          height16 = maps / "01_terrain_heightmap_grayscale16.png"
-          payload = height16.read_bytes()[:29]
+          payload = (maps / "01_terrain_heightmap_grayscale16.png").read_bytes()[:29]
           assert payload[:8] == b"\x89PNG\r\n\x1a\n"
-          width, height, bit_depth, color_type, _, _, _ = struct.unpack(
-              ">IIBBBBB", payload[16:29]
-          )
+          width, height, bit_depth, color_type, _, _, _ = struct.unpack(">IIBBBBB", payload[16:29])
           assert (width, height) == (8192, 4096)
           assert bit_depth == 16 and color_type == 0
 
-          height32 = maps / "01b_terrain_heightmap_grayscale32_native.tif"
-          with tifffile.TiffFile(height32) as tif:
+          with tifffile.TiffFile(maps / "01b_terrain_heightmap_grayscale32_native.tif") as tif:
               page = tif.pages[0]
               assert tuple(page.shape) == (8192, 16384), page.shape
               assert page.dtype == np.dtype(np.uint32), page.dtype
               assert int(page.samplesperpixel) == 1
               assert str(page.photometric.name).upper() == "MINISBLACK"
 
-          height_meta = json.loads(
-              (maps / "01b_terrain_heightmap_grayscale32_native.json").read_text()
-          )
+          height_meta = json.loads((maps / "01b_terrain_heightmap_grayscale32_native.json").read_text())
           assert height_meta["channels"] == 1
           assert height_meta["tiff_bits_per_sample"] == 32
           assert float(height_meta["quantization_step_m"]) < 1.0e-3
 
-          audit = json.loads(
-              (root / "ultrares" / "terrain_detail_audit.json").read_text()
-          )
+          audit = json.loads((root / "ultrares" / "terrain_detail_audit.json").read_text())
           assert audit["all_checks_passed"], audit["checks"]
-          aggregate = audit["aggregate"]
           print(json.dumps({
               "map_count": len(rows),
               "ordinary_resolution": manifest["resolution"],
               "native_resolution": [16384, 8192],
-              "terrain_grid_anisotropy": aggregate["terrain_square_grid_fourfold_anisotropy"],
-              "river_grid_anisotropy": aggregate["river_square_grid_fourfold_anisotropy"],
-              "river_sinuosity": aggregate["river_mean_tile_median_sinuosity"],
-              "river_max_straight_run_cells": aggregate["river_max_straight_run_cells"],
-              "land_fraction_above_1500_m": aggregate["land_fraction_above_1500_m"],
-              "land_fraction_above_2500_m": aggregate["land_fraction_above_2500_m"],
+              "aggregate": audit["aggregate"],
               "files": sorted(names),
           }, indent=2))
           PY
-
       - name: Prune reproducible intermediate caches after successful audit
         shell: bash
         run: |
           set -euxo pipefail
           DERIVED="$ROOT/tiles/cubesphere_v1/derived"
-          rm -rf             "$DERIVED/local_hydrology_v1"             "$DERIVED/river_constraints_v1"
+          rm -rf "$DERIVED/local_hydrology_v1" "$DERIVED/river_constraints_v1"
           rm -rf "$ROOT/tiles/cubesphere_v1/fields"
           for field in deposition_m hillslope_adjustment_m procedural_coherence tectonic_microdetail_m channel_incision_m final_flow_direction_d16 final_meander_potential major_river_constraint; do
             rm -rf "$DERIVED/local_geomorphology_v1/$field"
           done
-          rm -rf             "$ROOT/ultrares/reconstructed/deposition_m"             "$ROOT/ultrares/reconstructed/hillslope_adjustment_m"
+          rm -rf "$ROOT/ultrares/reconstructed/deposition_m" "$ROOT/ultrares/reconstructed/hillslope_adjustment_m"
           find "$ROOT" -type f -printf '%P\t%s\n' | sort > "$ROOT/ultrares/file_inventory.tsv"
           du -sh "$ROOT" "$ROOT/ultrares" "$DERIVED/local_geomorphology_v1"
-
       - name: Upload native 32-bit single-channel heightmap
         uses: actions/upload-artifact@v4
         with:
@@ -303,7 +410,6 @@ jobs:
             ${{ env.ROOT }}/ultrares/fullview_maps/01b_terrain_heightmap_grayscale32_native.tif
             ${{ env.ROOT }}/ultrares/fullview_maps/01b_terrain_heightmap_grayscale32_native.json
             ${{ env.ROOT }}/ultrares/fullview_maps/map_manifest.json
-
       - name: Upload native final D16 river map
         uses: actions/upload-artifact@v4
         with:
@@ -314,7 +420,6 @@ jobs:
           path: |
             ${{ env.ROOT }}/ultrares/fullview_maps/04a_rivers_final_d16_native.png
             ${{ env.ROOT }}/ultrares/fullview_maps/map_manifest.json
-
       - name: Upload core full-view maps
         uses: actions/upload-artifact@v4
         with:
@@ -329,7 +434,6 @@ jobs:
             ${{ env.ROOT }}/ultrares/fullview_maps/01_terrain_heightmap_grayscale16.json
             ${{ env.ROOT }}/ultrares/fullview_maps/elevation_m.npy
             ${{ env.ROOT }}/ultrares/fullview_maps/map_manifest.json
-
       - name: Upload weather full-view maps
         uses: actions/upload-artifact@v4
         with:
@@ -340,7 +444,6 @@ jobs:
           path: |
             ${{ env.ROOT }}/ultrares/fullview_maps/2[3-9]_*.png
             ${{ env.ROOT }}/ultrares/fullview_maps/map_manifest.json
-
       - name: Upload resource full-view maps
         uses: actions/upload-artifact@v4
         with:
@@ -351,7 +454,6 @@ jobs:
           path: |
             ${{ env.ROOT }}/ultrares/fullview_maps/3*.png
             ${{ env.ROOT }}/ultrares/fullview_maps/map_manifest.json
-
       - name: Upload scientific provenance and audits
         uses: actions/upload-artifact@v4
         with:
@@ -365,7 +467,10 @@ jobs:
             ${{ env.ROOT }}/ultrares/terrain_detail_audit.json
             ${{ env.ROOT }}/ultrares/reconstruction.json
             ${{ env.ROOT }}/ultrares/authority_compaction.json
+            ${{ env.ROOT }}/ultrares/tile_checkpoints/
+            ${{ env.ROOT }}/ultrares/shard-*.json
             ${{ env.ROOT }}/ultrares/file_inventory.tsv
+            ${{ env.ROOT }}/ultrares-finalize.log
             ${{ env.ROOT }}/ultrares-map-render.log
             ${{ env.ROOT }}/source_scientific_audit.json
             ${{ env.ROOT }}/source_optics_audit.json
