@@ -109,8 +109,12 @@ class UltraResolutionTilePyramid(PlanetTilePyramid):
         sample_m = approximate_meters_per_sample(
             self.planet_radius_m, int(level), int(self.spec.tile_size)
         )
-        coarsest_m = max(3.25 * source_m, 4.0 * sample_m)
-        finest_m = max(2.35 * sample_m, 800.0)
+        # Four source/tile samples per wavelength is a conservative resolved
+        # bandwidth. With z3 tiles sampled twice as finely as the 16384-wide
+        # deliverable, the shortest ridge/valley half-wave is about one output
+        # pixel: the map is saturated without violating Nyquist.
+        coarsest_m = max(3.95 * source_m, 4.0 * sample_m)
+        finest_m = max(4.0 * sample_m, 800.0)
         if coarsest_m <= finest_m:
             wavelengths = [finest_m]
         else:
@@ -204,13 +208,13 @@ class UltraResolutionSpec:
     """Numerical contract for one ultra-resolution terrain build."""
 
     base_linear_multiplier: float = 4.0
-    subsection_linear_multiplier: float = 2.0
+    subsection_linear_multiplier: float = 3.0
     tile_size: int = 1024
     min_samples_per_wavelength: float = 4.0
     procedural_lacunarity: float = 2.0
     procedural_hurst_exponent: float = 0.65
     procedural_amplitude_fraction: float = 0.65
-    terrain_detail_strength: float = 1.0
+    terrain_detail_strength: float = 1.15
     workers: int = 2
     reconstruction_chunk_rows: int = 64
 
@@ -768,8 +772,6 @@ def reconstruct_parent_levels(
     fields: tuple[str, ...] = (
         "elevation_m",
         "erosion_m",
-        "deposition_m",
-        "hillslope_adjustment_m",
         "procedural_detail_m",
     ),
 ) -> Path:
