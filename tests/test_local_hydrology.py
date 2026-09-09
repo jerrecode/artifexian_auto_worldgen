@@ -423,3 +423,60 @@ def test_priority_flood_optional_numba_matches_independent_python_reference():
     expected = reference(elevation, ocean, 0.01)
     actual = _priority_flood_open(elevation, ocean, epsilon_m=0.01)
     np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-12)
+
+
+
+def test_routing_metrics_separates_raw_and_meander_eligible_straight_runs():
+    from worldgen.local_hydrology import _routing_metrics
+
+    h, w = 3, 10
+    code = np.full((h, w), -1, dtype=np.int8)
+    streams = np.zeros((h, w), dtype=bool)
+    receiver = np.full(h * w, -1, dtype=np.int64)
+    discharge = np.zeros((h, w), dtype=np.float64)
+    meander = np.zeros((h, w), dtype=np.float64)
+
+    row = 1
+    for x in range(1, 8):
+        code[row, x] = 4  # D16 east
+        streams[row, x] = True
+        receiver[row * w + x] = row * w + x + 1
+        discharge[row, x] = 0.9
+
+    yy, xx = np.mgrid[:h, :w]
+    xyz = np.stack(
+        (
+            (xx - w / 2.0) * 1.0e-5,
+            (yy - h / 2.0) * 1.0e-5,
+            np.ones((h, w)),
+        ),
+        axis=-1,
+    )
+    xyz /= np.linalg.norm(xyz, axis=-1, keepdims=True)
+
+    raw_only = _routing_metrics(
+        receiver,
+        code,
+        streams,
+        discharge,
+        xyz,
+        1.0e6,
+        meander_potential=meander,
+    )
+    assert raw_only["max_straight_run_cells"] >= 6
+    assert raw_only["max_straight_run_km"] > 0.0
+    assert raw_only["max_meander_eligible_straight_run_cells"] == 0
+
+    meander[row, 2:7] = 0.5
+    eligible = _routing_metrics(
+        receiver,
+        code,
+        streams,
+        discharge,
+        xyz,
+        1.0e6,
+        meander_potential=meander,
+    )
+    assert eligible["max_straight_run_cells"] >= 6
+    assert eligible["max_meander_eligible_straight_run_cells"] >= 4
+    assert eligible["max_meander_eligible_straight_run_km"] > 0.0
