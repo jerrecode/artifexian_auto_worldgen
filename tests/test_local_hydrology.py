@@ -478,3 +478,68 @@ def test_d16_meander_steering_breaks_long_axis_lock_without_uphill_flow():
     assert np.all(flat_z[receiver[active]] < flat_z[sources])
     assert metrics["max_straight_run_cells"] < 80
     assert metrics["stream_turn_fraction_gt10deg"] > 0.02
+
+
+
+def test_adaptive_meander_variants_are_deterministic_bounded_and_distinct():
+    from worldgen.local_hydrology import _meander_phase
+
+    h, w = 40, 48
+    yy, xx = np.meshgrid(
+        np.linspace(-0.08, 0.08, h),
+        np.linspace(-0.10, 0.10, w),
+        indexing="ij",
+    )
+    xyz = np.stack((xx, yy, np.ones_like(xx)), axis=-1)
+    xyz /= np.linalg.norm(xyz, axis=-1, keepdims=True)
+    q = np.clip((xx + 0.10) / 0.20, 0.0, 1.0)
+
+    kwargs = dict(
+        radius_m=6.4e6,
+        discharge_index=q,
+        seed=2026090707,
+        minimum_wavelength_m=12_000.0,
+    )
+    base = _meander_phase(xyz, variant=0, **kwargs)
+    v1 = _meander_phase(xyz, variant=1, **kwargs)
+    v1_again = _meander_phase(xyz, variant=1, **kwargs)
+    v2 = _meander_phase(xyz, variant=2, **kwargs)
+
+    np.testing.assert_array_equal(v1, v1_again)
+    assert np.isfinite(base).all()
+    assert np.isfinite(v1).all()
+    assert np.isfinite(v2).all()
+    assert float(np.max(np.abs(v1))) <= 1.0 + 1e-12
+    assert float(np.max(np.abs(v2))) <= 1.0 + 1e-12
+    assert not np.array_equal(base, v1)
+    assert not np.array_equal(v1, v2)
+
+
+def test_routing_metadata_reports_resolved_adaptive_wavelength_floor(tmp_path):
+    from worldgen.planet_tiles import approximate_meters_per_sample
+
+    _world(tmp_path)
+    pyramid = PlanetTilePyramid(
+        tmp_path,
+        spec=TilePyramidSpec(
+            tile_size=32,
+            elevation_detail_strength=0.0,
+            maximum_level=4,
+        ),
+    )
+    solver = LocalHydrologySolver(
+        pyramid,
+        spec=LocalHydrologySpec(halo_cells=6, stream_quantile=0.94),
+    )
+    key = TileKey("px", 1, 0, 0)
+    result = solver.solve(key)
+    expected = 4.5 * approximate_meters_per_sample(
+        pyramid.planet_radius_m,
+        key.level,
+        pyramid.spec.tile_size,
+    )
+    assert result.metadata["adaptive_meander_min_wavelength_m"] == pytest.approx(
+        expected
+    )
+    assert result.metadata["adaptive_meander_attempt"] in (0, 1, 2)
+    assert result.metadata["routing_candidate_metrics"]
