@@ -54,11 +54,16 @@ jobs:
           path: ${{ env.ROOT }}
           github-token: ${{ github.token }}
           run-id: 34353489700
-      - name: Regenerate only problem-relevant z2 shards with fixed algorithms
+      - name: Regenerate only five measured problem/neighbor z2 tiles
         shell: bash
         run: |
           set -euxo pipefail
-          for shard in 1 2 5 7; do
+          # _level_keys(z2) ordinal mapping:
+          # 55 = ny/z2/x3/y1 (257-cell straight-run failure)
+          # 73,74 = pz/z2/x1/y2 -> x2/y2 high derivative seam
+          # 85,89 = nz/z2/x1/y1 -> x1/y2 worst derivative seam
+          # shard_count=96 makes each selected shard exactly one of the 96 z2 tiles.
+          for ordinal in 55 73 74 85 89; do
             /usr/bin/time -v python scripts/run_ultrares_earth.py "$ROOT" \
               --mode shard \
               --no-compact \
@@ -68,9 +73,9 @@ jobs:
               --subsection-multiplier 2 \
               --min-samples-per-wavelength 4 \
               --terrain-detail-strength 1.15 \
-              --shard-index "$shard" \
-              --shard-count 12 \
-              2>&1 | tee "$ROOT/targeted-shard-${shard}.log"
+              --shard-index "$ordinal" \
+              --shard-count 96 \
+              2>&1 | tee "$ROOT/targeted-tile-${ordinal}.log"
           done
       - name: Validate measured production failure locations
         shell: bash
@@ -171,5 +176,5 @@ jobs:
           if-no-files-found: warn
           path: |
             ${{ env.ROOT }}/targeted-z2-fix-validation.json
-            ${{ env.ROOT }}/targeted-shard-*.log
+            ${{ env.ROOT }}/targeted-tile-*.log
             ${{ env.ROOT }}/ultrares/telemetry/
