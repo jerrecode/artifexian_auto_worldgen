@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import json
 
 import numpy as np
@@ -351,3 +352,72 @@ def test_accumulation_backend_matches_python_recurrence_when_numba_available():
         )
         np.testing.assert_array_equal(drainage_nb, drainage_py)
         np.testing.assert_array_equal(discharge_nb, discharge_py)
+
+
+def test_priority_flood_optional_numba_matches_independent_python_reference():
+    def reference(elevation, ocean, epsilon):
+        z = np.asarray(elevation, dtype=np.float64).copy()
+        oc = np.asarray(ocean, dtype=bool)
+        h, w = z.shape
+        visited = oc.copy()
+
+        seed = np.zeros_like(oc)
+        land = ~oc
+        # Coastal land.
+        for dy, dx in (
+            (-1, -1), (-1, 0), (-1, 1),
+            (0, -1), (0, 1),
+            (1, -1), (1, 0), (1, 1),
+        ):
+            sy0 = max(0, -dy)
+            sy1 = min(h, h - dy)
+            sx0 = max(0, -dx)
+            sx1 = min(w, w - dx)
+            ty0, ty1 = sy0 + dy, sy1 + dy
+            tx0, tx1 = sx0 + dx, sx1 + dx
+            seed[sy0:sy1, sx0:sx1] |= oc[ty0:ty1, tx0:tx1]
+        seed &= land
+        seed[0, :] |= land[0, :]
+        seed[-1, :] |= land[-1, :]
+        seed[:, 0] |= land[:, 0]
+        seed[:, -1] |= land[:, -1]
+
+        heap = []
+        ys, xs = np.where(seed & ~visited)
+        for y, x in zip(ys.tolist(), xs.tolist()):
+            visited[y, x] = True
+            heapq.heappush(heap, (float(z[y, x]), y, x))
+
+        while heap:
+            cur, y, x = heapq.heappop(heap)
+            for dy, dx in (
+                (-1, -1), (-1, 0), (-1, 1),
+                (0, -1), (0, 1),
+                (1, -1), (1, 0), (1, 1),
+            ):
+                ny, nx = y + dy, x + dx
+                if ny < 0 or ny >= h or nx < 0 or nx >= w or visited[ny, nx]:
+                    continue
+                visited[ny, nx] = True
+                nz = float(z[ny, nx])
+                if nz <= cur:
+                    nz = cur + epsilon
+                    z[ny, nx] = nz
+                heapq.heappush(heap, (nz, ny, nx))
+        return z
+
+    elevation = np.array(
+        [
+            [10.0, 10.0, 10.0, 10.0, 10.0, 10.0],
+            [10.0,  8.0,  8.0,  8.0,  8.0, 10.0],
+            [10.0,  8.0,  2.0,  2.0,  8.0, 10.0],
+            [10.0,  8.0,  2.0,  1.0,  8.0, 10.0],
+            [10.0,  8.0,  8.0,  8.0,  8.0, 10.0],
+            [ 5.0,  6.0,  7.0,  8.0,  9.0, 10.0],
+        ],
+        dtype=np.float64,
+    )
+    ocean = np.zeros_like(elevation, dtype=bool)
+    expected = reference(elevation, ocean, 0.01)
+    actual = _priority_flood_open(elevation, ocean, epsilon_m=0.01)
+    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-12)
