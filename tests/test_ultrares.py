@@ -15,6 +15,7 @@ from worldgen.ultrares import (
     _geomorph_path,
     _merge_children_downsample,
     _select_shard_keys,
+    _semantic_authority_sha256,
     _tile_checkpoint_path,
     _tile_resume_valid,
     derive_scale_aware_geomorphology_spec,
@@ -325,3 +326,42 @@ def test_ultrares_resume_rejects_stale_spec_even_with_marker(tmp_path):
     marker.write_text(json.dumps({"state": "complete"}), encoding="utf-8")
 
     assert not _tile_resume_valid(pyramid, key, geom)
+
+
+
+def test_semantic_authority_fingerprint_is_order_stable_and_content_sensitive():
+    arrays_a = {
+        "elevation": np.arange(12, dtype=np.float64).reshape(3, 4),
+        "streams": np.array([[False, True], [True, False]], dtype=np.bool_),
+    }
+    arrays_b = {
+        "streams": arrays_a["streams"].copy(),
+        "elevation": arrays_a["elevation"].copy(),
+    }
+    digest_a = _semantic_authority_sha256(arrays_a)
+    digest_b = _semantic_authority_sha256(arrays_b)
+    assert digest_a == digest_b
+
+    arrays_b["elevation"][1, 2] += 1.0
+    assert _semantic_authority_sha256(arrays_b) != digest_a
+
+
+def test_ultrares_pyramid_prefers_semantic_compaction_fingerprint(tmp_path):
+    _write_source(tmp_path)
+    semantic = "ab" * 32
+    report = tmp_path / "ultrares" / "authority_compaction.json"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(
+        json.dumps({"semantic_sha256": semantic}),
+        encoding="utf-8",
+    )
+
+    pyramid = UltraResolutionTilePyramid(
+        tmp_path,
+        spec=TilePyramidSpec(
+            tile_size=64,
+            elevation_detail_strength=1.0,
+            maximum_level=6,
+        ),
+    )
+    assert pyramid._source_hash() == semantic
