@@ -24,6 +24,9 @@ from scipy import ndimage
 
 from .local_hydrology import LocalHydrologySolver, _sample_area_km2
 from .local_orography import edge_anchor_taper, terrain_frame
+LOCAL_GEOMORPHOLOGY_ALGORITHM_REVISION = "metric-source-river-steering-v2"
+
+
 from .planet_tiles import (
     PlanetTilePyramid,
     TileKey,
@@ -616,6 +619,12 @@ class LocalGeomorphologySolver:
             "schema_version": 2,
             "key": asdict(key),
             "source_sha256": self.pyramid._source_hash(),
+            "authority_sampling_revision": getattr(
+                self.pyramid,
+                "authority_sampling_revision",
+                "legacy",
+            ),
+            "algorithm_revision": LOCAL_GEOMORPHOLOGY_ALGORITHM_REVISION,
             "spec": asdict(cfg),
             "upstream": {
                 "hydrology": "local_hydrology_v1",
@@ -701,6 +710,7 @@ class LocalGeomorphologySolver:
 
 
 __all__ = [
+    "LOCAL_GEOMORPHOLOGY_ALGORITHM_REVISION",
     "LocalGeomorphologyResult",
     "LocalGeomorphologySolver",
     "LocalGeomorphologySpec",
