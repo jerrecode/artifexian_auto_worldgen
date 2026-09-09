@@ -608,7 +608,9 @@ def derive_scale_aware_geomorphology_spec(
         sediment_retention_fraction=float(np.clip(deposition_strength, 0.05, 0.85)),
         max_deposition_m=float(deposition_cap),
         hillslope_diffusion_fraction=hillslope_fraction,
-        edge_anchor_cells=6,
+        # Absolute-XYZ microrelief itself is seamless; only finite-domain
+        # geomorphic displacement needs a narrow edge anchor.
+        edge_anchor_cells=3,
         procedural_detail_enabled=True,
         procedural_octaves=int(octaves),
         procedural_base_wavelength_samples=float(base_wavelength_samples),
@@ -624,7 +626,11 @@ def derive_scale_aware_geomorphology_spec(
         ),
         procedural_lacunarity=float(lac),
         procedural_cell_scale=0.72,
-        procedural_steering_strength=0.28,
+        procedural_steering_strength=0.34,
+        final_channel_incision_m=float(
+            np.clip(6.0 + 0.30 * global_fluvial_cap, 6.0, 14.0)
+        ),
+        final_channel_discharge_exponent=1.08,
     ).validate()
 
 
@@ -1526,7 +1532,8 @@ def run_ultra_resolution(
                     "4x-linear terrain base reconstructed from deeper solved tiles"
                 ),
                 "subsections": (
-                    "deepest cube-sphere tiles resolve another 2x in linear ground sampling"
+                    "requested >=3x subsection refinement selects the next power-of-two LOD; "
+                    "for the Earth production profile this is z3, 4x finer than the 8192 base"
                 ),
                 "detail": (
                     "globally continuous tectonic microrelief fills newly resolvable terrain "
