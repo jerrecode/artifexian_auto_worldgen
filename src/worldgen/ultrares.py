@@ -36,9 +36,11 @@ from scipy import ndimage
 
 from .heightmap import write_heightmap_png16
 from .local_geomorphology import LocalGeomorphologySolver, LocalGeomorphologySpec
+from .procedural_erosion import phase_cell_octave_xyz
 from .planet_tiles import (
     CUBE_FACES,
     PlanetTilePyramid,
+    TileGeometry,
     TileKey,
     TilePyramidSpec,
     approximate_meters_per_sample,
@@ -71,6 +73,132 @@ class UltraResolutionTilePyramid(PlanetTilePyramid):
         return values
 
 
+    def _xyz_geometry(self, xyz: np.ndarray) -> TileGeometry:
+        unit = np.asarray(xyz, dtype=np.float64)
+        lat = np.rad2deg(np.arcsin(np.clip(unit[..., 2], -1.0, 1.0)))
+        lon = np.rad2deg(np.arctan2(unit[..., 1], unit[..., 0]))
+        return TileGeometry(xyz=unit, latitude_deg=lat, longitude_deg=lon)
+
+    def _context_field(
+        self,
+        name: str,
+        geom: TileGeometry,
+        *,
+        default: float = 0.0,
+    ) -> np.ndarray:
+        _shape, fields = self._source_metadata()
+        if name not in fields:
+            return np.full(geom.latitude_deg.shape, float(default), dtype=np.float64)
+        return np.asarray(self._sample_source_field(name, geom), dtype=np.float64)
+
+    def _spectral_detail(self, xyz: np.ndarray, level: int) -> np.ndarray:
+        """Globally continuous, tectonically conditioned sub-grid terrain.
+
+        Unlike the old tile-local sinusoidal filler this field is evaluated from
+        absolute spherical coordinates and global tectonic authority. Shared tile
+        vertices therefore evaluate identically, so no edge taper/grid imprint is
+        needed. Wavelengths fill the band below the global source resolution down
+        to ~2.35 samples at the requested LOD.
+        """
+        if int(level) <= 0 or float(self.spec.elevation_detail_strength) <= 0.0:
+            return np.zeros(np.asarray(xyz).shape[:-1], dtype=np.float64)
+        unit = np.asarray(xyz, dtype=np.float64)
+        geom = self._xyz_geometry(unit)
+        (_source_h, source_w), _fields = self._source_metadata()
+        source_m = 2.0 * math.pi * float(self.planet_radius_m) / float(source_w)
+        sample_m = approximate_meters_per_sample(
+            self.planet_radius_m, int(level), int(self.spec.tile_size)
+        )
+        coarsest_m = max(3.25 * source_m, 4.0 * sample_m)
+        finest_m = max(2.35 * sample_m, 800.0)
+        if coarsest_m <= finest_m:
+            wavelengths = [finest_m]
+        else:
+            wavelengths = []
+            w = coarsest_m
+            while w >= finest_m * (1.0 - 1.0e-12) and len(wavelengths) < 10:
+                wavelengths.append(float(w))
+                w /= 1.82
+            if wavelengths[-1] > finest_m * 1.20 and len(wavelengths) < 10:
+                wavelengths.append(float(finest_m))
+
+        elevation = self._context_field("elevation_m", geom)
+        mountain = np.clip(self._context_field("mountain_strength", geom), 0.0, 1.0)
+        convergence = np.clip(
+            self._context_field("convergence_strength", geom), 0.0, 1.0
+        )
+        strain = np.clip(self._context_field("strain_field", geom), 0.0, 1.0)
+        paleo = np.clip(self._context_field("paleo_convergence", geom), 0.0, 1.0)
+        age = np.maximum(self._context_field("orogen_age_myr", geom, default=900.0), 0.0)
+        inherited_orogen = paleo * np.exp(-age / 480.0)
+        orogen = np.clip(
+            np.maximum(mountain, 0.90 * convergence + 0.55 * strain + 0.55 * inherited_orogen),
+            0.0,
+            1.0,
+        )
+        land = elevation >= 0.0
+        relief_context = 0.32 + 0.68 * np.tanh(np.abs(elevation) / 1700.0)
+        coast_guard = 0.30 + 0.70 * np.tanh(np.abs(elevation) / 260.0)
+
+        seed = int(self._read_seed()) ^ 0x5445525241494E32
+        result = np.zeros(unit.shape[:-1], dtype=np.float64)
+        reference_m = max(float(wavelengths[0]), 1.0)
+        ridge_mean = 1.0 - 2.0 / math.pi
+        for octave, wavelength_m in enumerate(wavelengths):
+            rng = np.random.default_rng(seed + 0x9E3779B1 * (octave + 1))
+            octave_field = np.zeros(result.shape, dtype=np.float64)
+            octave_ridge = np.zeros(result.shape, dtype=np.float64)
+            for orientation in range(2):
+                axis = rng.normal(size=3)
+                axis /= max(float(np.linalg.norm(axis)), 1.0e-15)
+                tangent = axis - np.sum(unit * axis, axis=-1, keepdims=True) * unit
+                norm = np.linalg.norm(tangent, axis=-1, keepdims=True)
+                fallback_axis = np.array([0.0, 0.0, 1.0])
+                fallback = fallback_axis - (
+                    np.sum(unit * fallback_axis, axis=-1, keepdims=True) * unit
+                )
+                tangent = np.where(norm > 1.0e-10, tangent, fallback)
+                tangent /= np.maximum(
+                    np.linalg.norm(tangent, axis=-1, keepdims=True), 1.0e-12
+                )
+                cosine, _sine, coherence = phase_cell_octave_xyz(
+                    unit,
+                    self.planet_radius_m / 1000.0,
+                    np.full(result.shape, wavelength_m / 1000.0, dtype=np.float64),
+                    tangent,
+                    cell_scale=0.68,
+                    seed=seed ^ (0xA511E9B3 * (orientation + 1)),
+                    octave=octave + 17,
+                )
+                octave_field += coherence * cosine
+                octave_ridge += coherence * (
+                    (1.0 - np.abs(cosine)) - ridge_mean
+                )
+            octave_field *= 0.5
+            octave_ridge *= 0.5
+            scale = (wavelength_m / reference_m) ** float(
+                self.spec.detail_hurst_exponent
+            )
+            background_amp_m = 48.0 * scale
+            orogenic_amp_m = 390.0 * scale
+            ocean_amp_m = 22.0 * scale
+            amplitude = np.where(
+                land,
+                background_amp_m * relief_context + orogenic_amp_m * orogen,
+                ocean_amp_m * (0.55 + 0.45 * relief_context),
+            )
+            shape_field = (
+                octave_field * (0.72 - 0.30 * orogen)
+                + octave_ridge * (0.55 + 1.10 * orogen)
+            )
+            result += amplitude * shape_field * coast_guard
+
+        return (
+            float(self.spec.elevation_detail_strength)
+            * np.asarray(result, dtype=np.float64)
+        )
+
+
 @dataclass(slots=True, frozen=True)
 class UltraResolutionSpec:
     """Numerical contract for one ultra-resolution terrain build."""
@@ -82,6 +210,7 @@ class UltraResolutionSpec:
     procedural_lacunarity: float = 2.0
     procedural_hurst_exponent: float = 0.65
     procedural_amplitude_fraction: float = 0.65
+    terrain_detail_strength: float = 1.0
     workers: int = 2
     reconstruction_chunk_rows: int = 64
 
@@ -104,6 +233,10 @@ class UltraResolutionSpec:
             raise ValueError("procedural_hurst_exponent must be in [0.1, 1.5]")
         if not 0.0 < float(self.procedural_amplitude_fraction) <= 1.0:
             raise ValueError("procedural_amplitude_fraction must be in (0, 1]")
+        if not math.isfinite(float(self.terrain_detail_strength)) or not (
+            0.0 < float(self.terrain_detail_strength) <= 2.5
+        ):
+            raise ValueError("terrain_detail_strength must be in (0, 2.5]")
         if not 1 <= int(self.workers) <= 32:
             raise ValueError("workers must be in [1, 32]")
         if int(self.reconstruction_chunk_rows) < 1:
@@ -214,6 +347,13 @@ ULTRARES_OPTIONAL_AUTHORITY_FIELDS = (
     "coral_reef",
     "rock_code",
     "bedrock_code",
+    "mountain_strength",
+    "ruggedness",
+    "convergence_strength",
+    "strain_field",
+    "paleo_convergence",
+    "orogen_age_myr",
+    "stress_field",
 )
 
 
@@ -1056,9 +1196,10 @@ def run_ultra_resolution(
         root,
         spec=TilePyramidSpec(
             tile_size=int(cfg.tile_size),
-            # Critical: interpolation alone is not counted as new terrain detail.
-            # All added morphology comes from the two audited geomorphic operators.
-            elevation_detail_strength=0.0,
+            # This is not interpolation/noise-for-pixels: UltraResolutionTilePyramid
+            # overrides _spectral_detail with a globally continuous, tectonically
+            # conditioned physical microrelief field evaluated in absolute XYZ.
+            elevation_detail_strength=float(cfg.terrain_detail_strength),
             detail_hurst_exponent=float(cfg.procedural_hurst_exponent),
             detail_harmonics=1,
             maximum_level=12,
@@ -1081,8 +1222,9 @@ def run_ultra_resolution(
                     "deepest cube-sphere tiles resolve another 2x in linear ground sampling"
                 ),
                 "detail": (
-                    "base tile spectral noise disabled; legacy stream-power and phase-cell "
-                    "erosion are the added terrain-detail operators"
+                    "globally continuous tectonic microrelief fills newly resolvable terrain "
+                    "frequencies before hydrology; legacy stream-power and phase-cell erosion "
+                    "then operate on that refined terrain"
                 ),
             },
         },
