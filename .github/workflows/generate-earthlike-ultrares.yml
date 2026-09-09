@@ -210,6 +210,7 @@ jobs:
           path: |
             ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/
             ${{ env.ROOT }}/ultrares/tile_checkpoints/
+            ${{ env.ROOT }}/ultrares/telemetry/
             ${{ env.ROOT }}/ultrares/progress-shard-*.json
             ${{ env.ROOT }}/ultrares/shard-*.json
             ${{ env.ROOT }}/ultrares-shard-*.log
@@ -468,6 +469,7 @@ jobs:
             ${{ env.ROOT }}/ultrares/reconstruction.json
             ${{ env.ROOT }}/ultrares/authority_compaction.json
             ${{ env.ROOT }}/ultrares/tile_checkpoints/
+            ${{ env.ROOT }}/ultrares/telemetry/
             ${{ env.ROOT }}/ultrares/shard-*.json
             ${{ env.ROOT }}/ultrares/file_inventory.tsv
             ${{ env.ROOT }}/ultrares-finalize.log
