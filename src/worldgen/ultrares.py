@@ -1464,6 +1464,27 @@ def _same_face_seam_max(
     return maximum
 
 
+def _seam_c1_difference(
+    a: np.ndarray,
+    b: np.ndarray,
+    orientation: str,
+) -> np.ndarray:
+    """Second-order one-sided derivative mismatch at one shared tile seam."""
+    left = np.asarray(a, dtype=np.float64)
+    right = np.asarray(b, dtype=np.float64)
+    if left.shape != right.shape or min(left.shape) < 3:
+        raise ValueError("seam arrays must have equal shape with at least 3 samples")
+    if orientation == "x":
+        da = (3.0 * left[:, -1] - 4.0 * left[:, -2] + left[:, -3]) / 2.0
+        db = (-3.0 * right[:, 0] + 4.0 * right[:, 1] - right[:, 2]) / 2.0
+    elif orientation == "y":
+        da = (3.0 * left[-1, :] - 4.0 * left[-2, :] + left[-3, :]) / 2.0
+        db = (-3.0 * right[0, :] + 4.0 * right[1, :] - right[2, :]) / 2.0
+    else:
+        raise ValueError("orientation must be 'x' or 'y'")
+    return np.asarray(da - db, dtype=np.float64)
+
+
 def _same_face_seam_gradient_diagnostics(
     pyramid: PlanetTilePyramid, level: int
 ) -> dict[str, Any]:
@@ -1545,10 +1566,7 @@ def _same_face_seam_gradient_diagnostics(
                         key,
                         key_b,
                         "x",
-                        (
-                            (3.0 * a[:, -1] - 4.0 * a[:, -2] + a[:, -3]) / 2.0
-                            - (-3.0 * b[:, 0] + 4.0 * b[:, 1] - b[:, 2]) / 2.0
-                        ),
+                        _seam_c1_difference(a, b, "x"),
                     )
                 if y + 1 < side:
                     key_b = TileKey(face, level, x, y + 1)
@@ -1569,10 +1587,7 @@ def _same_face_seam_gradient_diagnostics(
                         key,
                         key_b,
                         "y",
-                        (
-                            (3.0 * a[-1, :] - 4.0 * a[-2, :] + a[-3, :]) / 2.0
-                            - (-3.0 * b[0, :] + 4.0 * b[1, :] - b[2, :]) / 2.0
-                        ),
+                        _seam_c1_difference(a, b, "y"),
                     )
 
     rms = math.sqrt(sumsq / max(count, 1))
