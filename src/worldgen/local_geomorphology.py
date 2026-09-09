@@ -630,11 +630,12 @@ class LocalGeomorphologySolver:
                 mode="nearest",
             ),
         )
+        pre_channel_terrain = anchored
         channel_incision = (
             float(cfg.final_channel_incision_m)
             * np.clip(channel_profile, 0.0, 1.0)
             * taper
-            * (anchored >= 0.0)
+            * (pre_channel_terrain >= 0.0)
         )
         channel_incision[0, :] = 0.0
         channel_incision[-1, :] = 0.0
@@ -656,7 +657,9 @@ class LocalGeomorphologySolver:
             {
                 "attempt": 0,
                 "max_offset_cells": 0.0,
-                "extra_incision_max_m": 0.0,
+                "candidate_incision_max_m": float(
+                    np.max(channel_incision)
+                ),
                 "routing_metrics": dict(
                     final_hydro.metadata.get("routing_metrics", {})
                 ),
@@ -748,19 +751,28 @@ class LocalGeomorphologySolver:
                     np.clip(shifted_profile, 0.0, 1.0)
                     * lateral_preference
                 )
-                extra_incision = (
-                    float(cfg.final_channel_incision_m)
-                    * float(depth_scale)
-                    * extra_profile
-                    * taper
-                    * (baseline_anchored >= 0.0)
+                # Replace rather than stack the baseline incision. A small
+                # remnant of the original centreline keeps the migrated channel
+                # connected, while the total incision never exceeds the configured
+                # final_channel_incision_m cap.
+                migration_profile = np.maximum(
+                    0.18 * np.clip(channel_profile, 0.0, 1.0),
+                    float(depth_scale) * extra_profile,
                 )
-                extra_incision[0, :] = 0.0
-                extra_incision[-1, :] = 0.0
-                extra_incision[:, 0] = 0.0
-                extra_incision[:, -1] = 0.0
+                candidate_channel_incision = (
+                    float(cfg.final_channel_incision_m)
+                    * np.clip(migration_profile, 0.0, 1.0)
+                    * taper
+                    * (pre_channel_terrain >= 0.0)
+                )
+                candidate_channel_incision[0, :] = 0.0
+                candidate_channel_incision[-1, :] = 0.0
+                candidate_channel_incision[:, 0] = 0.0
+                candidate_channel_incision[:, -1] = 0.0
 
-                candidate_anchored = baseline_anchored - extra_incision
+                candidate_anchored = (
+                    pre_channel_terrain - candidate_channel_incision
+                )
                 candidate_anchored[0, :] = base[0, :]
                 candidate_anchored[-1, :] = base[-1, :]
                 candidate_anchored[:, 0] = base[:, 0]
@@ -779,11 +791,15 @@ class LocalGeomorphologySolver:
                         "minimum_wavelength_m": float(
                             min_migration_wavelength_m
                         ),
-                        "extra_incision_max_m": float(
-                            np.max(extra_incision)
+                        "candidate_incision_max_m": float(
+                            np.max(candidate_channel_incision)
                         ),
-                        "extra_incision_rms_m": float(
-                            np.sqrt(np.mean(np.square(extra_incision)))
+                        "candidate_incision_rms_m": float(
+                            np.sqrt(
+                                np.mean(
+                                    np.square(candidate_channel_incision)
+                                )
+                            )
                         ),
                         "routing_metrics": candidate_metrics,
                     }
@@ -791,9 +807,7 @@ class LocalGeomorphologySolver:
                 if candidate_rank < current_best_rank:
                     current_best_rank = candidate_rank
                     best_anchored = candidate_anchored
-                    best_channel_incision = (
-                        baseline_channel_incision + extra_incision
-                    )
+                    best_channel_incision = candidate_channel_incision
                     best_hydro = candidate_hydro
 
         anchored = best_anchored
