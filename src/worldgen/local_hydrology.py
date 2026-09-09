@@ -798,7 +798,8 @@ def _routing_metrics(
     radius_m: float,
     *,
     active_mask: np.ndarray | None = None,
-) -> dict[str, float | int | None]:
+    routing_surface_m: np.ndarray | None = None,
+) -> dict[str, object]:
     receiver = np.asarray(receiver_flat, dtype=np.int64)
     code = np.asarray(code16, dtype=np.int16).ravel()
     stream = np.asarray(streams, dtype=bool).ravel()
@@ -828,6 +829,7 @@ def _routing_metrics(
             "max_straight_run_start_yx": None,
             "max_straight_run_end_yx": None,
             "max_straight_run_distance_m": 0.0,
+            "max_straight_run_downhill_alternatives": None,
             "median_sampled_sinuosity": None,
         }
 
@@ -897,6 +899,122 @@ def _routing_metrics(
             )
             cur = target
 
+    downhill_alternatives: dict[str, object] | None = None
+    if (
+        routing_surface_m is not None
+        and max_straight_start is not None
+        and max_straight_direction is not None
+        and max_straight > 0
+    ):
+        surface = np.asarray(routing_surface_m, dtype=np.float64)
+        stream_shape = np.asarray(streams).shape
+        if surface.shape != stream_shape:
+            raise ValueError("routing_surface_m must match streams")
+        h, w = surface.shape
+        alt_counts: list[int] = []
+        best_ratios: list[float] = []
+        current_slopes: list[float] = []
+        cur = int(max_straight_start)
+        for _ in range(int(max_straight)):
+            y, x = divmod(cur, w)
+            target = int(receiver[cur])
+            if target < 0 or target >= stream.size:
+                break
+            ty, tx = divmod(target, w)
+            current_distance = float(
+                _great_circle_distance_m(
+                    unit[cur][None, :],
+                    unit[target][None, :],
+                    radius_m,
+                )[0]
+            )
+            current_slope = (
+                float(surface[y, x] - surface[ty, tx])
+                / max(current_distance, 1.0e-6)
+            )
+            current_slopes.append(current_slope)
+            alternatives: list[float] = []
+            for direction, (dy, dx) in enumerate(_D16):
+                if direction == int(max_straight_direction):
+                    continue
+                ny, nx = y + int(dy), x + int(dx)
+                if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                    continue
+                distance = float(
+                    _great_circle_distance_m(
+                        unit[cur][None, :],
+                        unit[ny * w + nx][None, :],
+                        radius_m,
+                    )[0]
+                )
+                slope = (
+                    float(surface[y, x] - surface[ny, nx])
+                    / max(distance, 1.0e-6)
+                )
+                if slope <= 0.0:
+                    continue
+                if max(abs(int(dy)), abs(int(dx))) > 1:
+                    sdy = int(np.sign(dy))
+                    sdx = int(np.sign(dx))
+                    if abs(int(dy)) == 2:
+                        mid_a = float(surface[y + sdy, x])
+                        mid_b = float(surface[y + sdy, x + sdx])
+                    else:
+                        mid_a = float(surface[y, x + sdx])
+                        mid_b = float(surface[y + sdy, x + sdx])
+                    corridor = min(mid_a, mid_b)
+                    source = float(surface[y, x])
+                    candidate = float(surface[ny, nx])
+                    corridor_limit = source - 0.015 * max(
+                        source - candidate, 0.0
+                    )
+                    if corridor > corridor_limit + 1.0e-8:
+                        continue
+                alternatives.append(float(slope))
+            alt_counts.append(len(alternatives))
+            best_alt = max(alternatives) if alternatives else 0.0
+            best_ratios.append(
+                best_alt / max(current_slope, 1.0e-30)
+                if current_slope > 0.0
+                else 0.0
+            )
+            cur = target
+
+        ratios = np.asarray(best_ratios, dtype=np.float64)
+        counts = np.asarray(alt_counts, dtype=np.int64)
+        slopes = np.asarray(current_slopes, dtype=np.float64)
+        downhill_alternatives = {
+            "samples": int(counts.size),
+            "cells_with_any_alternative": int(np.count_nonzero(counts > 0)),
+            "fraction_with_any_alternative": (
+                float(np.mean(counts > 0)) if counts.size else 0.0
+            ),
+            "median_alternative_count": (
+                float(np.median(counts)) if counts.size else 0.0
+            ),
+            "max_alternative_count": (
+                int(np.max(counts)) if counts.size else 0
+            ),
+            "median_best_alternative_to_current_slope_ratio": (
+                float(np.median(ratios)) if ratios.size else 0.0
+            ),
+            "p90_best_alternative_to_current_slope_ratio": (
+                float(np.quantile(ratios, 0.90)) if ratios.size else 0.0
+            ),
+            "fraction_best_alternative_ratio_ge_0_02": (
+                float(np.mean(ratios >= 0.02)) if ratios.size else 0.0
+            ),
+            "fraction_best_alternative_ratio_ge_0_05": (
+                float(np.mean(ratios >= 0.05)) if ratios.size else 0.0
+            ),
+            "fraction_best_alternative_ratio_ge_0_10": (
+                float(np.mean(ratios >= 0.10)) if ratios.size else 0.0
+            ),
+            "median_current_slope": (
+                float(np.median(slopes)) if slopes.size else 0.0
+            ),
+        }
+
     candidates = nodes[np.argsort(q[nodes], kind="stable")[-min(160, len(nodes)):]]
     sinuosity: list[float] = []
     for start in candidates.tolist():
@@ -961,6 +1079,7 @@ def _routing_metrics(
             ]
         ),
         "max_straight_run_distance_m": float(max_straight_distance_m),
+        "max_straight_run_downhill_alternatives": downhill_alternatives,
         "median_sampled_sinuosity": (
             float(np.median(sinuosity)) if sinuosity else None
         ),
@@ -1362,6 +1481,7 @@ class LocalHydrologySolver:
                 local_discharge,
                 geom.xyz,
                 self.pyramid.planet_radius_m,
+                routing_surface_m=filled,
             )
             return {
                 "attempt": int(attempt),
@@ -1508,6 +1628,10 @@ class LocalHydrologySolver:
             geom.xyz,
             self.pyramid.planet_radius_m,
             active_mask=core_mask,
+            routing_surface_m=np.asarray(
+                arrays_patch["filled_elevation_m"],
+                dtype=np.float64,
+            ),
         )
 
         arrays = {
