@@ -454,10 +454,15 @@ def generate_climate_surface_products(
         "true_color_rgb",
     )
 
-    for key in _level_keys(plan.finest_level):
+    product_level = int(plan.base_level)
+    for key in _level_keys(product_level):
         geom = tile_geometry(key, pyramid.spec.tile_size)
         final_elevation = np.asarray(
-            np.load(_geomorph_path(pyramid, "elevation_m", key), mmap_mode="r", allow_pickle=False),
+            np.load(
+                _reconstructed_path(root, key, "elevation_m"),
+                mmap_mode="r",
+                allow_pickle=False,
+            ),
             dtype=np.float64,
         )
         inherited_elevation = np.asarray(
@@ -691,7 +696,11 @@ def generate_climate_surface_products(
     metadata = {
         "category": "climate_surface",
         "fields": list(fields),
-        "source": "deepest final geomorphology elevation plus inherited global climate boundary state",
+        "product_level": product_level,
+        "source": (
+            "terrain propagated upward from deepest final geomorphology to the "
+            "8192-class base LOD plus inherited global climate boundary state"
+        ),
         "terrain_sensitive_recomputed": True,
         "true_color_semantics": (
             "global physical appearance recolored only by locally recomputed vegetation, "
@@ -732,7 +741,8 @@ def generate_weather_products(
             1.0e-12,
         )
 
-    for key in _level_keys(plan.finest_level):
+    product_level = int(plan.base_level)
+    for key in _level_keys(product_level):
         geom = tile_geometry(key, pyramid.spec.tile_size)
         surface_root = root / "ultrares" / "deepest_products" / "climate_surface"
         moisture = np.asarray(
@@ -806,6 +816,7 @@ def generate_weather_products(
 
     metadata = {
         "category": "weather",
+        "product_level": product_level,
         "fields": list(WEATHER_GROUPS) + ["dominant_weather_code", "dominant_weather_strength"],
         "source_percentile_scales": scales,
         "semantics": (
@@ -825,7 +836,8 @@ def generate_resource_products(
     root = pyramid.world_root
     available = set(pyramid._source_metadata()[1])
     used: dict[str, list[str]] = {}
-    for key in _level_keys(plan.finest_level):
+    product_level = int(plan.base_level)
+    for key in _level_keys(product_level):
         geom = tile_geometry(key, pyramid.spec.tile_size)
         groups: list[np.ndarray] = []
         for group, candidates in RESOURCE_GROUPS.items():
@@ -863,6 +875,7 @@ def generate_resource_products(
 
     metadata = {
         "category": "resources",
+        "product_level": product_level,
         "groups": {key: list(value) for key, value in RESOURCE_GROUPS.items()},
         "available_group_inputs": used,
         "semantics": (
