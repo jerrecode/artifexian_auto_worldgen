@@ -35,6 +35,7 @@ from .planet_tiles import (
     TileGeometry,
     TileKey,
     _cube_direction,
+    approximate_meters_per_sample,
     tile_geometry,
 )
 
@@ -647,6 +648,7 @@ def _meander_phase(
     *,
     seed: int,
     variant: int = 0,
+    minimum_wavelength_m: float = 0.0,
 ) -> np.ndarray:
     """Absolute-coordinate meander phase with adaptive multi-scale variants.
 
@@ -690,10 +692,14 @@ def _meander_phase(
         return primary
 
     tangent1 = tangent_from_axis(rng.normal(size=3))
-    wavelength1_km = (
-        (7.0 + 58.0 * np.power(q, 0.62))
-        if int(variant) == 1
-        else (4.5 + 34.0 * np.power(q, 0.58))
+    wavelength_floor_km = max(float(minimum_wavelength_m), 0.0) / 1000.0
+    wavelength1_km = np.maximum(
+        (
+            (7.0 + 58.0 * np.power(q, 0.62))
+            if int(variant) == 1
+            else (4.5 + 34.0 * np.power(q, 0.58))
+        ),
+        wavelength_floor_km,
     )
     _c1, s1, coh1 = phase_cell_octave_xyz(
         unit,
@@ -710,7 +716,10 @@ def _meander_phase(
         return np.clip(0.55 * primary + 0.80 * short, -1.0, 1.0)
 
     tangent2 = tangent_from_axis(rng.normal(size=3))
-    wavelength2_km = 3.5 + 20.0 * np.power(q, 0.52)
+    wavelength2_km = np.maximum(
+        3.5 + 20.0 * np.power(q, 0.52),
+        wavelength_floor_km,
+    )
     _c2, s2, coh2 = phase_cell_octave_xyz(
         unit,
         float(radius_m) / 1000.0,
@@ -1168,6 +1177,12 @@ class LocalHydrologySolver:
         local0 = _normalize_log(discharge0, ~ocean)
         base_angle = _flow_angles(code0)
         parent_discharge = self._parent_discharge_patch(geom)
+        sample_m = approximate_meters_per_sample(
+            self.pyramid.planet_radius_m,
+            key.level,
+            self.pyramid.spec.tile_size,
+        )
+        corrective_min_wavelength_m = 4.5 * sample_m
 
         def route_candidate(attempt: int):
             phase = _meander_phase(
@@ -1176,6 +1191,9 @@ class LocalHydrologySolver:
                 local0,
                 seed=int(self.pyramid._read_seed()),
                 variant=attempt,
+                minimum_wavelength_m=(
+                    corrective_min_wavelength_m if attempt > 0 else 0.0
+                ),
             )
             slope_factor = np.exp(
                 -np.maximum(best_slope0, 0.0)
@@ -1329,6 +1347,9 @@ class LocalHydrologySolver:
             "local_stream_cells": int(np.count_nonzero(streams)),
             "routing_metrics": metrics,
             "adaptive_meander_attempt": int(selected["attempt"]),
+            "adaptive_meander_min_wavelength_m": float(
+                corrective_min_wavelength_m
+            ),
             "routing_candidate_metrics": [
                 {
                     "attempt": int(candidate["attempt"]),
