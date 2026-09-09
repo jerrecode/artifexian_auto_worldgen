@@ -45,6 +45,7 @@ from .ultrares import (
     UltraResolutionPlan,
     UltraResolutionTilePyramid,
     _inverse_cube_coordinates,
+    _reconstructed_path,
 )
 
 
@@ -885,8 +886,9 @@ def _sample_deepest_to_npy(
     width: int | None = None,
     height: int | None = None,
     value_scale: float = 1.0,
+    level: int | None = None,
 ) -> Path:
-    level = int(plan.finest_level)
+    level = int(plan.finest_level if level is None else level)
     side = 1 << level
     n = int(plan.tile_size)
     first = np.asarray(
@@ -1383,6 +1385,7 @@ def reconstruct_fullview_maps(
         width: int | None = None,
         height: int | None = None,
         value_scale: float = 1.0,
+        level: int | None = None,
     ) -> Path:
         return _sample_deepest_to_npy(
             plan,
@@ -1393,6 +1396,7 @@ def reconstruct_fullview_maps(
             width=width,
             height=height,
             value_scale=value_scale,
+            level=level,
         )
 
     # Terrain and erosion use the actual final deepest geomorphology tiles.
