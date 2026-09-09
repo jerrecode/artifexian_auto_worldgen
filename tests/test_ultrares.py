@@ -16,6 +16,7 @@ from worldgen.ultrares import (
     _merge_children_downsample,
     _select_shard_keys,
     _semantic_authority_sha256,
+    _seam_c1_difference,
     _tile_checkpoint_path,
     _tile_resume_valid,
     derive_scale_aware_geomorphology_spec,
@@ -365,3 +366,24 @@ def test_ultrares_pyramid_prefers_semantic_compaction_fingerprint(tmp_path):
         ),
     )
     assert pyramid._source_hash() == semantic
+
+
+
+def test_seam_c1_difference_ignores_smooth_quadratic_curvature():
+    y = np.linspace(-1.0, 1.0, 9)[:, None]
+    left_x = np.array([-2.0, -1.0, 0.0])[None, :]
+    right_x = np.array([0.0, 1.0, 2.0])[None, :]
+    left = y + left_x**2
+    right = y + right_x**2
+    diff = _seam_c1_difference(left, right, "x")
+    np.testing.assert_allclose(diff, 0.0, atol=1.0e-12)
+
+
+def test_seam_c1_difference_detects_actual_slope_kink():
+    y = np.linspace(-1.0, 1.0, 9)[:, None]
+    left_x = np.array([-2.0, -1.0, 0.0])[None, :]
+    right_x = np.array([0.0, 1.0, 2.0])[None, :]
+    left = y + left_x
+    right = y + 2.0 * right_x
+    diff = _seam_c1_difference(left, right, "x")
+    np.testing.assert_allclose(diff, -1.0, atol=1.0e-12)
