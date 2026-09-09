@@ -98,7 +98,10 @@ class UltraResolutionTilePyramid(PlanetTilePyramid):
         absolute spherical coordinates and global tectonic authority. Shared tile
         vertices therefore evaluate identically, so no edge taper/grid imprint is
         needed. Wavelengths fill the band below the global source resolution down
-        to ~2.35 samples at the requested LOD.
+        to four deepest-tile samples at the requested LOD.  Because the native
+        16384-wide height product spans about two deepest samples per output pixel,
+        that makes the smallest half-wave approximately one output pixel without
+        aliasing below the raster Nyquist limit.
         """
         if int(level) <= 0 or float(self.spec.elevation_detail_strength) <= 0.0:
             return np.zeros(np.asarray(xyz).shape[:-1], dtype=np.float64)
