@@ -1215,19 +1215,56 @@ def _render_river_composite(
     streams_path: Path,
     png_path: Path,
 ) -> dict[str, object]:
+    """Render very large river maps in bounded memory."""
     drainage = np.load(drainage_path, mmap_mode="r", allow_pickle=False)
     discharge = np.load(discharge_path, mmap_mode="r", allow_pickle=False)
     streams = np.load(streams_path, mmap_mode="r", allow_pickle=False)
-    d = np.log1p(np.maximum(np.asarray(drainage, dtype=np.float64), 0.0))
-    _, d_hi = _sample_percentiles(d, 1.0, 99.8)
-    dn = np.clip(d / max(d_hi, 1.0e-12), 0.0, 1.0)
-    qn = np.clip(np.asarray(discharge, dtype=np.float64), 0.0, 1.0)
-    intensity = np.clip((0.65 * dn + 0.35 * qn) * (0.15 + 0.85 * (np.asarray(streams) > 0)), 0.0, 1.0)
-    rgb = _ramp(intensity, PALETTES["water"])
-    image = Image.fromarray(rgb, mode="RGB")
+    if drainage.shape != discharge.shape or drainage.shape != streams.shape:
+        raise ValueError("river map arrays must have identical shapes")
+
+    sample = np.log1p(
+        np.maximum(np.asarray(drainage[::8, ::8], dtype=np.float64), 0.0)
+    )
+    finite = sample[np.isfinite(sample)]
+    d_hi = float(np.percentile(finite, 99.8)) if finite.size else 1.0
+    d_hi = max(d_hi, 1.0e-12)
+
+    tmp = png_path.with_suffix(".river.rgb.tmp")
+    rgb = np.memmap(
+        tmp,
+        mode="w+",
+        dtype=np.uint8,
+        shape=(drainage.shape[0], drainage.shape[1], 3),
+    )
+    for y0 in range(0, drainage.shape[0], 128):
+        y1 = min(drainage.shape[0], y0 + 128)
+        d = np.log1p(
+            np.maximum(
+                np.asarray(drainage[y0:y1], dtype=np.float64),
+                0.0,
+            )
+        )
+        dn = np.clip(d / d_hi, 0.0, 1.0)
+        qn = np.clip(
+            np.asarray(discharge[y0:y1], dtype=np.float64),
+            0.0,
+            1.0,
+        )
+        channel = np.asarray(streams[y0:y1]) > 0
+        # Keep drainage context visible but make the actual routed centreline the
+        # dominant feature, so sinuosity is not hidden by broad accumulation.
+        intensity = np.clip(
+            (0.42 * dn + 0.58 * qn)
+            * (0.055 + 0.945 * channel),
+            0.0,
+            1.0,
+        )
+        rgb[y0:y1] = _ramp(intensity, PALETTES["water"])
+    rgb.flush()
+    image = Image.fromarray(np.asarray(rgb), mode="RGB")
     _draw_scalar_legend(
         image,
-        title="Deepest-tile river / drainage hierarchy",
+        title="Final-terrain D16 river / drainage hierarchy",
         units="relative",
         lo=0.0,
         hi=1.0,
@@ -1235,9 +1272,12 @@ def _render_river_composite(
     )
     png_path.parent.mkdir(parents=True, exist_ok=True)
     image.save(png_path, format="PNG", compress_level=6)
+    del image
+    del rgb
+    tmp.unlink(missing_ok=True)
     return {
         "file": png_path.name,
-        "title": "Deepest-tile river / drainage hierarchy",
+        "title": "Final-terrain D16 river / drainage hierarchy",
         "resolution": [int(drainage.shape[1]), int(drainage.shape[0])],
     }
 
