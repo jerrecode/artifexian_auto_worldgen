@@ -1464,13 +1464,44 @@ def _same_face_seam_max(
     return maximum
 
 
-def _same_face_seam_gradient_rms(
+def _same_face_seam_gradient_diagnostics(
     pyramid: PlanetTilePyramid, level: int
-) -> float:
-    """RMS mismatch of one-sided terrain derivatives across same-face tile seams."""
+) -> dict[str, Any]:
+    """Detailed one-sided derivative mismatch diagnostics for same-face seams."""
     side = 1 << int(level)
     sumsq = 0.0
     count = 0
+    maximum = 0.0
+    worst: dict[str, Any] | None = None
+    seam_rows: list[dict[str, Any]] = []
+
+    def consume(
+        key_a: TileKey,
+        key_b: TileKey,
+        orientation: str,
+        diff: np.ndarray,
+    ) -> None:
+        nonlocal sumsq, count, maximum, worst
+        values = np.asarray(diff, dtype=np.float64)
+        local_sumsq = float(np.sum(np.square(values)))
+        local_count = int(values.size)
+        local_rms = math.sqrt(local_sumsq / max(local_count, 1))
+        local_max = float(np.max(np.abs(values))) if values.size else 0.0
+        sumsq += local_sumsq
+        count += local_count
+        maximum = max(maximum, local_max)
+        row = {
+            "a": asdict(key_a),
+            "b": asdict(key_b),
+            "orientation": orientation,
+            "rms_m_per_sample": local_rms,
+            "max_abs_m_per_sample": local_max,
+            "sample_count": local_count,
+        }
+        seam_rows.append(row)
+        if worst is None or local_rms > float(worst["rms_m_per_sample"]):
+            worst = row
+
     for face in CUBE_FACES:
         for y in range(side):
             for x in range(side):
@@ -1484,42 +1515,63 @@ def _same_face_seam_gradient_rms(
                     dtype=np.float64,
                 )
                 if x + 1 < side:
+                    key_b = TileKey(face, level, x + 1, y)
                     b = np.asarray(
                         np.load(
-                            _geomorph_path(
-                                pyramid,
-                                TileKey(face, level, x + 1, y),
-                                "elevation_m",
-                            ),
+                            _geomorph_path(pyramid, key_b, "elevation_m"),
                             mmap_mode="r",
                             allow_pickle=False,
                         ),
                         dtype=np.float64,
                     )
-                    da = a[:, -1] - a[:, -2]
-                    db = b[:, 1] - b[:, 0]
-                    diff = da - db
-                    sumsq += float(np.sum(np.square(diff)))
-                    count += int(diff.size)
+                    consume(
+                        key,
+                        key_b,
+                        "x",
+                        (a[:, -1] - a[:, -2]) - (b[:, 1] - b[:, 0]),
+                    )
                 if y + 1 < side:
+                    key_b = TileKey(face, level, x, y + 1)
                     b = np.asarray(
                         np.load(
-                            _geomorph_path(
-                                pyramid,
-                                TileKey(face, level, x, y + 1),
-                                "elevation_m",
-                            ),
+                            _geomorph_path(pyramid, key_b, "elevation_m"),
                             mmap_mode="r",
                             allow_pickle=False,
                         ),
                         dtype=np.float64,
                     )
-                    da = a[-1, :] - a[-2, :]
-                    db = b[1, :] - b[0, :]
-                    diff = da - db
-                    sumsq += float(np.sum(np.square(diff)))
-                    count += int(diff.size)
-    return math.sqrt(sumsq / max(count, 1))
+                    consume(
+                        key,
+                        key_b,
+                        "y",
+                        (a[-1, :] - a[-2, :]) - (b[1, :] - b[0, :]),
+                    )
+
+    rms = math.sqrt(sumsq / max(count, 1))
+    top = sorted(
+        seam_rows,
+        key=lambda row: float(row["rms_m_per_sample"]),
+        reverse=True,
+    )[:20]
+    return {
+        "rms_m_per_sample": rms,
+        "max_abs_m_per_sample": maximum,
+        "sample_count": count,
+        "seam_count": len(seam_rows),
+        "worst_seam": worst,
+        "top_seams": top,
+    }
+
+
+def _same_face_seam_gradient_rms(
+    pyramid: PlanetTilePyramid, level: int
+) -> float:
+    """Backward-compatible RMS derivative mismatch scalar."""
+    return float(
+        _same_face_seam_gradient_diagnostics(pyramid, level)[
+            "rms_m_per_sample"
+        ]
+    )
 
 
 def audit_ultra_resolution(
@@ -1719,9 +1771,10 @@ def audit_ultra_resolution(
         )
 
     seam_max = _same_face_seam_max(pyramid, plan.finest_level)
-    seam_gradient_rms = _same_face_seam_gradient_rms(
+    seam_gradient = _same_face_seam_gradient_diagnostics(
         pyramid, plan.finest_level
     )
+    seam_gradient_rms = float(seam_gradient["rms_m_per_sample"])
     aggregate_physical = (
         float(np.sqrt(np.mean(np.square(physical_rms))))
         if physical_rms else 0.0
@@ -1919,6 +1972,7 @@ def audit_ultra_resolution(
             "max_sediment_closure_relative": closure_max,
             "same_face_seam_max_abs_m": seam_max,
             "same_face_seam_gradient_rms_m": seam_gradient_rms,
+            "same_face_seam_gradient_diagnostics": seam_gradient,
             "min_finest_samples_per_wavelength": (
                 None if not finest_samples else min_finest_samples
             ),
@@ -1932,6 +1986,32 @@ def audit_ultra_resolution(
     _atomic_json(out, report)
     if not report["all_checks_passed"]:
         failed = [name for name, passed in checks.items() if not passed]
+        worst_rivers = sorted(
+            (
+                {
+                    "key": row["key"],
+                    **dict(row.get("final_routing_metrics", {})),
+                }
+                for row in rows
+            ),
+            key=lambda row: int(row.get("max_straight_run_cells", 0) or 0),
+            reverse=True,
+        )[:20]
+        failure_summary = {
+            "failed_checks": failed,
+            "aggregate": report["aggregate"],
+            "worst_river_tiles": worst_rivers,
+            "worst_derivative_seams": seam_gradient.get("top_seams", []),
+        }
+        _atomic_json(
+            pyramid.world_root / "ultrares" / "terrain_detail_audit_failure.json",
+            failure_summary,
+        )
+        print(
+            "[ultrares-audit-failure] "
+            + json.dumps(failure_summary, sort_keys=True),
+            flush=True,
+        )
         raise RuntimeError(
             "ultra-resolution terrain audit failed: " + ", ".join(failed)
         )
