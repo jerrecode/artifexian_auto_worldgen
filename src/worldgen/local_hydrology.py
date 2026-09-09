@@ -101,8 +101,8 @@ class LocalHydrologySpec:
     priority_flood_epsilon_m: float = 0.01
     stream_quantile: float = 0.985
     fallback_runoff_base_fraction: float = 0.24
-    meander_strength: float = 0.78
-    meander_max_turn_deg: float = 55.0
+    meander_strength: float = 0.84
+    meander_max_turn_deg: float = 62.0
     meander_slope_scale: float = 0.012
     meander_discharge_power: float = 0.65
     major_river_corridor_cells: int = 7
@@ -1121,13 +1121,18 @@ class LocalHydrologySolver:
             local0,
             seed=int(self.pyramid._read_seed()),
         )
-        meander = (
-            float(cfg.meander_strength)
-            * np.power(np.clip(local0, 0.0, 1.0), float(cfg.meander_discharge_power))
+        slope_meander_factor = (
+            0.12
+            + 0.88
             * np.exp(
                 -np.maximum(best_slope0, 0.0)
                 / max(float(cfg.meander_slope_scale), 1.0e-12)
             )
+        )
+        meander = (
+            float(cfg.meander_strength)
+            * np.power(np.clip(local0, 0.0, 1.0), float(cfg.meander_discharge_power))
+            * slope_meander_factor
             * (~ocean)
         )
         # Major-river corridors permit a little more lateral migration because
