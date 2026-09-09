@@ -1467,7 +1467,13 @@ def _same_face_seam_max(
 def _same_face_seam_gradient_diagnostics(
     pyramid: PlanetTilePyramid, level: int
 ) -> dict[str, Any]:
-    """Detailed one-sided derivative mismatch diagnostics for same-face seams."""
+    """Detailed C1 mismatch diagnostics for same-face seams.
+
+    Uses second-order one-sided derivative estimators evaluated at the common
+    boundary vertex. This cancels the leading quadratic-curvature term, unlike
+    comparing the two adjacent first differences, which is a second-difference
+    curvature diagnostic and falsely flags smooth ridge crests.
+    """
     side = 1 << int(level)
     sumsq = 0.0
     count = 0
@@ -1528,7 +1534,10 @@ def _same_face_seam_gradient_diagnostics(
                         key,
                         key_b,
                         "x",
-                        (a[:, -1] - a[:, -2]) - (b[:, 1] - b[:, 0]),
+                        (
+                            (3.0 * a[:, -1] - 4.0 * a[:, -2] + a[:, -3]) / 2.0
+                            - (-3.0 * b[:, 0] + 4.0 * b[:, 1] - b[:, 2]) / 2.0
+                        ),
                     )
                 if y + 1 < side:
                     key_b = TileKey(face, level, x, y + 1)
@@ -1544,7 +1553,10 @@ def _same_face_seam_gradient_diagnostics(
                         key,
                         key_b,
                         "y",
-                        (a[-1, :] - a[-2, :]) - (b[1, :] - b[0, :]),
+                        (
+                            (3.0 * a[-1, :] - 4.0 * a[-2, :] + a[-3, :]) / 2.0
+                            - (-3.0 * b[0, :] + 4.0 * b[1, :] - b[2, :]) / 2.0
+                        ),
                     )
 
     rms = math.sqrt(sumsq / max(count, 1))
