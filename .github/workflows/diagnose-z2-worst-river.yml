@@ -10,6 +10,10 @@ on:
       - 'src/worldgen/local_hydrology.py'
       - 'src/worldgen/local_geomorphology.py'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   actions: read
