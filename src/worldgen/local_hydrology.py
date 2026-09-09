@@ -40,7 +40,7 @@ from .planet_tiles import (
 )
 
 
-LOCAL_HYDROLOGY_ALGORITHM_REVISION = "adaptive-d16-routing-v2"
+LOCAL_HYDROLOGY_ALGORITHM_REVISION = "competitive-flat-d16-routing-v3"
 
 _D8 = (
     (-1, -1),
@@ -511,6 +511,9 @@ def _flow_d16_open(
     preferred_angle_rad: np.ndarray | None = None,
     steering_weight: np.ndarray | None = None,
     steering_score_floor: float = 0.10,
+    competitive_slope_fraction: float | None = None,
+    reference_max_slope: np.ndarray | None = None,
+    competitive_alignment_weight: float = 0.90,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Steepest-descent routing on a 16-direction queen+knight stencil.
 
@@ -519,6 +522,12 @@ def _flow_d16_open(
     below the source elevation, preventing the router from jumping across a ridge.
     Optional steering rotates the preferred direction on low-gradient, high-
     discharge reaches while every receiver remains strictly downhill.
+
+    Corrective routing may additionally restrict selection to a competitive set
+    of directions whose downhill slope is within a configured fraction of the
+    unsteered local maximum. Within that near-tie set, smooth angular preference
+    becomes the primary de-locking criterion. This targets Priority-Flood flats
+    without sacrificing steepest descent where alternatives are materially worse.
     """
     z = np.asarray(filled_elevation_m, dtype=np.float64)
     oc = np.asarray(ocean, dtype=bool)
@@ -543,6 +552,38 @@ def _flow_d16_open(
     score_floor = float(steering_score_floor)
     if not math.isfinite(score_floor) or not 0.0 <= score_floor <= 1.0:
         raise ValueError("steering_score_floor must be finite and in [0,1]")
+    competitive_fraction = (
+        None
+        if competitive_slope_fraction is None
+        else float(competitive_slope_fraction)
+    )
+    if competitive_fraction is not None and not (
+        math.isfinite(competitive_fraction)
+        and 0.0 < competitive_fraction <= 1.0
+    ):
+        raise ValueError(
+            "competitive_slope_fraction must be finite and in (0,1]"
+        )
+    reference = (
+        None
+        if reference_max_slope is None
+        else np.asarray(reference_max_slope, dtype=np.float64)
+    )
+    if competitive_fraction is not None:
+        if reference is None or reference.shape != z.shape:
+            raise ValueError(
+                "reference_max_slope matching elevation is required for "
+                "competitive slope selection"
+            )
+        if preferred is None:
+            raise ValueError(
+                "preferred_angle_rad is required for competitive slope selection"
+            )
+    align_weight = float(competitive_alignment_weight)
+    if not math.isfinite(align_weight) or not 0.0 <= align_weight <= 1.0:
+        raise ValueError(
+            "competitive_alignment_weight must be finite and in [0,1]"
+        )
 
     best_score = np.zeros((h, w), dtype=np.float64)
     best_slope = np.zeros((h, w), dtype=np.float64)
@@ -584,6 +625,18 @@ def _flow_d16_open(
             corridor_limit = source - 0.015 * np.maximum(source - target, 0.0)
             valid &= corridor <= corridor_limit + 1.0e-8
 
+        reference_view = None
+        if competitive_fraction is not None:
+            reference_view = reference[sy0:sy1, sx0:sx1]
+            # The unsteered maximum is always part of this set. Directions with
+            # materially smaller descent are excluded, so steering cannot force a
+            # channel across the local relief merely to create curvature.
+            valid &= slope >= (
+                competitive_fraction
+                * np.maximum(reference_view, 0.0)
+                - 1.0e-15
+            )
+
         score = np.where(valid, slope, 0.0)
         if preferred is not None:
             delta = np.angle(
@@ -597,10 +650,37 @@ def _flow_d16_open(
             )
             alignment = np.square(0.5 + 0.5 * np.cos(delta))
             sw = steer[sy0:sy1, sx0:sx1]
-            directional = (1.0 - sw) + sw * (
-                score_floor + (1.0 - score_floor) * alignment
-            )
-            score *= directional
+            aligned = score_floor + (1.0 - score_floor) * alignment
+
+            if competitive_fraction is None:
+                directional = (1.0 - sw) + sw * aligned
+                score *= directional
+            else:
+                # In a near-tie set the raw slope differences mostly represent
+                # raster quantization of an almost-flat hydrologic surface. Blend
+                # normalized descent with angular preference, making alignment
+                # dominant only where meander steering is physically active.
+                relative = np.divide(
+                    slope,
+                    np.maximum(reference_view, 1.0e-30),
+                    out=np.zeros_like(slope),
+                    where=reference_view > 0.0,
+                )
+                local_alignment_weight = np.clip(
+                    align_weight
+                    * (0.35 + 0.65 * np.sqrt(sw)),
+                    0.0,
+                    1.0,
+                )
+                priority = (
+                    (1.0 - local_alignment_weight) * relative
+                    + local_alignment_weight * aligned
+                )
+                score = np.where(
+                    valid,
+                    np.maximum(reference_view, 0.0) * priority,
+                    0.0,
+                )
 
         view_best = best_score[sy0:sy1, sx0:sx1]
         better = score > view_best
@@ -657,14 +737,14 @@ def _meander_phase(
     seed: int,
     variant: int = 0,
     minimum_wavelength_m: float = 0.0,
-    flow_angle_rad: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Absolute-coordinate meander phase with adaptive multi-scale variants.
+    """Absolute-coordinate, scale-aware meander preference field.
 
     Variant 0 preserves the historical long-wave field. Variants 1 and 2 add
-    independent shorter-wave components used only when measured routing contains
-    an over-long raster-locked reach. All fields are absolute-coordinate and
-    deterministic, so neighbouring tiles receive compatible steering.
+    independent shorter-wave components used only by corrective routing. The
+    fields remain globally deterministic and seamless; the corrective D16 selector
+    decides among genuinely competitive downhill receivers rather than changing
+    the terrain or permitting uphill flow.
     """
     unit = np.asarray(xyz, dtype=np.float64)
     q = np.clip(np.asarray(discharge_index, dtype=np.float64), 0.0, 1.0)
@@ -681,46 +761,12 @@ def _meander_phase(
         )
         tangent = np.where(norm > 1.0e-10, tangent, fallback)
         tangent /= np.maximum(
-            np.linalg.norm(tangent, axis=-1, keepdims=True), 1.0e-12
+            np.linalg.norm(tangent, axis=-1, keepdims=True),
+            1.0e-12,
         )
         return tangent
 
-    streamwise: np.ndarray | None = None
-    if flow_angle_rad is not None:
-        flow_angle = np.asarray(flow_angle_rad, dtype=np.float64)
-        if flow_angle.shape != q.shape:
-            raise ValueError("flow_angle_rad must match discharge_index")
-        z_axis = np.zeros_like(unit)
-        z_axis[..., 2] = 1.0
-        east = np.cross(z_axis, unit)
-        east_norm = np.linalg.norm(east, axis=-1, keepdims=True)
-        polar = east_norm[..., 0] < 1.0e-8
-        if np.any(polar):
-            fallback_axis = np.zeros_like(unit)
-            fallback_axis[..., 1] = 1.0
-            east[polar] = np.cross(fallback_axis[polar], unit[polar])
-            east_norm = np.linalg.norm(east, axis=-1, keepdims=True)
-        east /= np.maximum(east_norm, 1.0e-15)
-        south = -np.cross(unit, east)
-
-        valid_angle = np.isfinite(flow_angle)
-        # D16 angle is atan2(dy, dx): dy is local south and dx local east.
-        streamwise = (
-            np.sin(np.where(valid_angle, flow_angle, 0.0))[..., None] * south
-            + np.cos(np.where(valid_angle, flow_angle, 0.0))[..., None] * east
-        )
-        streamwise /= np.maximum(
-            np.linalg.norm(streamwise, axis=-1, keepdims=True),
-            1.0e-12,
-        )
-        fallback = tangent_from_axis(rng.normal(size=3))
-        streamwise = np.where(valid_angle[..., None], streamwise, fallback)
-
-    tangent0 = (
-        streamwise
-        if streamwise is not None
-        else tangent_from_axis(rng.normal(size=3))
-    )
+    tangent0 = tangent_from_axis(rng.normal(size=3))
     wavelength0_km = 18.0 + 165.0 * np.power(q, 0.72)
     _c0, s0, coh0 = phase_cell_octave_xyz(
         unit,
@@ -735,11 +781,7 @@ def _meander_phase(
     if int(variant) <= 0:
         return primary
 
-    tangent1 = (
-        streamwise
-        if streamwise is not None
-        else tangent_from_axis(rng.normal(size=3))
-    )
+    tangent1 = tangent_from_axis(rng.normal(size=3))
     wavelength_floor_km = max(float(minimum_wavelength_m), 0.0) / 1000.0
     wavelength1_km = np.maximum(
         (
@@ -755,19 +797,22 @@ def _meander_phase(
         wavelength1_km,
         tangent1,
         cell_scale=0.70 if int(variant) == 1 else 0.62,
-        seed=(int(seed) ^ 0x73686F7274776176 ^ (int(variant) * 0x9E3779B1)),
+        seed=(
+            int(seed)
+            ^ 0x73686F7274776176
+            ^ (int(variant) * 0x9E3779B1)
+        ),
         octave=41 + int(variant),
     )
     short = np.asarray(s1 * coh1, dtype=np.float64)
-
     if int(variant) == 1:
-        return np.clip(0.55 * primary + 0.80 * short, -1.0, 1.0)
+        return np.clip(
+            0.55 * primary + 0.80 * short,
+            -1.0,
+            1.0,
+        )
 
-    tangent2 = (
-        streamwise
-        if streamwise is not None
-        else tangent_from_axis(rng.normal(size=3))
-    )
+    tangent2 = tangent_from_axis(rng.normal(size=3))
     wavelength2_km = np.maximum(
         3.5 + 20.0 * np.power(q, 0.52),
         wavelength_floor_km,
@@ -787,7 +832,6 @@ def _meander_phase(
         -1.0,
         1.0,
     )
-
 
 def _major_river_guide(
     inherited_major_river: np.ndarray,
@@ -1410,30 +1454,6 @@ class LocalHydrologySolver:
         )
         local0 = _normalize_log(discharge0, ~ocean)
         base_angle = _flow_angles(code0)
-        valid_base_angle = np.isfinite(base_angle)
-        phase_weight = ndimage.gaussian_filter(
-            valid_base_angle.astype(np.float64),
-            sigma=2.0,
-            mode="nearest",
-        )
-        phase_cos = ndimage.gaussian_filter(
-            np.where(valid_base_angle, np.cos(base_angle), 0.0),
-            sigma=2.0,
-            mode="nearest",
-        )
-        phase_sin = ndimage.gaussian_filter(
-            np.where(valid_base_angle, np.sin(base_angle), 0.0),
-            sigma=2.0,
-            mode="nearest",
-        )
-        smoothed_flow_angle = np.where(
-            phase_weight > 1.0e-6,
-            np.arctan2(
-                phase_sin / np.maximum(phase_weight, 1.0e-12),
-                phase_cos / np.maximum(phase_weight, 1.0e-12),
-            ),
-            base_angle,
-        )
         parent_discharge = self._parent_discharge_patch(geom)
         sample_m = approximate_meters_per_sample(
             self.pyramid.planet_radius_m,
@@ -1452,7 +1472,6 @@ class LocalHydrologySolver:
                 minimum_wavelength_m=(
                     corrective_min_wavelength_m if attempt > 0 else 0.0
                 ),
-                flow_angle_rad=smoothed_flow_angle,
             )
             slope_factor = np.exp(
                 -np.maximum(best_slope0, 0.0)
@@ -1506,6 +1525,19 @@ class LocalHydrologySolver:
                     0.10 if attempt == 0
                     else 0.045 if attempt == 1
                     else 0.018
+                ),
+                competitive_slope_fraction=(
+                    None if attempt == 0
+                    else 0.90 if attempt == 1
+                    else 0.80
+                ),
+                reference_max_slope=(
+                    None if attempt == 0 else best_slope0
+                ),
+                competitive_alignment_weight=(
+                    0.0 if attempt == 0
+                    else 0.84 if attempt == 1
+                    else 0.96
                 ),
             )
             drainage, discharge = _accumulate_open(
@@ -1615,7 +1647,11 @@ class LocalHydrologySolver:
             "adaptive_meander_min_wavelength_m": float(
                 corrective_min_wavelength_m
             ),
-            "meander_phase_axis": "smoothed local streamwise flow direction",
+            "meander_selector_semantics": (
+                "corrective attempts select only near-tied strictly-downhill "
+                "D16 receivers, then use smooth absolute-coordinate angular "
+                "preference as the dominant de-locking criterion"
+            ),
             "routing_candidate_metrics": [
                 {
                     "attempt": int(candidate["attempt"]),
@@ -1632,6 +1668,16 @@ class LocalHydrologySolver:
                         0.10 if int(candidate["attempt"]) == 0
                         else 0.045 if int(candidate["attempt"]) == 1
                         else 0.018
+                    ),
+                    "competitive_slope_fraction": (
+                        None if int(candidate["attempt"]) == 0
+                        else 0.90 if int(candidate["attempt"]) == 1
+                        else 0.80
+                    ),
+                    "competitive_alignment_weight": (
+                        None if int(candidate["attempt"]) == 0
+                        else 0.84 if int(candidate["attempt"]) == 1
+                        else 0.96
                     ),
                 }
                 for candidate in candidates
