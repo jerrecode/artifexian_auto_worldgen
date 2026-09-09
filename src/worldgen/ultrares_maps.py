@@ -1434,6 +1434,47 @@ def reconstruct_fullview_maps(
     combined.flush()
     del combined
 
+    # Emit native height first. Once its TIFF exists, the multi-gigabyte z3
+    # elevation/erosion/procedural authorities are no longer needed because their
+    # 8192 scratch products above and reconstructed z1 elevation remain available.
+    native_elev_km = sample(
+        "native_elevation_km",
+        lambda key: _geomorph_path(pyramid, "elevation_m", key),
+        dtype="float64",
+        width=native_width,
+        height=native_height,
+        value_scale=0.001,
+    )
+    native_tiff = output / "01b_terrain_heightmap_grayscale32_native.tif"
+    native_tiff_meta = output / "01b_terrain_heightmap_grayscale32_native.json"
+    native_height_meta = write_heightmap_tiff32(
+        native_tiff,
+        np.load(native_elev_km, mmap_mode="r", allow_pickle=False),
+        metadata_path=native_tiff_meta,
+        chunk_rows=96,
+    )
+    manifest.append({
+        "file": native_tiff.name,
+        "metadata_file": native_tiff_meta.name,
+        "title": "Native final terrain heightmap",
+        "encoding": (
+            "single-channel min-is-black uint32 BigTIFF; global min->0 "
+            "global max->4294967295"
+        ),
+        "channels": 1,
+        "bits_per_sample": 32,
+        "quantization_step_m": float(native_height_meta["quantization_step_m"]),
+        "resolution": [native_width, native_height],
+    })
+    _remove_fullview_temp(native_elev_km)
+
+    if cleanup_heavy_solver_caches:
+        for field in ("elevation_m", "erosion_m", "procedural_detail_m"):
+            shutil.rmtree(
+                pyramid.root / "derived" / "local_geomorphology_v1" / field,
+                ignore_errors=True,
+            )
+
     # Rivers must come from the final-terrain reroute saved by geomorphology,
     # never from the pre-erosion local_hydrology cache.
     drainage = sample(
@@ -1478,8 +1519,8 @@ def reconstruct_fullview_maps(
     )
     _remove_fullview_temp(drainage, discharge, streams)
 
-    # A native-resolution river image preserves the additional sinuosity exposed
-    # by z3 rather than collapsing it back to the 8192-wide climate-map raster.
+    # Native river image preserves z3 sinuosity instead of collapsing it back to
+    # the 8192-wide climate-product raster.
     native_drainage = sample(
         "native_final_drainage_area_km2",
         lambda key: _geomorph_path(pyramid, "final_drainage_area_km2", key),
@@ -1512,47 +1553,8 @@ def reconstruct_fullview_maps(
     )
     _remove_fullview_temp(native_drainage, native_discharge, native_streams)
 
-    # Emit the high-precision native height product before climate/surface
-    # materialization so z3 elevation can be released immediately afterwards.
-    native_elev_km = sample(
-        "native_elevation_km",
-        lambda key: _geomorph_path(pyramid, "elevation_m", key),
-        dtype="float64",
-        width=native_width,
-        height=native_height,
-        value_scale=0.001,
-    )
-    native_tiff = output / "01b_terrain_heightmap_grayscale32_native.tif"
-    native_tiff_meta = output / "01b_terrain_heightmap_grayscale32_native.json"
-    native_height_meta = write_heightmap_tiff32(
-        native_tiff,
-        np.load(native_elev_km, mmap_mode="r", allow_pickle=False),
-        metadata_path=native_tiff_meta,
-        chunk_rows=96,
-    )
-    manifest.append({
-        "file": native_tiff.name,
-        "metadata_file": native_tiff_meta.name,
-        "title": "Native final terrain heightmap",
-        "encoding": (
-            "single-channel min-is-black uint32 BigTIFF; global min->0 "
-            "global max->4294967295"
-        ),
-        "channels": 1,
-        "bits_per_sample": 32,
-        "quantization_step_m": float(native_height_meta["quantization_step_m"]),
-        "resolution": [native_width, native_height],
-    })
-    _remove_fullview_temp(native_elev_km)
-
     if cleanup_heavy_solver_caches:
-        # Ordinary 8192 scratch arrays above now contain everything still needed
-        # for terrain/erosion rendering. Climate uses reconstructed z1 elevation,
-        # so the multi-gigabyte z3 source fields can be released here.
         for field in (
-            "elevation_m",
-            "erosion_m",
-            "procedural_detail_m",
             "final_drainage_area_km2",
             "final_discharge_index",
             "final_streams",
@@ -1561,8 +1563,14 @@ def reconstruct_fullview_maps(
                 pyramid.root / "derived" / "local_geomorphology_v1" / field,
                 ignore_errors=True,
             )
-        shutil.rmtree(pyramid.root / "derived" / "local_hydrology_v1", ignore_errors=True)
-        shutil.rmtree(pyramid.root / "derived" / "river_constraints_v1", ignore_errors=True)
+        shutil.rmtree(
+            pyramid.root / "derived" / "local_hydrology_v1",
+            ignore_errors=True,
+        )
+        shutil.rmtree(
+            pyramid.root / "derived" / "river_constraints_v1",
+            ignore_errors=True,
+        )
 
     # Recompute terrain-sensitive climate/surface products using final elevation.
     generate_climate_surface_products(pyramid, plan)
