@@ -1467,12 +1467,13 @@ def _same_face_seam_max(
 def _same_face_seam_gradient_diagnostics(
     pyramid: PlanetTilePyramid, level: int
 ) -> dict[str, Any]:
-    """Detailed C1 mismatch diagnostics for same-face seams.
+    """C1 mismatch introduced by tile-local geomorphology at same-face seams.
 
-    Uses second-order one-sided derivative estimators evaluated at the common
-    boundary vertex. This cancels the leading quadratic-curvature term, unlike
-    comparing the two adjacent first differences, which is a second-difference
-    curvature diagnostic and falsely flags smooth ridge crests.
+    The diagnostic is evaluated on final elevation minus inherited elevation.
+    This isolates discontinuity added by independently solved tile-local erosion,
+    channels and procedural morphology from legitimate curvature already present
+    in the globally continuous inherited terrain. Second-order one-sided
+    derivatives are compared at the common boundary vertex.
     """
     side = 1 << int(level)
     sumsq = 0.0
@@ -1512,7 +1513,7 @@ def _same_face_seam_gradient_diagnostics(
         for y in range(side):
             for x in range(side):
                 key = TileKey(face, level, x, y)
-                a = np.asarray(
+                final_a = np.asarray(
                     np.load(
                         _geomorph_path(pyramid, key, "elevation_m"),
                         mmap_mode="r",
@@ -1520,9 +1521,14 @@ def _same_face_seam_gradient_diagnostics(
                     ),
                     dtype=np.float64,
                 )
+                inherited_a = np.asarray(
+                    pyramid.load_field(key, "elevation_m"),
+                    dtype=np.float64,
+                )
+                a = final_a - inherited_a
                 if x + 1 < side:
                     key_b = TileKey(face, level, x + 1, y)
-                    b = np.asarray(
+                    final_b = np.asarray(
                         np.load(
                             _geomorph_path(pyramid, key_b, "elevation_m"),
                             mmap_mode="r",
@@ -1530,6 +1536,11 @@ def _same_face_seam_gradient_diagnostics(
                         ),
                         dtype=np.float64,
                     )
+                    inherited_b = np.asarray(
+                        pyramid.load_field(key_b, "elevation_m"),
+                        dtype=np.float64,
+                    )
+                    b = final_b - inherited_b
                     consume(
                         key,
                         key_b,
@@ -1541,7 +1552,7 @@ def _same_face_seam_gradient_diagnostics(
                     )
                 if y + 1 < side:
                     key_b = TileKey(face, level, x, y + 1)
-                    b = np.asarray(
+                    final_b = np.asarray(
                         np.load(
                             _geomorph_path(pyramid, key_b, "elevation_m"),
                             mmap_mode="r",
@@ -1549,6 +1560,11 @@ def _same_face_seam_gradient_diagnostics(
                         ),
                         dtype=np.float64,
                     )
+                    inherited_b = np.asarray(
+                        pyramid.load_field(key_b, "elevation_m"),
+                        dtype=np.float64,
+                    )
+                    b = final_b - inherited_b
                     consume(
                         key,
                         key_b,
@@ -1566,6 +1582,10 @@ def _same_face_seam_gradient_diagnostics(
         reverse=True,
     )[:20]
     return {
+        "semantics": (
+            "C1 mismatch of tile-local geomorphic residual relative to "
+            "globally continuous inherited terrain"
+        ),
         "rms_m_per_sample": rms,
         "max_abs_m_per_sample": maximum,
         "sample_count": count,
