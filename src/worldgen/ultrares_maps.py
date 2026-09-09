@@ -882,6 +882,8 @@ def _sample_deepest_to_npy(
     mode: str = "linear",
     output_dtype: np.dtype | str | None = None,
     chunk_rows: int = 64,
+    width: int | None = None,
+    height: int | None = None,
 ) -> Path:
     level = int(plan.finest_level)
     side = 1 << level
@@ -893,12 +895,13 @@ def _sample_deepest_to_npy(
         raise ValueError(f"deepest tile shape must begin {(n + 1, n + 1)}, got {first.shape}")
     trailing = first.shape[2:]
     dtype = np.dtype(output_dtype or first.dtype)
-    shape = (int(plan.fullview_height), int(plan.fullview_width), *trailing)
+    width = int(plan.fullview_width if width is None else width)
+    height = int(plan.fullview_height if height is None else height)
+    if width < 2 or height < 1 or width != 2 * height:
+        raise ValueError("equirectangular output must be a positive canonical 2:1 raster")
+    shape = (height, width, *trailing)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     out = np.lib.format.open_memmap(output_path, mode="w+", dtype=dtype, shape=shape)
-
-    width = int(plan.fullview_width)
-    height = int(plan.fullview_height)
     lon = -math.pi + (np.arange(width, dtype=np.float64) + 0.5) * (2.0 * math.pi / width)
     cos_lon = np.cos(lon)
     sin_lon = np.sin(lon)
