@@ -146,3 +146,15 @@ def test_local_geomorphology_cache_is_deterministic(tmp_path):
         np.asarray(first.final_streams),
     )
     assert second.metadata == first.metadata
+
+
+def test_terrain_eighth_moment_catches_balanced_axis_diagonal_grid():
+    y, x = np.mgrid[:256, :256]
+    field = np.zeros((256, 256), dtype=np.float64)
+    field[:128] = np.sin(2.0 * np.pi * x[:128] / 12.0)
+    field[128:] = np.sin(
+        2.0 * np.pi * (x[128:] + y[128:]) / (12.0 * np.sqrt(2.0))
+    )
+    metrics = _grid_angular_moments(field)
+    assert metrics["local_fourth_magnitude"] < 0.25
+    assert metrics["local_eighth_magnitude"] > 0.80
