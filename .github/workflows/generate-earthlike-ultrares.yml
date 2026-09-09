@@ -27,6 +27,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 # Never throw away hours of deterministic production merely because a new commit lands.
 concurrency:
@@ -146,7 +147,7 @@ jobs:
         with:
           name: earthlike-ultrares-source-2026090707
           path: ${{ env.ROOT }}/
-          retention-days: 3
+          retention-days: 14
           compression-level: 3
           overwrite: true
           if-no-files-found: error
@@ -176,12 +177,36 @@ jobs:
         with:
           name: earthlike-ultrares-source-2026090707
           path: ${{ env.ROOT }}
-      - name: Restore prior partial shard checkpoint when rerunning
+      - name: Locate newest compatible-candidate shard checkpoint
+        id: prior-checkpoint
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_NAME: earthlike-ultrares-terrain-shard-${{ matrix.shard }}-of-24
+        run: |
+          set -euo pipefail
+          run_id="$(
+            gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${ARTIFACT_NAME}&per_page=100" \
+              --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | reverse | .[0].workflow_run.id // empty'
+          )"
+          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+          if [[ -n "${run_id}" ]]; then
+            echo "Found restart candidate artifact from workflow run ${run_id}."
+          else
+            echo "No prior restart artifact found; this shard starts clean."
+          fi
+      - name: Restore newest shard checkpoint candidate
+        if: ${{ steps.prior-checkpoint.outputs.run_id != '' }}
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: earthlike-ultrares-terrain-shard-${{ matrix.shard }}-of-24
           path: ${{ env.ROOT }}
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.prior-checkpoint.outputs.run_id }}
       - name: Generate resumable z3 terrain shard
         shell: bash
         run: |
@@ -203,7 +228,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: earthlike-ultrares-terrain-shard-${{ matrix.shard }}-of-24
-          retention-days: 3
+          retention-days: 14
           compression-level: 3
           overwrite: true
           if-no-files-found: warn
