@@ -1545,13 +1545,19 @@ class LocalHydrologySolver:
         )
         corrective_min_wavelength_m = 4.5 * sample_m
 
-        def route_candidate(attempt: int):
+        def route_candidate(
+            attempt: int,
+            *,
+            lock_reference: dict[str, object] | None = None,
+            bend_sign: float = 1.0,
+        ):
+            phase_variant = min(int(attempt), 2)
             phase = _meander_phase(
                 geom.xyz,
                 self.pyramid.planet_radius_m,
                 local0,
                 seed=int(self.pyramid._read_seed()),
-                variant=attempt,
+                variant=phase_variant,
                 minimum_wavelength_m=(
                     corrective_min_wavelength_m if attempt > 0 else 0.0
                 ),
@@ -1596,6 +1602,30 @@ class LocalHydrologySolver:
                 * turn_weight,
                 0.0,
             )
+
+            lock_info = None
+            if lock_reference is not None:
+                fields = _straight_reach_bend_fields(
+                    np.asarray(lock_reference["receiver"]),
+                    np.asarray(lock_reference["code16"]),
+                    lock_reference["metrics"],
+                    bend_sign=bend_sign,
+                )
+                if fields is not None:
+                    bend_offset, bend_strength, lock_info = fields
+                    reference_angle = _flow_angles(
+                        np.asarray(lock_reference["code16"])
+                    )
+                    target_angle = np.where(
+                        np.isfinite(reference_angle),
+                        reference_angle + bend_offset,
+                        preferred,
+                    )
+                    delta = np.angle(
+                        np.exp(1j * (target_angle - preferred))
+                    )
+                    preferred = preferred + bend_strength * delta
+                    meander = np.maximum(meander, bend_strength)
 
             receiver, code16, _best_slope = _flow_d16_open(
                 filled,
@@ -1677,6 +1707,7 @@ class LocalHydrologySolver:
                 "meander": meander,
                 "threshold": threshold,
                 "metrics": metrics,
+                "lock_breaker": lock_info,
             }
 
         candidates = [route_candidate(0)]
