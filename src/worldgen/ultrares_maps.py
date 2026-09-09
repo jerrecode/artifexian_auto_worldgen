@@ -1371,6 +1371,8 @@ def reconstruct_fullview_maps(
     output.mkdir(parents=True, exist_ok=True)
     temp.mkdir(parents=True, exist_ok=True)
     manifest: list[dict[str, object]] = []
+    native_width = int(plan.fullview_width * 2)
+    native_height = int(plan.fullview_height * 2)
 
     def sample(
         name: str,
@@ -1539,8 +1541,6 @@ def reconstruct_fullview_maps(
     # Authoritative high-precision grayscale deliverable. The z3 terrain is
     # reprojected at 2x the ordinary fullview, which makes the audited four-z3-
     # sample minimum wavelength a ~2-pixel wave / ~1-pixel half-wave.
-    native_width = int(plan.fullview_width * 2)
-    native_height = int(plan.fullview_height * 2)
     native_elev_km = sample(
         "native_elevation_km",
         lambda key: _geomorph_path(pyramid, "elevation_m", key),
