@@ -27,11 +27,13 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
-# Never throw away hours of deterministic production merely because a new commit lands.
+# Normal pushes queue behind active production. A deliberately tagged replacement
+# merge can retire obsolete same-ref production runs in favor of the new profile.
 concurrency:
   group: earthlike-ultrares-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ contains(github.event.head_commit.message, '[replace-production]') }}
 
 env:
   MPLBACKEND: Agg
@@ -44,7 +46,7 @@ env:
   SEED: '2026090707'
   ROOT: output/earthlike-ultrares-2026090707
   CONFIG: validation-configs/earthlike-ultrares-2026090707.yaml
-  SHARD_COUNT: '24'
+  SHARD_COUNT: '12'
 
 jobs:
   preflight:
@@ -146,7 +148,7 @@ jobs:
         with:
           name: earthlike-ultrares-source-2026090707
           path: ${{ env.ROOT }}/
-          retention-days: 3
+          retention-days: 14
           compression-level: 3
           overwrite: true
           if-no-files-found: error
@@ -159,7 +161,7 @@ jobs:
       fail-fast: false
       max-parallel: 4
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-python@v7.0.0
@@ -176,13 +178,37 @@ jobs:
         with:
           name: earthlike-ultrares-source-2026090707
           path: ${{ env.ROOT }}
-      - name: Restore prior partial shard checkpoint when rerunning
+      - name: Locate newest compatible-candidate shard checkpoint
+        id: prior-checkpoint
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_NAME: earthlike-ultrares-terrain-shard-${{ matrix.shard }}-of-12
+        run: |
+          set -euo pipefail
+          run_id="$(
+            gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${ARTIFACT_NAME}&per_page=100" \
+              --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | reverse | .[0].workflow_run.id // empty'
+          )"
+          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+          if [[ -n "${run_id}" ]]; then
+            echo "Found restart candidate artifact from workflow run ${run_id}."
+          else
+            echo "No prior restart artifact found; this shard starts clean."
+          fi
+      - name: Restore newest shard checkpoint candidate
+        if: ${{ steps.prior-checkpoint.outputs.run_id != '' }}
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: earthlike-ultrares-terrain-shard-${{ matrix.shard }}-of-24
+          name: earthlike-ultrares-terrain-shard-${{ matrix.shard }}-of-12
           path: ${{ env.ROOT }}
-      - name: Generate resumable z3 terrain shard
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.prior-checkpoint.outputs.run_id }}
+      - name: Generate resumable z2 terrain shard
         shell: bash
         run: |
           set -euxo pipefail
@@ -192,7 +218,7 @@ jobs:
             --workers 2 \
             --tile-size 1024 \
             --base-multiplier 4 \
-            --subsection-multiplier 3 \
+            --subsection-multiplier 2 \
             --min-samples-per-wavelength 4 \
             --terrain-detail-strength 1.15 \
             --shard-index "${{ matrix.shard }}" \
@@ -202,14 +228,15 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: earthlike-ultrares-terrain-shard-${{ matrix.shard }}-of-24
-          retention-days: 3
+          name: earthlike-ultrares-terrain-shard-${{ matrix.shard }}-of-12
+          retention-days: 14
           compression-level: 3
           overwrite: true
           if-no-files-found: warn
           path: |
             ${{ env.ROOT }}/tiles/cubesphere_v1/derived/local_geomorphology_v1/
             ${{ env.ROOT }}/ultrares/tile_checkpoints/
+            ${{ env.ROOT }}/ultrares/telemetry/
             ${{ env.ROOT }}/ultrares/progress-shard-*.json
             ${{ env.ROOT }}/ultrares/shard-*.json
             ${{ env.ROOT }}/ultrares-shard-*.log
@@ -238,7 +265,7 @@ jobs:
       - name: Gather all terrain shard authorities
         uses: actions/download-artifact@v4
         with:
-          pattern: earthlike-ultrares-terrain-shard-*-of-24
+          pattern: earthlike-ultrares-terrain-shard-*-of-12
           path: ${{ env.ROOT }}
           merge-multiple: true
       - name: Rebuild deterministic source profile for provenance
@@ -249,7 +276,7 @@ jobs:
             --base config/ultra_detail.yaml \
             --out "$CONFIG" \
             --seed "$SEED"
-      - name: Validate all 384 checkpoints and reconstruct ultra-resolution authority
+      - name: Validate all 96 checkpoints and reconstruct ultra-resolution authority
         shell: bash
         run: |
           set -euxo pipefail
@@ -258,7 +285,7 @@ jobs:
             --workers 2 \
             --tile-size 1024 \
             --base-multiplier 4 \
-            --subsection-multiplier 3 \
+            --subsection-multiplier 2 \
             --min-samples-per-wavelength 4 \
             --terrain-detail-strength 1.15 \
             2>&1 | tee "$ROOT/ultrares-finalize.log"
@@ -278,13 +305,13 @@ jobs:
           assert audit["all_checks_passed"], audit["checks"]
           assert plan["fullview_width"] == 8192 and plan["fullview_height"] == 4096, plan
           assert plan["actual_base_multiplier"] >= 4.0 - 1e-9, plan
-          assert plan["actual_subsection_multiplier"] >= 3.0 - 1e-9, plan
-          assert plan["finest_level"] == 3, plan
-          assert plan["finest_tile_count"] == 384, plan
+          assert plan["actual_subsection_multiplier"] >= 2.0 - 1e-9, plan
+          assert plan["finest_level"] == 2, plan
+          assert plan["finest_tile_count"] == 96, plan
           sampling = audit["sampling"]
           assert sampling["native_output_resolution"] == [16384, 8192], sampling
           feature_px = float(sampling["minimum_feature_width_in_native_output_pixels"])
-          assert 0.90 <= feature_px <= 1.15, sampling
+          assert 1.80 <= feature_px <= 2.30, sampling
 
           height = root / "ultrares" / "fullview" / "height_grayscale_16bit.png"
           with Image.open(height) as im:
@@ -325,7 +352,7 @@ jobs:
           maps = root / "ultrares" / "fullview_maps"
           manifest = json.loads((maps / "map_manifest.json").read_text())
           assert manifest["resolution"] == [8192, 4096], manifest["resolution"]
-          assert manifest["deepest_tile_count"] == 384
+          assert manifest["deepest_tile_count"] == 96
           rows = manifest["files"]
           assert len(rows) >= 40, len(rows)
           names = {row["file"] for row in rows}
@@ -468,6 +495,7 @@ jobs:
             ${{ env.ROOT }}/ultrares/reconstruction.json
             ${{ env.ROOT }}/ultrares/authority_compaction.json
             ${{ env.ROOT }}/ultrares/tile_checkpoints/
+            ${{ env.ROOT }}/ultrares/telemetry/
             ${{ env.ROOT }}/ultrares/shard-*.json
             ${{ env.ROOT }}/ultrares/file_inventory.tsv
             ${{ env.ROOT }}/ultrares-finalize.log

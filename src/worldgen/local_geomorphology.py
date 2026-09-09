@@ -16,7 +16,8 @@ import math
 import os
 from pathlib import Path
 import tempfile
-from typing import Mapping
+import time
+from typing import Callable, Mapping
 
 import numpy as np
 from scipy import ndimage
@@ -225,12 +226,25 @@ class LocalGeomorphologySolver:
         pyramid: PlanetTilePyramid,
         *,
         spec: LocalGeomorphologySpec | None = None,
+        timing_callback: Callable[[TileKey, str, str, float | None], None] | None = None,
     ) -> None:
         self.pyramid = pyramid
         self.spec = (spec or LocalGeomorphologySpec()).validate()
         self.hydrology = LocalHydrologySolver(pyramid)
         self.rivers = RiverConstraintGenerator(pyramid)
         self.root = pyramid.root / "derived" / "local_geomorphology_v1"
+        self.timing_callback = timing_callback
+
+    def _timing_begin(self, key: TileKey, name: str) -> float:
+        if self.timing_callback is not None:
+            self.timing_callback(key, name, "start", None)
+        return time.monotonic()
+
+    def _timing_end(self, key: TileKey, name: str, started: float) -> float:
+        duration = max(time.monotonic() - started, 0.0)
+        if self.timing_callback is not None:
+            self.timing_callback(key, name, "end", duration)
+        return duration
 
     def _path(self, key: TileKey, field: str) -> Path:
         return (
@@ -289,6 +303,7 @@ class LocalGeomorphologySolver:
         if cached is not None:
             return cached
         cfg = self.spec
+        phase_started = self._timing_begin(key, "source_geometry")
         geom = tile_geometry(key, self.pyramid.spec.tile_size)
         base = np.asarray(self.pyramid.load_field(key, "elevation_m"), dtype=np.float64)
         inherited_source = np.asarray(
@@ -300,8 +315,17 @@ class LocalGeomorphologySolver:
         taper = edge_anchor_taper(base.shape, cfg.edge_anchor_cells)
         area_km2 = _sample_area_km2(geom.xyz, self.pyramid.planet_radius_m)
         area_m2 = area_km2 * 1.0e6
+        self._timing_end(key, "source_geometry", phase_started)
+
+        phase_started = self._timing_begin(key, "initial_hydrology")
         hydro = self.hydrology.solve(key)
+        self._timing_end(key, "initial_hydrology", phase_started)
+
+        phase_started = self._timing_begin(key, "river_constraints")
         river = self.rivers.generate(key)
+        self._timing_end(key, "river_constraints", phase_started)
+
+        phase_started = self._timing_begin(key, "physical_evolution")
         _normal, slope_deg, grad_east, grad_south = terrain_frame(
             geom.xyz, base, self.pyramid.planet_radius_m
         )
@@ -352,7 +376,9 @@ class LocalGeomorphologySolver:
         if correction_denom > 0.0:
             hillslope -= correction_weight * (net / correction_denom)
         evolved = evolved + hillslope
+        self._timing_end(key, "physical_evolution", phase_started)
 
+        phase_started = self._timing_begin(key, "procedural_morphology")
         # Add unresolved deterministic phase-cell morphology without changing the
         # physical sediment ledger. The field is zero-area-mean on active land and
         # tapers exactly to the inherited parent terrain at the tile boundary.
@@ -469,7 +495,9 @@ class LocalGeomorphologySolver:
         anchored[-1, :] = base[-1, :]
         anchored[:, 0] = base[:, 0]
         anchored[:, -1] = base[:, -1]
+        self._timing_end(key, "procedural_morphology", phase_started)
 
+        phase_started = self._timing_begin(key, "final_channel_routing")
         # The first local drainage graph controlled erosion, but phase-cell detail
         # and hillslope evolution have since changed the surface. Re-route over the
         # actual final terrain, carve only a shallow discharge-scaled channel, then
@@ -553,6 +581,9 @@ class LocalGeomorphologySolver:
         rugged_area_m2 = float(
             np.sum(area_m2 * final_land * (final_slope_deg >= 10.0))
         )
+        self._timing_end(key, "final_channel_routing", phase_started)
+
+        phase_started = self._timing_begin(key, "persistence")
         arrays = {
             # Preserve native numerical height precision. Derived display rasters
             # may quantize explicitly, but the authoritative terrain does not.
@@ -665,6 +696,7 @@ class LocalGeomorphologySolver:
             ],
         }
         _atomic_json(self._metadata_path(key), metadata)
+        self._timing_end(key, "persistence", phase_started)
         return LocalGeomorphologyResult(metadata=metadata, **arrays)
 
 

@@ -22,6 +22,7 @@ claiming that an arbitrary local tile has independent global boundary conditions
 
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
+import hashlib
 import json
 import math
 import os
@@ -38,6 +39,7 @@ from scipy import ndimage
 from .heightmap import write_heightmap_png16
 from .local_geomorphology import LocalGeomorphologySolver, LocalGeomorphologySpec
 from .procedural_erosion import phase_cell_octave_xyz
+from .progress_telemetry import HierarchicalProgressTracker
 from .planet_tiles import (
     CUBE_FACES,
     PlanetTilePyramid,
@@ -72,6 +74,21 @@ class UltraResolutionTilePyramid(PlanetTilePyramid):
             values = np.asarray(z[name])
         self._ultra_source_cache[name] = values
         return values
+
+    def _source_hash(self) -> str:
+        """Prefer the stable semantic authority fingerprint when available."""
+        if self._source_sha256 is None and self.source_kind == "base_npz":
+            report_path = self.world_root / "ultrares" / "authority_compaction.json"
+            try:
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, OSError, json.JSONDecodeError):
+                report = {}
+            value = report.get("semantic_sha256")
+            if isinstance(value, str):
+                candidate = value.strip().lower()
+                if len(candidate) == 64 and all(ch in "0123456789abcdef" for ch in candidate):
+                    self._source_sha256 = candidate
+        return super()._source_hash()
 
 
     def _xyz_geometry(self, xyz: np.ndarray) -> TileGeometry:
@@ -364,6 +381,23 @@ ULTRARES_OPTIONAL_AUTHORITY_FIELDS = (
     "stress_field",
 )
 
+def _semantic_authority_sha256(arrays: Mapping[str, np.ndarray]) -> str:
+    """Hash authority semantics, independent of NPZ/ZIP container metadata."""
+    digest = hashlib.sha256()
+    digest.update(b"worldgen-ultrares-authority-v1\0")
+    for name in sorted(arrays):
+        values = np.ascontiguousarray(np.asarray(arrays[name]))
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(values.dtype.str.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(",".join(str(int(v)) for v in values.shape).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(memoryview(values).cast("B"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 
 def compact_world_authority(
     world_root: str | Path,
@@ -394,6 +428,8 @@ def compact_world_authority(
         )
         arrays = {name: np.asarray(z[name]) for name in selected}
 
+    semantic_sha256 = _semantic_authority_sha256(arrays)
+
     tmp = root / ".world_arrays.ultrares.npz"
     np.savez(tmp, **arrays)
     os.replace(tmp, source)
@@ -421,6 +457,8 @@ def compact_world_authority(
         "fields": list(arrays),
         "source_resolution": [int(len(arrays["lon"])), int(len(arrays["lat"]))],
         "npz_bytes": int(source.stat().st_size),
+        "semantic_sha256": semantic_sha256,
+        "fingerprint_schema": "worldgen-ultrares-authority-v1",
         "rendered_source_maps": sorted(
             path.name for path in source_maps.iterdir() if path.is_file()
         ),
@@ -733,7 +771,7 @@ def _tile_resume_valid(
 
     expected_shape = (int(pyramid.spec.tile_size) + 1,) * 2
     expected_dtypes = {
-        "elevation_m": np.dtype(np.float32),
+        "elevation_m": np.dtype(np.float64),
         "erosion_m": np.dtype(np.float32),
         "procedural_detail_m": np.dtype(np.float32),
         "final_drainage_area_km2": np.dtype(np.float32),
@@ -825,6 +863,17 @@ def generate_finest_geomorphology(
     worker_count = max(1, int(workers))
     thread_state = local()
     source_sha256 = pyramid._source_hash()
+
+    telemetry = HierarchicalProgressTracker(
+        pyramid.world_root / "ultrares" / "telemetry",
+        scope=f"terrain-shard-{int(shard_index):03d}-of-{int(shard_count):03d}",
+        heartbeat_seconds=30.0,
+        parallelism=worker_count,
+        # base elevation + 7 geomorphology phases + cleanup/checkpoint.
+        subsubsteps_per_substep=9,
+        processing_steps_total=3,
+    )
+    resume_scan_started = time.monotonic()
     resumed_keys: set[TileKey] = set()
     if resume:
         resumed_keys = {
@@ -838,6 +887,28 @@ def generate_finest_geomorphology(
                 repair_marker=True,
             )
         }
+    telemetry.observe(
+        "processing_step",
+        "resume_scan",
+        max(time.monotonic() - resume_scan_started, 0.0),
+        meta={"selected_tiles": len(keys), "resumed_tiles": len(resumed_keys)},
+    )
+    telemetry.set_processing_step("terrain_generation", completed_before=1)
+    telemetry.configure_substeps(
+        completed=len(resumed_keys),
+        total=len(keys),
+        resumed=len(resumed_keys),
+    )
+    telemetry.begin(
+        "processing_step",
+        "terrain_generation",
+        token="processing:terrain_generation",
+        index=2,
+        total=3,
+        meta={"selected_tiles": len(keys), "parallelism": worker_count},
+    )
+    telemetry.start_heartbeat()
+
     todo = tuple(key for key in keys if key not in resumed_keys)
     completed = len(resumed_keys)
     newly_completed = 0
@@ -851,74 +922,154 @@ def generate_finest_geomorphology(
         progress_path = _progress_path(pyramid.world_root)
     started = time.monotonic()
 
+    phase_order = {
+        "source_geometry": 2,
+        "initial_hydrology": 3,
+        "river_constraints": 4,
+        "physical_evolution": 5,
+        "procedural_morphology": 6,
+        "final_channel_routing": 7,
+        "persistence": 8,
+    }
+
+    def timing_callback(
+        key: TileKey,
+        phase: str,
+        event: str,
+        duration: float | None,
+    ) -> None:
+        tile_id = f"{key.face}/z{key.level}/x{key.x}/y{key.y}"
+        token = f"{tile_id}:{phase}"
+        if event == "start":
+            telemetry.begin(
+                "subsubstep",
+                phase,
+                token=token,
+                parent=tile_id,
+                index=phase_order.get(phase),
+                total=9,
+                meta={"tile": tile_id},
+            )
+        elif event == "end":
+            telemetry.end(
+                token,
+                duration_seconds=duration,
+                meta={"tile": tile_id},
+            )
+
     def solver() -> LocalGeomorphologySolver:
         value = getattr(thread_state, "solver", None)
         if value is None:
-            value = LocalGeomorphologySolver(pyramid, spec=geomorphology_spec)
+            value = LocalGeomorphologySolver(
+                pyramid,
+                spec=geomorphology_spec,
+                timing_callback=timing_callback,
+            )
             thread_state.solver = value
         return value
 
     def run_one(key: TileKey) -> TileKey:
-        # The base tile already contains seamless absolute-XYZ tectonic microrelief.
-        # Hydrology/geomorphology then consume that field at native LOD.
-        pyramid.generate_tile(key, ("elevation_m",))
-        local_solver = solver()
-        local_solver.solve(key)
+        tile_id = f"{key.face}/z{key.level}/x{key.x}/y{key.y}"
+        tile_token = f"tile:{tile_id}"
+        telemetry.begin(
+            "substep",
+            tile_id,
+            token=tile_token,
+            parent="terrain_generation",
+            total=len(keys),
+            meta={"tile": tile_id},
+        )
+        try:
+            # The base tile already contains seamless absolute-XYZ tectonic microrelief.
+            # Hydrology/geomorphology then consume that field at native LOD.
+            base_token = f"{tile_id}:base_elevation"
+            telemetry.begin(
+                "subsubstep",
+                "base_elevation",
+                token=base_token,
+                parent=tile_id,
+                index=1,
+                total=9,
+                meta={"tile": tile_id},
+            )
+            pyramid.generate_tile(key, ("elevation_m",))
+            telemetry.end(base_token, meta={"tile": tile_id})
 
-        # Keep only fields required by final scientific products/audits.  These
-        # retained fields are the durable restart authority for this tile.
-        for field in (
-            "deposition_m",
-            "hillslope_adjustment_m",
-            "procedural_coherence",
-            "tectonic_microdetail_m",
-            "channel_incision_m",
-            "final_flow_direction_d16",
-            "final_meander_potential",
-            "major_river_constraint",
-        ):
-            local_solver._path(key, field).unlink(missing_ok=True)
+            local_solver = solver()
+            local_solver.solve(key)
 
-        for field in (
-            "filled_elevation_m",
-            "flow_direction_d8",
-            "flow_direction_d16",
-            "flow_angle_rad",
-            "meander_potential",
-            "runoff_mm_year",
-            "drainage_area_km2",
-            "discharge_index",
-            "streams",
-            "inherited_major_river",
-        ):
-            local_solver.hydrology._path(key, field).unlink(missing_ok=True)
-        local_solver.hydrology._metadata_path(key).unlink(missing_ok=True)
+            cleanup_token = f"{tile_id}:cleanup_checkpoint"
+            telemetry.begin(
+                "subsubstep",
+                "cleanup_checkpoint",
+                token=cleanup_token,
+                parent=tile_id,
+                index=9,
+                total=9,
+                meta={"tile": tile_id},
+            )
 
-        for field in (
-            "major_river_mask",
-            "parent_stream_order",
-            "parent_discharge_index",
-            "parent_width_proxy",
-            "constraint_strength",
-            "channel_floor_m",
-        ):
-            local_solver.rivers._path(key, field).unlink(missing_ok=True)
-        local_solver.rivers._metadata_path(key).unlink(missing_ok=True)
+            # Keep only fields required by final scientific products/audits. These
+            # retained fields are the durable restart authority for this tile.
+            for field in (
+                "deposition_m",
+                "hillslope_adjustment_m",
+                "procedural_coherence",
+                "tectonic_microdetail_m",
+                "channel_incision_m",
+                "final_flow_direction_d16",
+                "final_meander_potential",
+                "major_river_constraint",
+            ):
+                local_solver._path(key, field).unlink(missing_ok=True)
 
-        # Base elevation can always be re-evaluated exactly from global authority +
-        # absolute-coordinate microrelief; do not retain a second tile copy.
-        pyramid._field_path(key, "elevation_m").unlink(missing_ok=True)
-        pyramid._metadata_path(key).unlink(missing_ok=True)
+            for field in (
+                "filled_elevation_m",
+                "flow_direction_d8",
+                "flow_direction_d16",
+                "flow_angle_rad",
+                "meander_potential",
+                "runoff_mm_year",
+                "drainage_area_km2",
+                "discharge_index",
+                "streams",
+                "inherited_major_river",
+            ):
+                local_solver.hydrology._path(key, field).unlink(missing_ok=True)
+            local_solver.hydrology._metadata_path(key).unlink(missing_ok=True)
 
-        if not _tile_resume_valid(
-            pyramid,
-            key,
-            geomorphology_spec,
-            source_sha256=source_sha256,
-            repair_marker=True,
-        ):
-            raise RuntimeError(f"completed tile failed restart validation: {key!r}")
-        return key
+            for field in (
+                "major_river_mask",
+                "parent_stream_order",
+                "parent_discharge_index",
+                "parent_width_proxy",
+                "constraint_strength",
+                "channel_floor_m",
+            ):
+                local_solver.rivers._path(key, field).unlink(missing_ok=True)
+            local_solver.rivers._metadata_path(key).unlink(missing_ok=True)
+
+            # Base elevation can always be re-evaluated exactly from global authority +
+            # absolute-coordinate microrelief; do not retain a second tile copy.
+            pyramid._field_path(key, "elevation_m").unlink(missing_ok=True)
+            pyramid._metadata_path(key).unlink(missing_ok=True)
+
+            if not _tile_resume_valid(
+                pyramid,
+                key,
+                geomorphology_spec,
+                source_sha256=source_sha256,
+                repair_marker=True,
+            ):
+                raise RuntimeError(f"completed tile failed restart validation: {key!r}")
+
+            telemetry.end(cleanup_token, meta={"tile": tile_id})
+            telemetry.end(tile_token, meta={"tile": tile_id})
+            return key
+        except Exception:
+            # Active spans remain visible in the persisted telemetry snapshot.
+            # On retry, restart validation decides whether this tile is reusable.
+            raise
 
     def publish(last: TileKey | None, state: str) -> None:
         elapsed = max(time.monotonic() - started, 0.0)
@@ -990,6 +1141,18 @@ def generate_finest_geomorphology(
                     publish(last_key, "running")
                 fill()
     publish(last_key, "complete")
+    telemetry.end(
+        "processing:terrain_generation",
+        meta={"completed_tiles": completed, "selected_tiles": len(keys)},
+    )
+    finalize_started = time.monotonic()
+    telemetry.observe(
+        "processing_step",
+        "shard_finalize",
+        max(time.monotonic() - finalize_started, 0.0),
+        meta={"completed_tiles": completed, "selected_tiles": len(keys)},
+    )
+    telemetry.close()
     return completed
 
 
@@ -1373,8 +1536,8 @@ def audit_ultra_resolution(
     fine_limit_m = cfg.min_samples_per_wavelength * plan.finest_m_per_sample
 
     # The selected high-resolution deliverable is 2x the ordinary fullview.
-    # z3 terrain is another factor of two finer than that output, so a four-native-
-    # sample wavelength has a one-output-pixel half-wave (Nyquist saturation).
+    # The native product remains 2x the ordinary fullview. At z3 the safe four-
+    # sample half-wave is ~1 native pixel; at z2 it is ~2 native pixels.
     native_output_width = int(plan.fullview_width * 2)
     native_output_height = int(plan.fullview_height * 2)
     native_output_m_per_pixel = (
@@ -1631,8 +1794,8 @@ def audit_ultra_resolution(
             plan.actual_subsection_multiplier + 1.0e-9
             >= cfg.subsection_linear_multiplier
         ),
-        "native_heightmap_bandwidth_saturated": (
-            0.90 <= feature_pixels <= 1.15
+        "native_heightmap_bandwidth_supported": (
+            0.90 <= feature_pixels <= 2.30
         ),
         "new_high_frequency_terrain_exists": aggregate_band > 0.25,
         "tectonic_microdetail_active": aggregate_microdetail > 1.0,
@@ -1801,8 +1964,10 @@ def _prepare_ultra_resolution(
             "semantics": {
                 "base_fullview": "4x-linear terrain base reconstructed from deeper solved tiles",
                 "subsections": (
-                    "requested >=3x subsection refinement selects the next power-of-two LOD; "
-                    "for the Earth production profile this is z3, 4x finer than the 8192 base"
+                    f"requested >= {float(cfg.subsection_linear_multiplier):g}x subsection "
+                    f"refinement selects discrete cube-sphere LOD z{int(plan.finest_level)}; "
+                    f"actual refinement is {float(plan.actual_subsection_multiplier):g}x "
+                    "relative to the reconstructed base"
                 ),
                 "detail": (
                     "globally continuous tectonic microrelief fills newly resolvable terrain "

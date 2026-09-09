@@ -15,6 +15,7 @@ from worldgen.ultrares import (
     _geomorph_path,
     _merge_children_downsample,
     _select_shard_keys,
+    _semantic_authority_sha256,
     _tile_checkpoint_path,
     _tile_resume_valid,
     derive_scale_aware_geomorphology_spec,
@@ -191,8 +192,8 @@ def test_xyz_microrelief_is_nontrivial_and_exactly_shared_across_tile_edge(tmp_p
     )
     left = TileKey("px", 2, 1, 1)
     right = TileKey("px", 2, 2, 1)
-    g_left = tile_geometry(left, 32)
-    g_right = tile_geometry(right, 32)
+    g_left = tile_geometry(left, 64)
+    g_right = tile_geometry(right, 64)
     d_left = pyramid._spectral_detail(g_left.xyz, left.level)
     d_right = pyramid._spectral_detail(g_right.xyz, right.level)
 
@@ -248,11 +249,12 @@ def test_ultrares_resume_requires_matching_retained_authority(tmp_path):
     for field in ULTRARES_RESUME_FIELDS:
         path = _geomorph_path(pyramid, key, field)
         path.parent.mkdir(parents=True, exist_ok=True)
-        values = (
-            np.zeros(shape, dtype=np.bool_)
-            if field == "final_streams"
-            else np.zeros(shape, dtype=np.float32)
-        )
+        if field == "final_streams":
+            values = np.zeros(shape, dtype=np.bool_)
+        elif field == "elevation_m":
+            values = np.zeros(shape, dtype=np.float64)
+        else:
+            values = np.zeros(shape, dtype=np.float32)
         np.save(path, values, allow_pickle=False)
 
     metadata_path = _geomorph_metadata_path(pyramid, key)
@@ -301,7 +303,12 @@ def test_ultrares_resume_rejects_stale_spec_even_with_marker(tmp_path):
     for field in ULTRARES_RESUME_FIELDS:
         path = _geomorph_path(pyramid, key, field)
         path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(path, np.zeros(shape, dtype=np.float32), allow_pickle=False)
+        dtype = (
+            np.bool_ if field == "final_streams"
+            else np.float64 if field == "elevation_m"
+            else np.float32
+        )
+        np.save(path, np.zeros(shape, dtype=dtype), allow_pickle=False)
 
     metadata = {
         "schema_version": 2,
@@ -319,3 +326,42 @@ def test_ultrares_resume_rejects_stale_spec_even_with_marker(tmp_path):
     marker.write_text(json.dumps({"state": "complete"}), encoding="utf-8")
 
     assert not _tile_resume_valid(pyramid, key, geom)
+
+
+
+def test_semantic_authority_fingerprint_is_order_stable_and_content_sensitive():
+    arrays_a = {
+        "elevation": np.arange(12, dtype=np.float64).reshape(3, 4),
+        "streams": np.array([[False, True], [True, False]], dtype=np.bool_),
+    }
+    arrays_b = {
+        "streams": arrays_a["streams"].copy(),
+        "elevation": arrays_a["elevation"].copy(),
+    }
+    digest_a = _semantic_authority_sha256(arrays_a)
+    digest_b = _semantic_authority_sha256(arrays_b)
+    assert digest_a == digest_b
+
+    arrays_b["elevation"][1, 2] += 1.0
+    assert _semantic_authority_sha256(arrays_b) != digest_a
+
+
+def test_ultrares_pyramid_prefers_semantic_compaction_fingerprint(tmp_path):
+    _write_source(tmp_path)
+    semantic = "ab" * 32
+    report = tmp_path / "ultrares" / "authority_compaction.json"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(
+        json.dumps({"semantic_sha256": semantic}),
+        encoding="utf-8",
+    )
+
+    pyramid = UltraResolutionTilePyramid(
+        tmp_path,
+        spec=TilePyramidSpec(
+            tile_size=64,
+            elevation_detail_strength=1.0,
+            maximum_level=6,
+        ),
+    )
+    assert pyramid._source_hash() == semantic
