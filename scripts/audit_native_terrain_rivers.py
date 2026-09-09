@@ -115,6 +115,135 @@ def audit_authoritative_report(report: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _cube_direction(face: str, s: np.ndarray, t: np.ndarray) -> np.ndarray:
+    if face == "px":
+        xyz = np.stack((np.ones_like(s), -t, -s), axis=-1)
+    elif face == "nx":
+        xyz = np.stack((-np.ones_like(s), -t, s), axis=-1)
+    elif face == "py":
+        xyz = np.stack((s, np.ones_like(s), t), axis=-1)
+    elif face == "ny":
+        xyz = np.stack((s, -np.ones_like(s), -t), axis=-1)
+    elif face == "pz":
+        xyz = np.stack((s, -t, np.ones_like(s)), axis=-1)
+    elif face == "nz":
+        xyz = np.stack((-s, -t, -np.ones_like(s)), axis=-1)
+    else:
+        raise ValueError(face)
+    return xyz / np.linalg.norm(xyz, axis=-1, keepdims=True)
+
+
+def _sample_equirectangular(values: np.ndarray, xyz: np.ndarray) -> np.ndarray:
+    a = np.asarray(values, dtype=np.float64)
+    h, w = a.shape
+    unit = np.asarray(xyz, dtype=np.float64)
+    lon = np.arctan2(unit[..., 1], unit[..., 0])
+    lat = np.arcsin(np.clip(unit[..., 2], -1.0, 1.0))
+    x = ((lon + np.pi) * w / (2.0 * np.pi) - 0.5) % w
+    y = np.clip((np.pi / 2.0 - lat) * h / np.pi - 0.5, 0.0, h - 1.0)
+    x0 = np.floor(x).astype(np.int64)
+    y0 = np.floor(y).astype(np.int64)
+    x1 = (x0 + 1) % w
+    y1 = np.minimum(y0 + 1, h - 1)
+    fx = x - x0
+    fy = y - y0
+    return (
+        a[y0, x0] * (1.0 - fx) * (1.0 - fy)
+        + a[y0, x1] * fx * (1.0 - fy)
+        + a[y1, x0] * (1.0 - fx) * fy
+        + a[y1, x1] * fx * fy
+    )
+
+
+def _river_tile_seam_diagnostic(
+    values: np.ndarray,
+    *,
+    level: int,
+    samples_per_curve: int = 320,
+    offset_pixels: float = 2.0,
+) -> dict[str, float | int]:
+    """Compare render discontinuity across projected internal cube-tile seams.
+
+    This intentionally excludes cube-face outer edges and is diagnostic only.
+    A ratio much larger than one means internal LOD boundaries carry stronger
+    image jumps than ordinary same-scale neighborhoods and merits visual review.
+    """
+    a = np.asarray(values, dtype=np.float64)
+    if a.ndim != 2 or min(a.shape) < 64:
+        raise ValueError("seam diagnostic requires a reasonably sized 2-D raster")
+    side = 1 << int(level)
+    if side < 2:
+        return {
+            "level": int(level),
+            "sample_count": 0,
+            "median_abs_jump": 0.0,
+            "p95_abs_jump": 0.0,
+            "baseline_median_abs_jump": 0.0,
+            "baseline_p95_abs_jump": 0.0,
+            "median_jump_ratio_to_baseline": 0.0,
+            "p95_jump_ratio_to_baseline": 0.0,
+        }
+
+    # In an equirectangular map a cube face spans roughly one quarter of the
+    # equatorial width. This offset therefore corresponds to about the requested
+    # number of pixels in the diagnostic raster without depending on tile_size.
+    delta = max(float(offset_pixels) * 8.0 / float(a.shape[1]), 1.0e-6)
+    u = np.linspace(-0.985, 0.985, max(64, int(samples_per_curve)))
+    jumps: list[np.ndarray] = []
+    for face in ("px", "nx", "py", "ny", "pz", "nz"):
+        for k in range(1, side):
+            q = -1.0 + 2.0 * k / side
+
+            s0 = np.full_like(u, q)
+            left = _cube_direction(face, s0 - delta, u)
+            right = _cube_direction(face, s0 + delta, u)
+            jumps.append(
+                np.abs(
+                    _sample_equirectangular(a, left)
+                    - _sample_equirectangular(a, right)
+                )
+            )
+
+            t0 = np.full_like(u, q)
+            top = _cube_direction(face, u, t0 - delta)
+            bottom = _cube_direction(face, u, t0 + delta)
+            jumps.append(
+                np.abs(
+                    _sample_equirectangular(a, top)
+                    - _sample_equirectangular(a, bottom)
+                )
+            )
+
+    seam = np.concatenate(jumps) if jumps else np.zeros(0, dtype=np.float64)
+    pixel_offset = max(1, int(round(offset_pixels)))
+    horizontal = np.abs(
+        a[:, 2 * pixel_offset :] - a[:, : -2 * pixel_offset]
+    )
+    vertical = np.abs(
+        a[2 * pixel_offset :, :] - a[: -2 * pixel_offset, :]
+    )
+    baseline = np.concatenate(
+        (
+            horizontal[::8, ::8].ravel(),
+            vertical[::8, ::8].ravel(),
+        )
+    )
+    seam_med = float(np.median(seam)) if seam.size else 0.0
+    seam_p95 = float(np.percentile(seam, 95.0)) if seam.size else 0.0
+    base_med = float(np.median(baseline)) if baseline.size else 0.0
+    base_p95 = float(np.percentile(baseline, 95.0)) if baseline.size else 0.0
+    return {
+        "level": int(level),
+        "sample_count": int(seam.size),
+        "median_abs_jump": seam_med,
+        "p95_abs_jump": seam_p95,
+        "baseline_median_abs_jump": base_med,
+        "baseline_p95_abs_jump": base_p95,
+        "median_jump_ratio_to_baseline": seam_med / max(base_med, 1.0e-9),
+        "p95_jump_ratio_to_baseline": seam_p95 / max(base_p95, 1.0e-9),
+    }
+
+
 def inspect_height_tiff(
     path: Path,
     *,
@@ -169,6 +298,7 @@ def inspect_river_png(
     expected_width: int,
     expected_height: int,
     diagnostic_width: int,
+    deepest_level: int,
 ) -> dict[str, Any]:
     try:
         from PIL import Image
@@ -197,6 +327,10 @@ def inspect_river_png(
         "dimension_contract_ok": original_size == (expected_width, expected_height),
         "diagnostic_resolution": [int(target_w), int(target_h)],
         "render_directional": _fourfold_gradient_anisotropy(residual),
+        "projected_internal_tile_seams": _river_tile_seam_diagnostic(
+            residual,
+            level=deepest_level,
+        ),
         "grayscale_std": float(np.std(values)),
     }
 
@@ -242,13 +376,14 @@ def main(argv: list[str] | None = None) -> int:
             expected_width=args.width,
             expected_height=args.height,
             diagnostic_width=args.river_diagnostic_width,
+            deepest_level=int(audit.get("plan", {}).get("finest_level", 3)),
         ),
         "interpretation": {
             "authoritative_grid_and_river_metrics": (
                 "tile-space generator audit; use these for pass/fail"
             ),
             "render_directional_metrics": (
-                "projection/render diagnostics only; report rather than equate with physical anisotropy"
+                "projection/render diagnostics only; directional and projected tile-seam scores are review signals rather than physical pass/fail criteria"
             ),
         },
     }
