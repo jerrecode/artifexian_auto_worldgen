@@ -52,6 +52,8 @@ class LocalGeomorphologySpec:
     procedural_lacunarity: float = 2.0
     procedural_cell_scale: float = 0.72
     procedural_steering_strength: float = 0.28
+    final_channel_incision_m: float = 10.0
+    final_channel_discharge_exponent: float = 1.15
 
     def validate(self) -> "LocalGeomorphologySpec":
         for name in (
@@ -91,6 +93,12 @@ class LocalGeomorphologySpec:
             raise ValueError("procedural_lacunarity must be > 1")
         if not math.isfinite(float(self.procedural_steering_strength)) or float(self.procedural_steering_strength) < 0.0:
             raise ValueError("procedural_steering_strength must be finite and non-negative")
+        if not math.isfinite(float(self.final_channel_incision_m)) or not (
+            0.0 <= float(self.final_channel_incision_m) <= 50.0
+        ):
+            raise ValueError("final_channel_incision_m must be in [0,50]")
+        if not 0.25 <= float(self.final_channel_discharge_exponent) <= 3.0:
+            raise ValueError("final_channel_discharge_exponent must be in [0.25,3]")
         return self
 
 
@@ -102,6 +110,13 @@ class LocalGeomorphologyResult:
     hillslope_adjustment_m: np.ndarray
     procedural_detail_m: np.ndarray
     procedural_coherence: np.ndarray
+    tectonic_microdetail_m: np.ndarray
+    channel_incision_m: np.ndarray
+    final_drainage_area_km2: np.ndarray
+    final_discharge_index: np.ndarray
+    final_streams: np.ndarray
+    final_flow_direction_d16: np.ndarray
+    final_meander_potential: np.ndarray
     major_river_constraint: np.ndarray
     metadata: Mapping[str, object]
 
@@ -174,6 +189,13 @@ class LocalGeomorphologySolver:
             "hillslope_adjustment_m",
             "procedural_detail_m",
             "procedural_coherence",
+            "tectonic_microdetail_m",
+            "channel_incision_m",
+            "final_drainage_area_km2",
+            "final_discharge_index",
+            "final_streams",
+            "final_flow_direction_d16",
+            "final_meander_potential",
             "major_river_constraint",
         )
         paths = {name: self._path(key, name) for name in names}
@@ -187,6 +209,13 @@ class LocalGeomorphologySolver:
             hillslope_adjustment_m=np.load(paths["hillslope_adjustment_m"], mmap_mode="r", allow_pickle=False),
             procedural_detail_m=np.load(paths["procedural_detail_m"], mmap_mode="r", allow_pickle=False),
             procedural_coherence=np.load(paths["procedural_coherence"], mmap_mode="r", allow_pickle=False),
+            tectonic_microdetail_m=np.load(paths["tectonic_microdetail_m"], mmap_mode="r", allow_pickle=False),
+            channel_incision_m=np.load(paths["channel_incision_m"], mmap_mode="r", allow_pickle=False),
+            final_drainage_area_km2=np.load(paths["final_drainage_area_km2"], mmap_mode="r", allow_pickle=False),
+            final_discharge_index=np.load(paths["final_discharge_index"], mmap_mode="r", allow_pickle=False),
+            final_streams=np.load(paths["final_streams"], mmap_mode="r", allow_pickle=False),
+            final_flow_direction_d16=np.load(paths["final_flow_direction_d16"], mmap_mode="r", allow_pickle=False),
+            final_meander_potential=np.load(paths["final_meander_potential"], mmap_mode="r", allow_pickle=False),
             major_river_constraint=np.load(paths["major_river_constraint"], mmap_mode="r", allow_pickle=False),
             metadata=json.loads(meta.read_text(encoding="utf-8")),
         )
