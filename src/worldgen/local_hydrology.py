@@ -508,6 +508,7 @@ def _flow_d16_open(
     *,
     preferred_angle_rad: np.ndarray | None = None,
     steering_weight: np.ndarray | None = None,
+    steering_score_floor: float = 0.10,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Steepest-descent routing on a 16-direction queen+knight stencil.
 
@@ -537,6 +538,9 @@ def _flow_d16_open(
         raise ValueError("preferred_angle_rad must match elevation")
     if steer.shape != z.shape:
         raise ValueError("steering_weight must match elevation")
+    score_floor = float(steering_score_floor)
+    if not math.isfinite(score_floor) or not 0.0 <= score_floor <= 1.0:
+        raise ValueError("steering_score_floor must be finite and in [0,1]")
 
     best_score = np.zeros((h, w), dtype=np.float64)
     best_slope = np.zeros((h, w), dtype=np.float64)
@@ -591,7 +595,9 @@ def _flow_d16_open(
             )
             alignment = np.square(0.5 + 0.5 * np.cos(delta))
             sw = steer[sy0:sy1, sx0:sx1]
-            directional = (1.0 - sw) + sw * (0.10 + 0.90 * alignment)
+            directional = (1.0 - sw) + sw * (
+                score_floor + (1.0 - score_floor) * alignment
+            )
             score *= directional
 
         view_best = best_score[sy0:sy1, sx0:sx1]
@@ -1292,6 +1298,11 @@ class LocalHydrologySolver:
                 self.pyramid.planet_radius_m,
                 preferred_angle_rad=preferred,
                 steering_weight=meander,
+                steering_score_floor=(
+                    0.10 if attempt == 0
+                    else 0.045 if attempt == 1
+                    else 0.018
+                ),
             )
             drainage, discharge = _accumulate_open(
                 filled, receiver, runoff, area, ocean
@@ -1411,6 +1422,11 @@ class LocalHydrologySolver:
                     "median_sampled_sinuosity": candidate["metrics"][
                         "median_sampled_sinuosity"
                     ],
+                    "steering_score_floor": (
+                        0.10 if int(candidate["attempt"]) == 0
+                        else 0.045 if int(candidate["attempt"]) == 1
+                        else 0.018
+                    ),
                 }
                 for candidate in candidates
             ],
