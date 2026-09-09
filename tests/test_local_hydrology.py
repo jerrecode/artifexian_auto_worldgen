@@ -543,3 +543,51 @@ def test_routing_metadata_reports_resolved_adaptive_wavelength_floor(tmp_path):
     )
     assert result.metadata["adaptive_meander_attempt"] in (0, 1, 2)
     assert result.metadata["routing_candidate_metrics"]
+
+
+
+def test_d16_corrective_steering_floor_preserves_strict_downhill_flow():
+    h = w = 64
+    yy, xx = np.meshgrid(
+        np.arange(h, dtype=np.float64),
+        np.arange(w, dtype=np.float64),
+        indexing="ij",
+    )
+    scale = 2.0e-5
+    xyz = np.stack(
+        (
+            (xx - w / 2.0) * scale,
+            (yy - h / 2.0) * scale,
+            np.ones((h, w), dtype=np.float64),
+        ),
+        axis=-1,
+    )
+    xyz /= np.linalg.norm(xyz, axis=-1, keepdims=True)
+    z = 2500.0 - 2.8 * xx - 0.22 * yy
+    preferred = 0.72 * np.sin(2.0 * np.pi * xx / 16.0)
+    steer = np.full((h, w), 0.92, dtype=np.float64)
+
+    receiver, _code, _slope = _flow_d16_open(
+        z,
+        np.zeros((h, w), dtype=bool),
+        xyz,
+        1.0e6,
+        preferred_angle_rad=preferred,
+        steering_weight=steer,
+        steering_score_floor=0.018,
+    )
+    flat = z.ravel()
+    active = receiver >= 0
+    sources = np.flatnonzero(active)
+    assert np.all(flat[receiver[active]] < flat[sources])
+
+    with pytest.raises(ValueError):
+        _flow_d16_open(
+            z,
+            np.zeros((h, w), dtype=bool),
+            xyz,
+            1.0e6,
+            preferred_angle_rad=preferred,
+            steering_weight=steer,
+            steering_score_floor=-0.01,
+        )
