@@ -320,6 +320,302 @@ def _flow_d8_open(
     return receiver.ravel(), code
 
 
+def _flow_d16_open(
+    filled_elevation_m: np.ndarray,
+    ocean: np.ndarray,
+    xyz: np.ndarray,
+    radius_m: float,
+    *,
+    preferred_angle_rad: np.ndarray | None = None,
+    steering_weight: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Steepest-descent routing on a 16-direction queen+knight stencil.
+
+    Knight moves supply intermediate directions missing from D8.  They are accepted
+    only when at least one raster corridor between the source and target remains
+    below the source elevation, preventing the router from jumping across a ridge.
+    Optional steering rotates the preferred direction on low-gradient, high-
+    discharge reaches while every receiver remains strictly downhill.
+    """
+    z = np.asarray(filled_elevation_m, dtype=np.float64)
+    oc = np.asarray(ocean, dtype=bool)
+    unit = np.asarray(xyz, dtype=np.float64)
+    h, w = z.shape
+    if oc.shape != z.shape or unit.shape != (h, w, 3):
+        raise ValueError("D16 routing inputs have incompatible shapes")
+    preferred = (
+        None
+        if preferred_angle_rad is None
+        else np.asarray(preferred_angle_rad, dtype=np.float64)
+    )
+    steer = (
+        np.zeros(z.shape, dtype=np.float64)
+        if steering_weight is None
+        else np.clip(np.asarray(steering_weight, dtype=np.float64), 0.0, 1.0)
+    )
+    if preferred is not None and preferred.shape != z.shape:
+        raise ValueError("preferred_angle_rad must match elevation")
+    if steer.shape != z.shape:
+        raise ValueError("steering_weight must match elevation")
+
+    best_score = np.zeros((h, w), dtype=np.float64)
+    best_slope = np.zeros((h, w), dtype=np.float64)
+    receiver = np.full((h, w), -1, dtype=np.int64)
+    code = np.full((h, w), -1, dtype=np.int8)
+
+    for direction, (dy, dx) in enumerate(_D16):
+        sy0 = max(0, -dy)
+        sy1 = min(h, h - dy)
+        sx0 = max(0, -dx)
+        sx1 = min(w, w - dx)
+        ty0, ty1 = sy0 + dy, sy1 + dy
+        tx0, tx1 = sx0 + dx, sx1 + dx
+        source = z[sy0:sy1, sx0:sx1]
+        target = z[ty0:ty1, tx0:tx1]
+        distance = _great_circle_distance_m(
+            unit[sy0:sy1, sx0:sx1],
+            unit[ty0:ty1, tx0:tx1],
+            radius_m,
+        )
+        slope = (source - target) / np.maximum(distance, 1.0e-6)
+        valid = slope > 0.0
+
+        if max(abs(dy), abs(dx)) > 1:
+            ys = np.arange(sy0, sy1, dtype=np.int64)[:, None]
+            xs = np.arange(sx0, sx1, dtype=np.int64)[None, :]
+            sdy = int(np.sign(dy))
+            sdx = int(np.sign(dx))
+            if abs(dy) == 2:
+                mid_a = z[ys + sdy, xs]
+                mid_b = z[ys + sdy, xs + sdx]
+            else:
+                mid_a = z[ys, xs + sdx]
+                mid_b = z[ys + sdy, xs + sdx]
+            corridor = np.minimum(mid_a, mid_b)
+            # At least one plausible raster corridor must descend away from the
+            # source.  A very small tolerance avoids floating-point rejection on
+            # Priority-Flood flats.
+            corridor_limit = source - 0.015 * np.maximum(source - target, 0.0)
+            valid &= corridor <= corridor_limit + 1.0e-8
+
+        score = np.where(valid, slope, 0.0)
+        if preferred is not None:
+            delta = np.angle(
+                np.exp(
+                    1j
+                    * (
+                        float(_D16_ANGLES[direction])
+                        - preferred[sy0:sy1, sx0:sx1]
+                    )
+                )
+            )
+            alignment = np.square(0.5 + 0.5 * np.cos(delta))
+            sw = steer[sy0:sy1, sx0:sx1]
+            directional = (1.0 - sw) + sw * (0.10 + 0.90 * alignment)
+            score *= directional
+
+        view_best = best_score[sy0:sy1, sx0:sx1]
+        better = score > view_best
+        if np.any(better):
+            target_y = np.arange(ty0, ty1, dtype=np.int64)[:, None]
+            target_x = np.arange(tx0, tx1, dtype=np.int64)[None, :]
+            target_flat = target_y * w + target_x
+            receiver_view = receiver[sy0:sy1, sx0:sx1]
+            code_view = code[sy0:sy1, sx0:sx1]
+            slope_view = best_slope[sy0:sy1, sx0:sx1]
+            receiver_view[better] = np.broadcast_to(target_flat, better.shape)[better]
+            code_view[better] = direction
+            slope_view[better] = slope[better]
+            view_best[better] = score[better]
+
+    receiver[oc] = -1
+    code[oc] = -1
+    best_slope[oc] = 0.0
+    for edge in (
+        (0, slice(None)),
+        (-1, slice(None)),
+        (slice(None), 0),
+        (slice(None), -1),
+    ):
+        receiver[edge] = -1
+        code[edge] = -1
+        best_slope[edge] = 0.0
+    return receiver.ravel(), code, best_slope
+
+
+def _compat_d8_codes(code16: np.ndarray) -> np.ndarray:
+    code = np.asarray(code16, dtype=np.int16)
+    out = np.full(code.shape, -1, dtype=np.int8)
+    active = code >= 0
+    if np.any(active):
+        out[active] = _D16_TO_D8[code[active]]
+    return out
+
+
+def _flow_angles(code16: np.ndarray) -> np.ndarray:
+    code = np.asarray(code16, dtype=np.int16)
+    out = np.full(code.shape, np.nan, dtype=np.float64)
+    active = code >= 0
+    if np.any(active):
+        out[active] = _D16_ANGLES[code[active]]
+    return out
+
+
+def _meander_phase(
+    xyz: np.ndarray,
+    radius_m: float,
+    discharge_index: np.ndarray,
+    *,
+    seed: int,
+) -> np.ndarray:
+    """Absolute-coordinate meander phase with discharge-scaled wavelength."""
+    unit = np.asarray(xyz, dtype=np.float64)
+    q = np.clip(np.asarray(discharge_index, dtype=np.float64), 0.0, 1.0)
+    rng = np.random.default_rng(int(seed) ^ 0x4D45414E44455232)
+    axis = rng.normal(size=3)
+    axis /= max(float(np.linalg.norm(axis)), 1.0e-15)
+    tangent = axis - np.sum(unit * axis, axis=-1, keepdims=True) * unit
+    norm = np.linalg.norm(tangent, axis=-1, keepdims=True)
+    fallback_axis = np.array([0.0, 0.0, 1.0])
+    fallback = fallback_axis - (
+        np.sum(unit * fallback_axis, axis=-1, keepdims=True) * unit
+    )
+    tangent = np.where(norm > 1.0e-10, tangent, fallback)
+    tangent /= np.maximum(
+        np.linalg.norm(tangent, axis=-1, keepdims=True), 1.0e-12
+    )
+    wavelength_km = 18.0 + 165.0 * np.power(q, 0.72)
+    _cosine, sine, coherence = phase_cell_octave_xyz(
+        unit,
+        float(radius_m) / 1000.0,
+        wavelength_km,
+        tangent,
+        cell_scale=0.82,
+        seed=int(seed) ^ 0x6D65616E,
+        octave=31,
+    )
+    return np.asarray(sine * coherence, dtype=np.float64)
+
+
+def _major_river_guide(
+    inherited_major_river: np.ndarray,
+    *,
+    corridor_cells: int,
+) -> np.ndarray:
+    raw = np.asarray(inherited_major_river, dtype=bool)
+    if not np.any(raw):
+        return np.zeros(raw.shape, dtype=np.float64)
+    distance = ndimage.distance_transform_edt(~raw)
+    sigma = max(float(corridor_cells) * 0.52, 1.0)
+    guide = np.exp(-0.5 * np.square(distance / sigma))
+    guide[distance > float(corridor_cells) * 1.75] = 0.0
+    return np.asarray(guide, dtype=np.float64)
+
+
+def _routing_metrics(
+    receiver_flat: np.ndarray,
+    code16: np.ndarray,
+    streams: np.ndarray,
+    discharge_index: np.ndarray,
+    xyz: np.ndarray,
+    radius_m: float,
+) -> dict[str, float | int | None]:
+    receiver = np.asarray(receiver_flat, dtype=np.int64)
+    code = np.asarray(code16, dtype=np.int16).ravel()
+    stream = np.asarray(streams, dtype=bool).ravel()
+    q = np.asarray(discharge_index, dtype=np.float64).ravel()
+    unit = np.asarray(xyz, dtype=np.float64).reshape((-1, 3))
+    active = stream & (code >= 0)
+    if not np.any(active):
+        return {
+            "directional_fourfold_anisotropy": 0.0,
+            "stream_turn_fraction_gt10deg": 0.0,
+            "max_straight_run_cells": 0,
+            "median_sampled_sinuosity": None,
+        }
+
+    angles = _D16_ANGLES[code[active]]
+    anisotropy = float(np.abs(np.mean(np.exp(4j * angles))))
+
+    nodes = np.flatnonzero(active)
+    targets = receiver[nodes]
+    valid_target = (
+        (targets >= 0)
+        & (targets < stream.size)
+        & stream[np.clip(targets, 0, stream.size - 1)]
+        & (code[np.clip(targets, 0, code.size - 1)] >= 0)
+    )
+    if np.any(valid_target):
+        a0 = _D16_ANGLES[code[nodes[valid_target]]]
+        a1 = _D16_ANGLES[code[targets[valid_target]]]
+        turn = np.abs(np.angle(np.exp(1j * (a1 - a0))))
+        turn_fraction = float(np.mean(turn >= np.deg2rad(10.0)))
+    else:
+        turn_fraction = 0.0
+
+    max_straight = 0
+    for start in nodes.tolist():
+        direction = int(code[start])
+        cur = int(start)
+        run = 0
+        while run < 512:
+            target = int(receiver[cur])
+            if (
+                target < 0
+                or target >= stream.size
+                or not stream[target]
+                or int(code[cur]) != direction
+            ):
+                break
+            run += 1
+            cur = target
+            if int(code[cur]) != direction:
+                break
+        max_straight = max(max_straight, run)
+
+    candidates = nodes[np.argsort(q[nodes], kind="stable")[-min(160, len(nodes)):]]
+    sinuosity: list[float] = []
+    for start in candidates.tolist():
+        cur = int(start)
+        distance = 0.0
+        segments = 0
+        for _ in range(160):
+            target = int(receiver[cur])
+            if (
+                target < 0
+                or target >= stream.size
+                or not stream[target]
+            ):
+                break
+            distance += float(
+                _great_circle_distance_m(
+                    unit[cur][None, :],
+                    unit[target][None, :],
+                    radius_m,
+                )[0]
+            )
+            segments += 1
+            cur = target
+        if segments >= 12 and distance > 0.0:
+            direct = float(
+                _great_circle_distance_m(
+                    unit[start][None, :],
+                    unit[cur][None, :],
+                    radius_m,
+                )[0]
+            )
+            if direct > 1.0:
+                sinuosity.append(distance / direct)
+    return {
+        "directional_fourfold_anisotropy": anisotropy,
+        "stream_turn_fraction_gt10deg": turn_fraction,
+        "max_straight_run_cells": int(max_straight),
+        "median_sampled_sinuosity": (
+            float(np.median(sinuosity)) if sinuosity else None
+        ),
+    }
+
+
 def _sample_area_km2(xyz: np.ndarray, radius_m: float) -> np.ndarray:
     """Approximate vertex support area from local great-circle neighbour spacing."""
     h, w, _ = xyz.shape
