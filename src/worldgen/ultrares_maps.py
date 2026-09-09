@@ -1416,20 +1416,20 @@ def reconstruct_fullview_maps(
     elev = sample("elevation_m", lambda key: _geomorph_path(pyramid, "elevation_m", key), dtype="float32")
     erosion = sample("erosion_m", lambda key: _geomorph_path(pyramid, "erosion_m", key), dtype="float32")
     proc = sample("procedural_detail_m", lambda key: _geomorph_path(pyramid, "procedural_detail_m", key), dtype="float32")
-    base = sample("base_elevation_m", lambda key: _base_tile_path(pyramid, "elevation_m", key), dtype="float32")
-    combined_path = temp / "combined_geomorphic_delta_m.npy"
+    combined_path = temp / "combined_erosion_morphology_delta_m.npy"
     combined = np.lib.format.open_memmap(
         combined_path,
         mode="w+",
         dtype=np.float32,
         shape=(plan.fullview_height, plan.fullview_width),
     )
-    e_arr = np.load(elev, mmap_mode="r", allow_pickle=False)
-    b_arr = np.load(base, mmap_mode="r", allow_pickle=False)
+    erosion_arr = np.load(erosion, mmap_mode="r", allow_pickle=False)
+    proc_arr = np.load(proc, mmap_mode="r", allow_pickle=False)
     for start in range(0, plan.fullview_height, 128):
         stop = min(plan.fullview_height, start + 128)
-        combined[start:stop] = np.asarray(e_arr[start:stop], dtype=np.float32) - np.asarray(
-            b_arr[start:stop], dtype=np.float32
+        combined[start:stop] = (
+            np.asarray(proc_arr[start:stop], dtype=np.float32)
+            - np.asarray(erosion_arr[start:stop], dtype=np.float32)
         )
     combined.flush()
     del combined
@@ -1749,8 +1749,8 @@ def reconstruct_fullview_maps(
             ),
             _render_scalar(
                 combined_path,
-                output / "22_erosion_combined_geomorphic_delta.png",
-                title="Combined local geomorphic terrain delta",
+                output / "22_erosion_combined_legacy_procedural_delta.png",
+                title="Combined legacy-incision + procedural erosion displacement",
                 units="m",
                 palette="signed",
                 signed=True,
@@ -1854,7 +1854,6 @@ def reconstruct_fullview_maps(
 
     # Scientific temporary fullview arrays used only to render images can now go.
     _remove_fullview_temp(
-        base,
         erosion,
         proc,
         combined_path,
