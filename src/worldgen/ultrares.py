@@ -732,6 +732,14 @@ def _tile_resume_valid(
         return False
 
     expected_shape = (int(pyramid.spec.tile_size) + 1,) * 2
+    expected_dtypes = {
+        "elevation_m": np.dtype(np.float32),
+        "erosion_m": np.dtype(np.float32),
+        "procedural_detail_m": np.dtype(np.float32),
+        "final_drainage_area_km2": np.dtype(np.float32),
+        "final_discharge_index": np.dtype(np.float32),
+        "final_streams": np.dtype(np.bool_),
+    }
     for field in ULTRARES_RESUME_FIELDS:
         path = _geomorph_path(pyramid, key, field)
         if not path.exists() or path.stat().st_size <= 0:
@@ -741,6 +749,8 @@ def _tile_resume_valid(
         except (OSError, ValueError):
             return False
         if tuple(values.shape) != expected_shape:
+            return False
+        if np.dtype(values.dtype) != expected_dtypes[field]:
             return False
 
     marker_path = _tile_checkpoint_path(pyramid.world_root, key)
@@ -981,6 +991,7 @@ def generate_finest_geomorphology(
                 fill()
     publish(last_key, "complete")
     return completed
+
 
 def _geomorph_path(
     pyramid: PlanetTilePyramid, key: TileKey, field: str
@@ -1890,6 +1901,7 @@ def run_ultra_resolution(
         resume=True,
     )
     return finalize_ultra_resolution(world_root, spec=cfg)
+
 
 __all__ = [
     "ULTRARES_AUTHORITY_FIELDS",
