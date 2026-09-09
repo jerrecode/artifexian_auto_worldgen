@@ -191,8 +191,8 @@ def test_xyz_microrelief_is_nontrivial_and_exactly_shared_across_tile_edge(tmp_p
     )
     left = TileKey("px", 2, 1, 1)
     right = TileKey("px", 2, 2, 1)
-    g_left = tile_geometry(left, 32)
-    g_right = tile_geometry(right, 32)
+    g_left = tile_geometry(left, 64)
+    g_right = tile_geometry(right, 64)
     d_left = pyramid._spectral_detail(g_left.xyz, left.level)
     d_right = pyramid._spectral_detail(g_right.xyz, right.level)
 
@@ -248,11 +248,12 @@ def test_ultrares_resume_requires_matching_retained_authority(tmp_path):
     for field in ULTRARES_RESUME_FIELDS:
         path = _geomorph_path(pyramid, key, field)
         path.parent.mkdir(parents=True, exist_ok=True)
-        values = (
-            np.zeros(shape, dtype=np.bool_)
-            if field == "final_streams"
-            else np.zeros(shape, dtype=np.float32)
-        )
+        if field == "final_streams":
+            values = np.zeros(shape, dtype=np.bool_)
+        elif field == "elevation_m":
+            values = np.zeros(shape, dtype=np.float64)
+        else:
+            values = np.zeros(shape, dtype=np.float32)
         np.save(path, values, allow_pickle=False)
 
     metadata_path = _geomorph_metadata_path(pyramid, key)
@@ -301,7 +302,12 @@ def test_ultrares_resume_rejects_stale_spec_even_with_marker(tmp_path):
     for field in ULTRARES_RESUME_FIELDS:
         path = _geomorph_path(pyramid, key, field)
         path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(path, np.zeros(shape, dtype=np.float32), allow_pickle=False)
+        dtype = (
+            np.bool_ if field == "final_streams"
+            else np.float64 if field == "elevation_m"
+            else np.float32
+        )
+        np.save(path, np.zeros(shape, dtype=dtype), allow_pickle=False)
 
     metadata = {
         "schema_version": 2,
