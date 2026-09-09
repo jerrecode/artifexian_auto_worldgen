@@ -282,6 +282,24 @@ class LocalGeomorphologySolver:
         meta = self._metadata_path(key)
         if not meta.exists() or not all(path.exists() for path in paths.values()):
             return None
+        try:
+            metadata = json.loads(meta.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return None
+        if metadata.get("key") != asdict(key):
+            return None
+        if metadata.get("source_sha256") != self.pyramid._source_hash():
+            return None
+        if metadata.get("spec") != asdict(self.spec):
+            return None
+        if metadata.get("authority_sampling_revision") != getattr(
+            self.pyramid,
+            "authority_sampling_revision",
+            "legacy",
+        ):
+            return None
+        if metadata.get("algorithm_revision") != LOCAL_GEOMORPHOLOGY_ALGORITHM_REVISION:
+            return None
         return LocalGeomorphologyResult(
             elevation_m=np.load(paths["elevation_m"], mmap_mode="r", allow_pickle=False),
             erosion_m=np.load(paths["erosion_m"], mmap_mode="r", allow_pickle=False),
@@ -297,7 +315,7 @@ class LocalGeomorphologySolver:
             final_flow_direction_d16=np.load(paths["final_flow_direction_d16"], mmap_mode="r", allow_pickle=False),
             final_meander_potential=np.load(paths["final_meander_potential"], mmap_mode="r", allow_pickle=False),
             major_river_constraint=np.load(paths["major_river_constraint"], mmap_mode="r", allow_pickle=False),
-            metadata=json.loads(meta.read_text(encoding="utf-8")),
+            metadata=metadata,
         )
 
     def solve(self, key: TileKey) -> LocalGeomorphologyResult:
