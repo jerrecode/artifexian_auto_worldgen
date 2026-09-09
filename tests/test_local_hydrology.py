@@ -13,7 +13,12 @@ from worldgen.local_hydrology import (
     _priority_flood_open,
     _resolved_elevation_patch,
 )
-from worldgen.planet_tiles import PlanetTilePyramid, TileKey, TilePyramidSpec
+from worldgen.planet_tiles import (
+    PlanetTilePyramid,
+    TileKey,
+    TilePyramidSpec,
+    tile_geometry,
+)
 
 
 def _world(root):
