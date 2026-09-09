@@ -207,6 +207,8 @@ def test_local_hydrology_cache_is_sparse_and_reusable(tmp_path):
 
 
 def test_final_terrain_reroute_uses_halo_not_core_perimeter_outlets(tmp_path):
+    from worldgen.planet_tiles import tile_geometry
+
     _world(tmp_path)
     pyramid = PlanetTilePyramid(
         tmp_path,
