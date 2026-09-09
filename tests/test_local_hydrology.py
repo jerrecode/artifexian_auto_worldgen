@@ -423,3 +423,58 @@ def test_priority_flood_optional_numba_matches_independent_python_reference():
     expected = reference(elevation, ocean, 0.01)
     actual = _priority_flood_open(elevation, ocean, epsilon_m=0.01)
     np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-12)
+
+
+
+def test_d16_meander_steering_breaks_long_axis_lock_without_uphill_flow():
+    from worldgen.local_hydrology import _routing_metrics
+
+    h = w = 96
+    yy, xx = np.meshgrid(
+        np.arange(h, dtype=np.float64),
+        np.arange(w, dtype=np.float64),
+        indexing="ij",
+    )
+    scale = 2.0e-5
+    xyz = np.stack(
+        (
+            (xx - w / 2.0) * scale,
+            (yy - h / 2.0) * scale,
+            np.ones((h, w), dtype=np.float64),
+        ),
+        axis=-1,
+    )
+    xyz /= np.linalg.norm(xyz, axis=-1, keepdims=True)
+
+    # Primarily eastward descent, with a much smaller southward component.  Both
+    # east and southeast remain downhill, allowing deterministic steering to
+    # choose a gently oscillating path instead of an axis-locked reach.
+    z = 2000.0 - 2.0 * xx - 0.30 * yy
+    ocean = np.zeros((h, w), dtype=bool)
+    preferred = 0.62 * np.sin(2.0 * np.pi * xx / 18.0)
+    steer = np.full((h, w), 0.84, dtype=np.float64)
+
+    receiver, code16, _slope = _flow_d16_open(
+        z,
+        ocean,
+        xyz,
+        1.0e6,
+        preferred_angle_rad=preferred,
+        steering_weight=steer,
+    )
+    streams = code16 >= 0
+    metrics = _routing_metrics(
+        receiver,
+        code16,
+        streams,
+        np.ones((h, w), dtype=np.float64),
+        xyz,
+        1.0e6,
+    )
+
+    flat_z = z.ravel()
+    active = receiver >= 0
+    sources = np.flatnonzero(active)
+    assert np.all(flat_z[receiver[active]] < flat_z[sources])
+    assert metrics["max_straight_run_cells"] < 80
+    assert metrics["stream_turn_fraction_gt10deg"] > 0.02
