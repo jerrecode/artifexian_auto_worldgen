@@ -51,6 +51,48 @@ def main(argv=None) -> int:
     climate["phase_coupled_evaporation"] = True
     cfg.setdefault("ocean", {})["fluid_species"] = "H2O"
 
+    cfg["tectonics"] = merge(
+        cfg.get("tectonics", {}),
+        {
+            # Active but still Earth-like: more resolved convergent/subplate
+            # structure and stronger relief, without changing planet gravity.
+            "plate_count": 20,
+            "mountain_uplift_km": 6.2,
+            "terrain_noise_km": 0.72,
+            "mean_subplates_per_plate": 7.0,
+            "min_subplates_per_plate": 4,
+            "max_subplates_per_plate": 12,
+            "boundary_warp_deg": 4.4,
+            "boundary_detail_octaves": 9,
+            "boundary_deformation_iterations": 4,
+            "strain_boundary_warp_deg": 3.8,
+            "geological_activity_mode": "active",
+            "activity_strength": 1.12,
+        },
+    )
+    cfg["terrain"] = merge(
+        cfg.get("terrain", {}),
+        {
+            # Preserve broad geologic elevations while retaining sharper active
+            # orogens for the subsequent kilometre-scale refinement.
+            "erosion_m_per_myr": 4.0,
+            "fractal_octaves": 9,
+            "relief_detail_strength": 0.68,
+            "fault_block_relief_km": 1.05,
+            "rift_shoulder_uplift_km": 1.0,
+        },
+    )
+    cfg["hydrology"] = merge(
+        cfg.get("hydrology", {}),
+        {
+            "surface_evolution_iterations": 6,
+            "sediment_routing_passes": 30,
+            "river_meander_strength": 1.0,
+            "lateral_erosion_fraction": 0.38,
+            "meander_microrelief_m": 14.0,
+        },
+    )
+
     cfg["atmogen"] = merge(
         cfg.get("atmogen", {}),
         {
@@ -107,7 +149,15 @@ def main(argv=None) -> int:
                 "procedural_erosion": cfg["procedural_erosion"],
                 "terrain_output_contract": {
                     "reconstructed_base_resolution": [8192, 4096],
-                    "deepest_subsection_linear_multiplier": 2,
+                    "native_terrain_map_resolution": [16384, 8192],
+                    "requested_subsection_linear_multiplier": 3,
+                    "expected_discrete_lod_multiplier": 4,
+                    "minimum_resolved_wave_samples_native_tile": 4,
+                    "minimum_feature_half_wave_pixels_native_map": 1,
+                    "height_products": [
+                        "single-channel grayscale uint16 PNG",
+                        "single-channel min-is-black uint32 TIFF",
+                    ],
                 },
             },
             sort_keys=False,
