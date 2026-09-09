@@ -567,6 +567,9 @@ def _routing_metrics(
             "directional_fourfold_anisotropy": 0.0,
             "directional_fourfold_moment_real": 0.0,
             "directional_fourfold_moment_imag": 0.0,
+            "directional_eighth_anisotropy": 0.0,
+            "directional_eighth_moment_real": 0.0,
+            "directional_eighth_moment_imag": 0.0,
             "stream_direction_count": 0,
             "stream_transition_count": 0,
             "stream_turn_fraction_gt10deg": 0.0,
@@ -575,9 +578,10 @@ def _routing_metrics(
         }
 
     angles = _D16_ANGLES[code[active]]
-    fourth = np.exp(4j * angles)
-    fourth_sum = np.sum(fourth)
+    fourth_sum = np.sum(np.exp(4j * angles))
+    eighth_sum = np.sum(np.exp(8j * angles))
     anisotropy = float(np.abs(fourth_sum / max(len(angles), 1)))
+    eighth_anisotropy = float(np.abs(eighth_sum / max(len(angles), 1)))
 
     nodes = np.flatnonzero(active)
     targets = receiver[nodes]
@@ -653,6 +657,9 @@ def _routing_metrics(
         "directional_fourfold_anisotropy": anisotropy,
         "directional_fourfold_moment_real": float(np.real(fourth_sum)),
         "directional_fourfold_moment_imag": float(np.imag(fourth_sum)),
+        "directional_eighth_anisotropy": eighth_anisotropy,
+        "directional_eighth_moment_real": float(np.real(eighth_sum)),
+        "directional_eighth_moment_imag": float(np.imag(eighth_sum)),
         "stream_direction_count": int(len(angles)),
         "stream_transition_count": transition_count,
         "stream_turn_fraction_gt10deg": turn_fraction,
