@@ -1,0 +1,103 @@
+name: Diagnose existing z2 terrain audit
+
+on:
+  push:
+    branches:
+      - z2-river-seam-audit-fix
+    paths:
+      - '.github/workflows/diagnose-z2-existing.yml'
+      - 'src/worldgen/ultrares.py'
+      - 'src/worldgen/local_geomorphology.py'
+      - 'src/worldgen/local_hydrology.py'
+      - 'tests/test_ultrares.py'
+      - 'tests/test_local_geomorphology.py'
+      - 'tests/test_local_hydrology.py'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      MPLBACKEND: Agg
+      WORLDGEN_DISTANCE_CACHE_MB: '128'
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_MAX_THREADS: '1'
+      NUMBA_CACHE_DIR: ${{ github.workspace }}/.numba-cache
+      SEED: '2026090707'
+      ROOT: output/earthlike-ultrares-2026090707
+      CONFIG: validation-configs/earthlike-ultrares-2026090707.yaml
+      SOURCE_RUN_ID: '34353489700'
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install production stack
+        run: |
+          set -euxo pipefail
+          python -m pip install --disable-pip-version-check -e '.[performance,jit,storage,thermodynamics,render,dev]'
+          python -m pip check
+
+      - name: Restore existing compact source authority
+        uses: actions/download-artifact@v4
+        with:
+          name: earthlike-ultrares-source-2026090707
+          path: ${{ env.ROOT }}
+          github-token: ${{ github.token }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+
+      - name: Restore all existing z2 terrain shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: earthlike-ultrares-terrain-shard-*-of-12
+          path: ${{ env.ROOT }}
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+
+      - name: Rebuild deterministic config
+        run: |
+          set -euxo pipefail
+          mkdir -p validation-configs
+          python scripts/build_ultrares_earth_config.py             --base config/ultra_detail.yaml             --out "$CONFIG"             --seed "$SEED"
+
+      - name: Re-run audit against existing 96 tiles
+        id: audit
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          python scripts/run_ultrares_earth.py "$ROOT"             --mode finalize             --workers 2             --tile-size 1024             --base-multiplier 4             --subsection-multiplier 2             --min-samples-per-wavelength 4             --terrain-detail-strength 1.15             2>&1 | tee "$ROOT/z2-existing-audit.log"
+
+      - name: Print complete failure diagnostics
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -f "$ROOT/ultrares/terrain_detail_audit.json" && cat "$ROOT/ultrares/terrain_detail_audit.json" || true
+          test -f "$ROOT/ultrares/terrain_detail_audit_failure.json" && cat "$ROOT/ultrares/terrain_detail_audit_failure.json" || true
+
+      - name: Upload audit diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: z2-existing-audit-diagnostics
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            ${{ env.ROOT }}/ultrares/terrain_detail_audit.json
+            ${{ env.ROOT }}/ultrares/terrain_detail_audit_failure.json
+            ${{ env.ROOT }}/z2-existing-audit.log
+
+      - name: Fail if audit still fails
+        if: ${{ steps.audit.outcome != 'success' }}
+        run: exit 1
