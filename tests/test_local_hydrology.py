@@ -4,6 +4,7 @@ import heapq
 import json
 
 import numpy as np
+import pytest
 
 from worldgen.local_hydrology import (
     _D16,
