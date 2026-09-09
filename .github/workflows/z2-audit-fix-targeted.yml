@@ -117,6 +117,9 @@ jobs:
                   "max_straight_run_end_yx": routing.get(
                       "max_straight_run_end_yx"
                   ),
+                  "max_straight_run_downhill_alternatives": routing.get(
+                      "max_straight_run_downhill_alternatives"
+                  ),
                   "turn_fraction_gt10deg": float(
                       routing["stream_turn_fraction_gt10deg"]
                   ),
