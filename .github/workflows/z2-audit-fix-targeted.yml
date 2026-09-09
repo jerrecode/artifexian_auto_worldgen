@@ -54,13 +54,16 @@ jobs:
           path: ${{ env.ROOT }}
           github-token: ${{ github.token }}
           run-id: 34353489700
-      - name: Regenerate only the measured river problem tile
+      - name: Regenerate measured river and seam problem tiles
         shell: bash
         run: |
           set -euxo pipefail
-          # _level_keys(z2) ordinal 55 = ny/z2/x3/y1, the measured
-          # production straight-run outlier. shard_count=96 selects exactly one tile.
-          for ordinal in 55; do
+          # _level_keys(z2) ordinal mapping:
+          # 55 = ny/z2/x3/y1 (river straight-run outlier)
+          # 73,74 = pz/z2/x1/y2 -> x2/y2 high derivative seam
+          # 85,89 = nz/z2/x1/y1 -> x1/y2 worst derivative seam
+          # shard_count=96 selects exactly one z2 tile per invocation.
+          for ordinal in 55 73 74 85 89; do
             /usr/bin/time -v python scripts/run_ultrares_earth.py "$ROOT" \
               --mode shard \
               --no-compact \
@@ -119,24 +122,78 @@ jobs:
               )
               return json.loads(p.read_text(encoding="utf-8"))
 
+          def y_seam(a_key, b_key):
+              a, b = elevation(a_key), elevation(b_key)
+              value_max = float(np.max(np.abs(a[-1, :] - b[0, :])))
+              diff = (a[-1, :] - a[-2, :]) - (b[1, :] - b[0, :])
+              return (
+                  value_max,
+                  float(np.sqrt(np.mean(np.square(diff)))),
+                  float(np.max(np.abs(diff))),
+              )
+
+          def x_seam(a_key, b_key):
+              a, b = elevation(a_key), elevation(b_key)
+              value_max = float(np.max(np.abs(a[:, -1] - b[:, 0])))
+              diff = (a[:, -1] - a[:, -2]) - (b[:, 1] - b[:, 0])
+              return (
+                  value_max,
+                  float(np.sqrt(np.mean(np.square(diff)))),
+                  float(np.max(np.abs(diff))),
+              )
+
           river_key = TileKey("ny", 2, 3, 1)
-          river = metadata(river_key)["final_routing_metrics"]
           river_meta = metadata(river_key)
+          river = river_meta["final_routing_metrics"]
+          nz = y_seam(
+              TileKey("nz", 2, 1, 1),
+              TileKey("nz", 2, 1, 2),
+          )
+          pz = x_seam(
+              TileKey("pz", 2, 1, 2),
+              TileKey("pz", 2, 2, 2),
+          )
+
           report = {
               "river_problem_tile": {
                   "key": "ny/z2/x3/y1",
                   "max_straight_run_cells": int(river["max_straight_run_cells"]),
-                  "turn_fraction_gt10deg": float(river["stream_turn_fraction_gt10deg"]),
+                  "turn_fraction_gt10deg": float(
+                      river["stream_turn_fraction_gt10deg"]
+                  ),
                   "median_sinuosity": river["median_sampled_sinuosity"],
-                  "adaptive_meander_attempt": river_meta.get("adaptive_meander_attempt"),
-                  "routing_candidate_metrics": river_meta.get("routing_candidate_metrics"),
+                  "adaptive_meander_attempt": river_meta.get(
+                      "adaptive_meander_attempt"
+                  ),
+                  "adaptive_meander_min_wavelength_m": river_meta.get(
+                      "adaptive_meander_min_wavelength_m"
+                  ),
+                  "routing_candidate_metrics": river_meta.get(
+                      "routing_candidate_metrics"
+                  ),
+              },
+              "worst_observed_nz_seam_retest": {
+                  "value_max_abs_m": nz[0],
+                  "derivative_rms_m": nz[1],
+                  "derivative_max_abs_m": nz[2],
+              },
+              "high_observed_pz_seam_retest": {
+                  "value_max_abs_m": pz[0],
+                  "derivative_rms_m": pz[1],
+                  "derivative_max_abs_m": pz[2],
               },
           }
           out = root / "targeted-z2-fix-validation.json"
-          out.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+          out.write_text(
+              json.dumps(report, indent=2, sort_keys=True),
+              encoding="utf-8",
+          )
           print(json.dumps(report, indent=2, sort_keys=True))
 
           assert report["river_problem_tile"]["max_straight_run_cells"] <= 220, report
+          assert nz[0] <= 1.0e-5 and pz[0] <= 1.0e-5, report
+          assert nz[1] <= 80.0, report
+          assert pz[1] <= 80.0, report
           PY
       - name: Upload targeted validation diagnostics
         if: ${{ always() }}
