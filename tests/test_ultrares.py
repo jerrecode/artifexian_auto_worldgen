@@ -183,7 +183,7 @@ def test_xyz_microrelief_is_nontrivial_and_exactly_shared_across_tile_edge(tmp_p
     pyramid = UltraResolutionTilePyramid(
         tmp_path,
         spec=TilePyramidSpec(
-            tile_size=32,
+            tile_size=64,
             elevation_detail_strength=1.0,
             detail_hurst_exponent=0.65,
             maximum_level=6,
@@ -229,13 +229,13 @@ def test_ultrares_resume_requires_matching_retained_authority(tmp_path):
     cfg = UltraResolutionSpec(
         base_linear_multiplier=4.0,
         subsection_linear_multiplier=2.0,
-        tile_size=32,
+        tile_size=64,
         terrain_detail_strength=1.0,
     )
     pyramid = UltraResolutionTilePyramid(
         tmp_path,
         spec=TilePyramidSpec(
-            tile_size=32,
+            tile_size=64,
             elevation_detail_strength=1.0,
             maximum_level=6,
         ),
@@ -243,7 +243,7 @@ def test_ultrares_resume_requires_matching_retained_authority(tmp_path):
     plan = make_ultra_resolution_plan(pyramid, cfg)
     geom = derive_scale_aware_geomorphology_spec(pyramid, plan, cfg)
     key = TileKey("px", plan.finest_level, 0, 0)
-    shape = (33, 33)
+    shape = (65, 65)
 
     for field in ULTRARES_RESUME_FIELDS:
         path = _geomorph_path(pyramid, key, field)
@@ -282,13 +282,13 @@ def test_ultrares_resume_rejects_stale_spec_even_with_marker(tmp_path):
     cfg = UltraResolutionSpec(
         base_linear_multiplier=4.0,
         subsection_linear_multiplier=2.0,
-        tile_size=32,
+        tile_size=64,
         terrain_detail_strength=1.0,
     )
     pyramid = UltraResolutionTilePyramid(
         tmp_path,
         spec=TilePyramidSpec(
-            tile_size=32,
+            tile_size=64,
             elevation_detail_strength=1.0,
             maximum_level=6,
         ),
@@ -296,7 +296,7 @@ def test_ultrares_resume_rejects_stale_spec_even_with_marker(tmp_path):
     plan = make_ultra_resolution_plan(pyramid, cfg)
     geom = derive_scale_aware_geomorphology_spec(pyramid, plan, cfg)
     key = TileKey("px", plan.finest_level, 0, 0)
-    shape = (33, 33)
+    shape = (65, 65)
 
     for field in ULTRARES_RESUME_FIELDS:
         path = _geomorph_path(pyramid, key, field)
