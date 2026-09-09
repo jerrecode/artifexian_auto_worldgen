@@ -558,13 +558,19 @@ def _routing_metrics(
     if not np.any(active):
         return {
             "directional_fourfold_anisotropy": 0.0,
+            "directional_fourfold_moment_real": 0.0,
+            "directional_fourfold_moment_imag": 0.0,
+            "stream_direction_count": 0,
+            "stream_transition_count": 0,
             "stream_turn_fraction_gt10deg": 0.0,
             "max_straight_run_cells": 0,
             "median_sampled_sinuosity": None,
         }
 
     angles = _D16_ANGLES[code[active]]
-    anisotropy = float(np.abs(np.mean(np.exp(4j * angles))))
+    fourth = np.exp(4j * angles)
+    fourth_sum = np.sum(fourth)
+    anisotropy = float(np.abs(fourth_sum / max(len(angles), 1)))
 
     nodes = np.flatnonzero(active)
     targets = receiver[nodes]
@@ -574,7 +580,8 @@ def _routing_metrics(
         & stream[np.clip(targets, 0, stream.size - 1)]
         & (code[np.clip(targets, 0, code.size - 1)] >= 0)
     )
-    if np.any(valid_target):
+    transition_count = int(np.count_nonzero(valid_target))
+    if transition_count:
         a0 = _D16_ANGLES[code[nodes[valid_target]]]
         a1 = _D16_ANGLES[code[targets[valid_target]]]
         turn = np.abs(np.angle(np.exp(1j * (a1 - a0))))
@@ -637,6 +644,10 @@ def _routing_metrics(
                 sinuosity.append(distance / direct)
     return {
         "directional_fourfold_anisotropy": anisotropy,
+        "directional_fourfold_moment_real": float(np.real(fourth_sum)),
+        "directional_fourfold_moment_imag": float(np.imag(fourth_sum)),
+        "stream_direction_count": int(len(angles)),
+        "stream_transition_count": transition_count,
         "stream_turn_fraction_gt10deg": turn_fraction,
         "max_straight_run_cells": int(max_straight),
         "median_sampled_sinuosity": (
