@@ -8,6 +8,7 @@ from worldgen.local_geomorphology import (
     LOCAL_GEOMORPHOLOGY_ALGORITHM_REVISION,
     LocalGeomorphologySolver,
     _grid_angular_moments,
+    _laterally_shift_channel_seed,
 )
 from worldgen.local_hydrology import _sample_area_km2
 from worldgen.planet_tiles import PlanetTilePyramid, TileKey, TilePyramidSpec, tile_geometry
@@ -191,3 +192,56 @@ def test_local_geomorphology_cache_rejects_algorithm_revision_mismatch(tmp_path)
     meta_path.write_text(json.dumps(metadata), encoding="utf-8")
 
     assert solver._load_cached(key) is None
+
+
+
+def test_lateral_channel_seed_shift_is_deterministic_and_bilinear():
+    h = w = 33
+    seed = np.zeros((h, w), dtype=np.float64)
+    seed[8:25, 16] = 1.0
+    angle = np.full((h, w), np.pi / 2.0, dtype=np.float64)
+    phase = np.zeros((h, w), dtype=np.float64)
+    phase[8:25, :] = 0.65
+    q = np.full((h, w), 0.8, dtype=np.float64)
+
+    shifted = _laterally_shift_channel_seed(
+        seed,
+        angle,
+        phase,
+        q,
+        max_offset_cells=2.4,
+    )
+    shifted_again = _laterally_shift_channel_seed(
+        seed,
+        angle,
+        phase,
+        q,
+        max_offset_cells=2.4,
+    )
+
+    np.testing.assert_array_equal(shifted, shifted_again)
+    assert shifted.shape == seed.shape
+    assert np.isfinite(shifted).all()
+    assert float(np.min(shifted)) >= 0.0
+    assert float(np.max(shifted)) <= 1.0 + 1e-12
+    # angle=pi/2 gives a horizontal normal shift, so the centre of incision
+    # must leave the original x=16 line without becoming a one-pixel jump.
+    assert np.count_nonzero(shifted[:, 16]) < np.count_nonzero(seed[:, 16])
+    assert np.count_nonzero((shifted > 0.0) & (np.indices(seed.shape)[1] != 16)) > 0
+
+
+def test_zero_lateral_offset_preserves_channel_seed_exactly():
+    rng = np.random.default_rng(123)
+    seed = rng.random((12, 15))
+    angle = rng.uniform(-np.pi, np.pi, seed.shape)
+    phase = rng.uniform(-1.0, 1.0, seed.shape)
+    q = rng.random(seed.shape)
+
+    shifted = _laterally_shift_channel_seed(
+        seed,
+        angle,
+        phase,
+        q,
+        max_offset_cells=0.0,
+    )
+    np.testing.assert_array_equal(shifted, seed)
