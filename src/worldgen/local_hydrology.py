@@ -512,6 +512,35 @@ def _major_river_guide(
     return np.asarray(guide, dtype=np.float64)
 
 
+def _connect_stream_knight_moves(
+    streams: np.ndarray,
+    receiver_flat: np.ndarray,
+    code16: np.ndarray,
+) -> np.ndarray:
+    """Rasterize the intermediate cell of D16 knight-move channel segments."""
+    out = np.asarray(streams, dtype=bool).copy()
+    code = np.asarray(code16, dtype=np.int16)
+    h, w = out.shape
+    for direction, (dy, dx) in enumerate(_D16):
+        if max(abs(dy), abs(dx)) <= 1:
+            continue
+        ys, xs = np.where(out & (code == direction))
+        if ys.size == 0:
+            continue
+        sdy = int(np.sign(dy))
+        sdx = int(np.sign(dx))
+        parity = (ys + xs + direction) & 1
+        if abs(dy) == 2:
+            my = ys + sdy
+            mx = xs + parity * sdx
+        else:
+            my = ys + parity * sdy
+            mx = xs + sdx
+        valid = (my >= 0) & (my < h) & (mx >= 0) & (mx < w)
+        out[my[valid], mx[valid]] = True
+    return out
+
+
 def _routing_metrics(
     receiver_flat: np.ndarray,
     code16: np.ndarray,
