@@ -276,3 +276,40 @@ def test_routing_metrics_active_mask_counts_only_selected_source_cells():
         active_mask=active_mask,
     )
     assert metrics["stream_direction_count"] <= 4
+
+
+def test_routing_metrics_eighth_moment_catches_balanced_axis_diagonal_lattice():
+    from worldgen.local_hydrology import _routing_metrics
+
+    h = w = 24
+    code = np.full((h, w), -1, dtype=np.int8)
+    streams = np.zeros((h, w), dtype=bool)
+
+    # Equal populations of east (0 degrees) and southeast (45 degrees).
+    code[2:10, 2:-2] = 4
+    code[14:22, 2:-2] = 7
+    streams[code >= 0] = True
+
+    receiver = np.full(h * w, -1, dtype=np.int64)
+    discharge = np.ones((h, w), dtype=np.float64)
+    yy, xx = np.mgrid[:h, :w]
+    xyz = np.stack(
+        (
+            (xx - w / 2) * 1e-5,
+            (yy - h / 2) * 1e-5,
+            np.ones((h, w)),
+        ),
+        axis=-1,
+    )
+    xyz /= np.linalg.norm(xyz, axis=-1, keepdims=True)
+
+    metrics = _routing_metrics(
+        receiver,
+        code,
+        streams,
+        discharge,
+        xyz,
+        1e6,
+    )
+    assert metrics["directional_fourfold_anisotropy"] < 0.05
+    assert metrics["directional_eighth_anisotropy"] > 0.95
