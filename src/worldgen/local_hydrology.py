@@ -24,6 +24,11 @@ from typing import Mapping
 import numpy as np
 from scipy import ndimage
 
+try:  # Optional hot-path accelerator; pure NumPy/Python remains authoritative fallback.
+    from numba import njit
+except ImportError:  # pragma: no cover - normal minimal install
+    njit = None
+
 from .procedural_erosion import phase_cell_octave_xyz
 from .planet_tiles import (
     PlanetTilePyramid,
@@ -688,6 +693,46 @@ def _sample_area_km2(xyz: np.ndarray, radius_m: float) -> np.ndarray:
     return np.maximum(dx * dy / 1.0e6, 1.0e-12)
 
 
+def _accumulate_topological_python(
+    order: np.ndarray,
+    receiver: np.ndarray,
+    drainage: np.ndarray,
+    discharge: np.ndarray,
+) -> None:
+    for node in order:
+        target = int(receiver[int(node)])
+        if target >= 0:
+            drainage[target] += drainage[int(node)]
+            discharge[target] += discharge[int(node)]
+
+
+if njit is not None:
+    _accumulate_topological_numba = njit(
+        cache=True,
+        nogil=True,
+    )(_accumulate_topological_python)
+else:
+    _accumulate_topological_numba = None
+
+
+def _accumulate_topological(
+    order: np.ndarray,
+    receiver: np.ndarray,
+    drainage: np.ndarray,
+    discharge: np.ndarray,
+) -> str:
+    """Accumulate downstream values in deterministic topological order.
+
+    Returns the backend name for diagnostics/tests.  The Numba and Python paths
+    execute the same in-place recurrence in the same node order.
+    """
+    if _accumulate_topological_numba is not None:
+        _accumulate_topological_numba(order, receiver, drainage, discharge)
+        return "numba"
+    _accumulate_topological_python(order, receiver, drainage, discharge)
+    return "python"
+
+
 def _accumulate_open(
     filled_elevation_m: np.ndarray,
     receiver_flat: np.ndarray,
@@ -702,13 +747,13 @@ def _accumulate_open(
     land = ~np.asarray(ocean, dtype=bool).ravel()
     drainage = area * land
     discharge = np.maximum(runoff, 0.0) * area * land
-    # Priority-Flood epsilon makes interior receiver heights strictly lower.  A
+    # Priority-Flood epsilon makes interior receiver heights strictly lower. A
     # descending elevation pass is therefore a deterministic topological order.
-    for node in np.argsort(z, kind="stable")[::-1]:
-        target = int(receiver[node])
-        if target >= 0:
-            drainage[target] += drainage[node]
-            discharge[target] += discharge[node]
+    order = np.ascontiguousarray(
+        np.argsort(z, kind="stable")[::-1],
+        dtype=np.int64,
+    )
+    _accumulate_topological(order, receiver, drainage, discharge)
     return drainage.reshape(filled_elevation_m.shape), discharge.reshape(
         filled_elevation_m.shape
     )
