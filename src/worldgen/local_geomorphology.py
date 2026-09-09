@@ -695,6 +695,15 @@ class LocalGeomorphologySolver:
             "combined_geomorphic_rms_m": float(
                 np.sqrt(np.mean(np.square(anchored - inherited_source)))
             ) if anchored.size else 0.0,
+            "pre_channel_routing_metrics": dict(
+                routed_before_channel.metadata.get("routing_metrics", {})
+            ),
+            "pre_channel_adaptive_meander_attempt": (
+                routed_before_channel.metadata.get("adaptive_meander_attempt")
+            ),
+            "pre_channel_routing_candidate_metrics": (
+                routed_before_channel.metadata.get("routing_candidate_metrics")
+            ),
             "final_routing_metrics": final_routing_metrics,
             "adaptive_meander_attempt": final_hydro.metadata.get(
                 "adaptive_meander_attempt"
