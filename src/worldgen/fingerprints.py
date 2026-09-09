@@ -9,6 +9,7 @@ from typing import Iterable
 
 _COMMON_PHYSICAL = {
     "config.py",
+    "identity.py",
     "rng.py",
     "grid.py",
     "topology.py",
