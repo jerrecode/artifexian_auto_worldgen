@@ -1071,18 +1071,94 @@ def _same_face_seam_max(
     return maximum
 
 
+def _same_face_seam_gradient_rms(
+    pyramid: PlanetTilePyramid, level: int
+) -> float:
+    """RMS mismatch of one-sided terrain derivatives across same-face tile seams."""
+    side = 1 << int(level)
+    sumsq = 0.0
+    count = 0
+    for face in CUBE_FACES:
+        for y in range(side):
+            for x in range(side):
+                key = TileKey(face, level, x, y)
+                a = np.asarray(
+                    np.load(
+                        _geomorph_path(pyramid, key, "elevation_m"),
+                        mmap_mode="r",
+                        allow_pickle=False,
+                    ),
+                    dtype=np.float64,
+                )
+                if x + 1 < side:
+                    b = np.asarray(
+                        np.load(
+                            _geomorph_path(
+                                pyramid,
+                                TileKey(face, level, x + 1, y),
+                                "elevation_m",
+                            ),
+                            mmap_mode="r",
+                            allow_pickle=False,
+                        ),
+                        dtype=np.float64,
+                    )
+                    da = a[:, -1] - a[:, -2]
+                    db = b[:, 1] - b[:, 0]
+                    diff = da - db
+                    sumsq += float(np.sum(np.square(diff)))
+                    count += int(diff.size)
+                if y + 1 < side:
+                    b = np.asarray(
+                        np.load(
+                            _geomorph_path(
+                                pyramid,
+                                TileKey(face, level, x, y + 1),
+                                "elevation_m",
+                            ),
+                            mmap_mode="r",
+                            allow_pickle=False,
+                        ),
+                        dtype=np.float64,
+                    )
+                    da = a[-1, :] - a[-2, :]
+                    db = b[1, :] - b[0, :]
+                    diff = da - db
+                    sumsq += float(np.sum(np.square(diff)))
+                    count += int(diff.size)
+    return math.sqrt(sumsq / max(count, 1))
+
+
 def audit_ultra_resolution(
     pyramid: PlanetTilePyramid,
     plan: UltraResolutionPlan,
     geomorphology_spec: LocalGeomorphologySpec,
     spec: UltraResolutionSpec | None = None,
 ) -> dict[str, Any]:
-    """Audit that refinement adds resolved terrain rather than merely more pixels."""
+    """Audit spatial bandwidth, grid neutrality, rivers, relief and mass closure."""
     cfg = (spec or UltraResolutionSpec()).validate()
     source_limit_m = (
         cfg.min_samples_per_wavelength * plan.source_equatorial_m_per_sample
     )
     fine_limit_m = cfg.min_samples_per_wavelength * plan.finest_m_per_sample
+
+    # The selected high-resolution deliverable is 2x the ordinary fullview.
+    # z3 terrain is another factor of two finer than that output, so a four-native-
+    # sample wavelength has a one-output-pixel half-wave (Nyquist saturation).
+    native_output_width = int(plan.fullview_width * 2)
+    native_output_height = int(plan.fullview_height * 2)
+    native_output_m_per_pixel = (
+        2.0 * math.pi * float(pyramid.planet_radius_m)
+        / float(native_output_width)
+    )
+    terrain_finest_wavelength_m = max(
+        4.0 * float(plan.finest_m_per_sample),
+        800.0,
+    )
+    terrain_min_feature_width_m = 0.5 * terrain_finest_wavelength_m
+    feature_pixels = (
+        terrain_min_feature_width_m / native_output_m_per_pixel
+    )
 
     rows: list[dict[str, Any]] = []
     closure_max = 0.0
@@ -1091,8 +1167,25 @@ def audit_ultra_resolution(
     residual_band_energy: list[float] = []
     physical_rms: list[float] = []
     procedural_rms: list[float] = []
+    microdetail_rms: list[float] = []
     finest_samples: list[float] = []
     coarsest_wavelengths: list[float] = []
+
+    terrain_grid_real = 0.0
+    terrain_grid_imag = 0.0
+    terrain_grid_weight = 0.0
+    river_grid_real = 0.0
+    river_grid_imag = 0.0
+    river_direction_count = 0
+    turn_weighted = 0.0
+    turn_transition_count = 0
+    max_straight_run = 0
+    sinuosity_values: list[tuple[float, int]] = []
+
+    land_area = 0.0
+    mountain_1500_area = 0.0
+    mountain_2500_area = 0.0
+    rugged_area = 0.0
 
     for key in _level_keys(plan.finest_level):
         meta_path = (
@@ -1106,7 +1199,6 @@ def audit_ultra_resolution(
             / f"y{key.y:08d}.json"
         )
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        base = np.asarray(pyramid.load_field(key, "elevation_m"), dtype=np.float64)
         evolved = np.asarray(
             np.load(
                 _geomorph_path(pyramid, key, "elevation_m"),
@@ -1115,22 +1207,74 @@ def audit_ultra_resolution(
             ),
             dtype=np.float64,
         )
-        residual = evolved - base
-        interior = residual[8:-8, 8:-8] if min(residual.shape) > 20 else residual
-        band = interior - ndimage.gaussian_filter(interior, sigma=2.0, mode="nearest")
-        band_rms = float(np.sqrt(np.mean(np.square(band)))) if band.size else 0.0
+        interior = (
+            evolved[8:-8, 8:-8]
+            if min(evolved.shape) > 20
+            else evolved
+        )
+        band = interior - ndimage.gaussian_filter(
+            interior, sigma=2.0, mode="nearest"
+        )
+        band_rms = (
+            float(np.sqrt(np.mean(np.square(band))))
+            if band.size
+            else 0.0
+        )
         residual_band_energy.append(band_rms)
 
         p_rms = float(meta.get("physical_erosion_rms_m", 0.0))
         q_rms = float(meta.get("procedural_detail_rms_m", 0.0))
+        m_rms = float(meta.get("tectonic_microdetail_rms_m", 0.0))
         physical_rms.append(p_rms)
         procedural_rms.append(q_rms)
+        microdetail_rms.append(m_rms)
         closure = abs(float(meta.get("sediment_closure_relative", 0.0)))
         closure_max = max(closure_max, closure)
-        if p_rms > 1.0e-8 or q_rms > 1.0e-8:
+        if p_rms > 1.0e-8 or q_rms > 1.0e-8 or m_rms > 1.0e-8:
             active_tiles += 1
         if bool(meta.get("legacy_and_procedural_simultaneous", False)):
             simultaneous += 1
+
+        grid = meta.get("terrain_grid_fourfold_moment", {})
+        terrain_grid_real += float(grid.get("real", 0.0))
+        terrain_grid_imag += float(grid.get("imag", 0.0))
+        terrain_grid_weight += float(grid.get("weight", 0.0))
+
+        routing = meta.get("final_routing_metrics", {})
+        direction_count = int(routing.get("stream_direction_count", 0) or 0)
+        river_direction_count += direction_count
+        river_grid_real += float(
+            routing.get("directional_fourfold_moment_real", 0.0) or 0.0
+        )
+        river_grid_imag += float(
+            routing.get("directional_fourfold_moment_imag", 0.0) or 0.0
+        )
+        transition_count = int(
+            routing.get("stream_transition_count", 0) or 0
+        )
+        turn_transition_count += transition_count
+        turn_weighted += (
+            float(routing.get("stream_turn_fraction_gt10deg", 0.0) or 0.0)
+            * transition_count
+        )
+        max_straight_run = max(
+            max_straight_run,
+            int(routing.get("max_straight_run_cells", 0) or 0),
+        )
+        sinuosity = routing.get("median_sampled_sinuosity")
+        if sinuosity is not None and direction_count > 0:
+            sinuosity_values.append((float(sinuosity), direction_count))
+
+        land_area += float(meta.get("land_area_m2", 0.0))
+        mountain_1500_area += float(
+            meta.get("mountain_area_above_1500_m_m2", 0.0)
+        )
+        mountain_2500_area += float(
+            meta.get("mountain_area_above_2500_m_m2", 0.0)
+        )
+        rugged_area += float(
+            meta.get("rugged_land_area_slope_ge_10deg_m2", 0.0)
+        )
 
         fs = meta.get("procedural_finest_samples_per_wavelength")
         cw = meta.get("procedural_coarsest_wavelength_m")
@@ -1138,49 +1282,111 @@ def audit_ultra_resolution(
             finest_samples.append(float(fs))
         if cw is not None:
             coarsest_wavelengths.append(float(cw))
+
         rows.append(
             {
                 "key": asdict(key),
-                "residual_high_frequency_rms_m": band_rms,
+                "elevation_high_frequency_rms_m": band_rms,
                 "physical_erosion_rms_m": p_rms,
                 "procedural_detail_rms_m": q_rms,
+                "tectonic_microdetail_rms_m": m_rms,
                 "sediment_closure_relative": closure,
                 "procedural_finest_samples_per_wavelength": fs,
                 "procedural_coarsest_wavelength_m": cw,
-                "procedural_finest_wavelength_m": meta.get("procedural_finest_wavelength_m"),
-                "simultaneous": bool(meta.get("legacy_and_procedural_simultaneous", False)),
+                "procedural_finest_wavelength_m": meta.get(
+                    "procedural_finest_wavelength_m"
+                ),
+                "final_routing_metrics": routing,
+                "simultaneous": bool(
+                    meta.get("legacy_and_procedural_simultaneous", False)
+                ),
             }
         )
 
     seam_max = _same_face_seam_max(pyramid, plan.finest_level)
-    aggregate_physical = float(np.sqrt(np.mean(np.square(physical_rms)))) if physical_rms else 0.0
-    aggregate_procedural = float(np.sqrt(np.mean(np.square(procedural_rms)))) if procedural_rms else 0.0
-    aggregate_band = float(np.sqrt(np.mean(np.square(residual_band_energy)))) if residual_band_energy else 0.0
-    min_finest_samples = min(finest_samples) if finest_samples else float("inf")
-    max_finest_samples = max(finest_samples) if finest_samples else 0.0
-    max_coarsest = max(coarsest_wavelengths) if coarsest_wavelengths else 0.0
+    seam_gradient_rms = _same_face_seam_gradient_rms(
+        pyramid, plan.finest_level
+    )
+    aggregate_physical = (
+        float(np.sqrt(np.mean(np.square(physical_rms))))
+        if physical_rms else 0.0
+    )
+    aggregate_procedural = (
+        float(np.sqrt(np.mean(np.square(procedural_rms))))
+        if procedural_rms else 0.0
+    )
+    aggregate_microdetail = (
+        float(np.sqrt(np.mean(np.square(microdetail_rms))))
+        if microdetail_rms else 0.0
+    )
+    aggregate_band = (
+        float(np.sqrt(np.mean(np.square(residual_band_energy))))
+        if residual_band_energy else 0.0
+    )
+    min_finest_samples = (
+        min(finest_samples) if finest_samples else float("inf")
+    )
+    max_finest_samples = (
+        max(finest_samples) if finest_samples else 0.0
+    )
+    max_coarsest = (
+        max(coarsest_wavelengths) if coarsest_wavelengths else 0.0
+    )
+
+    terrain_grid_anisotropy = (
+        abs(complex(terrain_grid_real, terrain_grid_imag))
+        / max(terrain_grid_weight, 1.0e-30)
+    )
+    river_grid_anisotropy = (
+        abs(complex(river_grid_real, river_grid_imag))
+        / max(river_direction_count, 1)
+    )
+    turn_fraction = (
+        turn_weighted / max(turn_transition_count, 1)
+    )
+    if sinuosity_values:
+        sinuosity_num = sum(value * weight for value, weight in sinuosity_values)
+        sinuosity_den = sum(weight for _value, weight in sinuosity_values)
+        mean_tile_median_sinuosity = sinuosity_num / max(sinuosity_den, 1)
+    else:
+        mean_tile_median_sinuosity = None
+
+    mountain_1500_fraction = mountain_1500_area / max(land_area, 1.0)
+    mountain_2500_fraction = mountain_2500_area / max(land_area, 1.0)
+    rugged_fraction = rugged_area / max(land_area, 1.0)
 
     checks = {
         "base_linear_resolution_at_least_requested": (
             plan.actual_base_multiplier + 1.0e-9 >= cfg.base_linear_multiplier
         ),
         "subsection_resolution_at_least_requested": (
-            plan.actual_subsection_multiplier + 1.0e-9 >= cfg.subsection_linear_multiplier
+            plan.actual_subsection_multiplier + 1.0e-9
+            >= cfg.subsection_linear_multiplier
         ),
-        "new_high_frequency_terrain_exists": aggregate_band > 0.02,
+        "native_heightmap_bandwidth_saturated": (
+            0.90 <= feature_pixels <= 1.15
+        ),
+        "new_high_frequency_terrain_exists": aggregate_band > 0.25,
+        "tectonic_microdetail_active": aggregate_microdetail > 1.0,
+        "terrain_square_grid_imprint_below_limit": (
+            terrain_grid_anisotropy < 0.28
+        ),
         "legacy_erosion_active": aggregate_physical > 1.0e-5,
         "procedural_erosion_active": aggregate_procedural > 1.0e-5,
         "legacy_and_procedural_overlap_on_active_tiles": (
             simultaneous >= max(1, int(0.20 * max(active_tiles, 1)))
         ),
-        "procedural_not_below_sampling_limit": min_finest_samples >= (
-            cfg.min_samples_per_wavelength - 1.0e-5
+        "procedural_not_below_sampling_limit": (
+            min_finest_samples >= cfg.min_samples_per_wavelength - 1.0e-5
         ),
-        "procedural_reaches_finest_safe_band": max_finest_samples <= (
-            cfg.min_samples_per_wavelength * cfg.procedural_lacunarity + 1.0e-3
+        "procedural_reaches_finest_safe_band": (
+            max_finest_samples
+            <= cfg.min_samples_per_wavelength
+            * cfg.procedural_lacunarity
+            + 1.0e-3
         ),
-        "procedural_does_not_overlap_source_resolved_band": max_coarsest <= (
-            source_limit_m * (1.0 + 1.0e-6)
+        "procedural_does_not_overlap_source_resolved_band": (
+            max_coarsest <= source_limit_m * (1.0 + 1.0e-6)
         ),
         "procedural_band_reaches_target_resolution": (
             min(
@@ -1191,31 +1397,81 @@ def audit_ultra_resolution(
                 ),
                 default=float("inf"),
             )
-            <= fine_limit_m * cfg.procedural_lacunarity * (1.0 + 1.0e-6)
+            <= fine_limit_m
+            * cfg.procedural_lacunarity
+            * (1.0 + 1.0e-6)
         ),
         "procedural_magnitude_not_overwhelming_legacy": (
             aggregate_procedural <= max(aggregate_physical * 3.0, 0.25)
         ),
+        "final_rivers_exist": river_direction_count > 100,
+        "river_square_grid_imprint_below_limit": river_grid_anisotropy < 0.58,
+        "rivers_turn_at_resolved_scale": turn_fraction > 0.025,
+        "river_straight_runs_bounded": max_straight_run <= 220,
+        "rivers_have_resolved_sinuosity": (
+            mean_tile_median_sinuosity is not None
+            and mean_tile_median_sinuosity >= 1.015
+        ),
+        "mountain_area_present": mountain_1500_fraction >= 0.08,
+        "high_mountain_area_present": mountain_2500_fraction >= 0.015,
+        "rugged_mountain_relief_present": rugged_fraction >= 0.002,
         "sediment_mass_closure": closure_max <= 1.0e-8,
         "same_face_tile_seams_watertight": seam_max <= 1.0e-5,
+        "same_face_derivative_seams_bounded": seam_gradient_rms <= 80.0,
     }
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "plan": asdict(plan),
         "derived_geomorphology_spec": asdict(geomorphology_spec),
         "sampling": {
             "source_safe_min_wavelength_m": float(source_limit_m),
             "finest_safe_min_wavelength_m": float(fine_limit_m),
-            "minimum_samples_per_wavelength": float(cfg.min_samples_per_wavelength),
+            "minimum_samples_per_wavelength": float(
+                cfg.min_samples_per_wavelength
+            ),
+            "native_output_resolution": [
+                native_output_width, native_output_height
+            ],
+            "native_output_equatorial_m_per_pixel": float(
+                native_output_m_per_pixel
+            ),
+            "terrain_finest_wavelength_m": float(
+                terrain_finest_wavelength_m
+            ),
+            "terrain_minimum_feature_half_wave_m": float(
+                terrain_min_feature_width_m
+            ),
+            "minimum_feature_width_in_native_output_pixels": float(
+                feature_pixels
+            ),
         },
         "aggregate": {
             "active_tiles": active_tiles,
             "simultaneous_legacy_and_procedural_tiles": simultaneous,
-            "high_frequency_residual_rms_m": aggregate_band,
+            "elevation_high_frequency_rms_m": aggregate_band,
+            "tectonic_microdetail_rms_m": aggregate_microdetail,
+            "terrain_square_grid_fourfold_anisotropy": float(
+                terrain_grid_anisotropy
+            ),
             "legacy_physical_erosion_rms_m": aggregate_physical,
             "procedural_detail_rms_m": aggregate_procedural,
+            "river_square_grid_fourfold_anisotropy": float(
+                river_grid_anisotropy
+            ),
+            "river_stream_direction_count": int(river_direction_count),
+            "river_turn_fraction_gt10deg": float(turn_fraction),
+            "river_max_straight_run_cells": int(max_straight_run),
+            "river_mean_tile_median_sinuosity": (
+                None
+                if mean_tile_median_sinuosity is None
+                else float(mean_tile_median_sinuosity)
+            ),
+            "land_fraction_above_1500_m": float(mountain_1500_fraction),
+            "land_fraction_above_2500_m": float(mountain_2500_fraction),
+            "rugged_land_fraction_slope_ge_10deg": float(rugged_fraction),
             "max_sediment_closure_relative": closure_max,
             "same_face_seam_max_abs_m": seam_max,
+            "same_face_seam_gradient_rms_m": seam_gradient_rms,
             "min_finest_samples_per_wavelength": (
                 None if not finest_samples else min_finest_samples
             ),
@@ -1229,7 +1485,9 @@ def audit_ultra_resolution(
     _atomic_json(out, report)
     if not report["all_checks_passed"]:
         failed = [name for name, passed in checks.items() if not passed]
-        raise RuntimeError("ultra-resolution terrain audit failed: " + ", ".join(failed))
+        raise RuntimeError(
+            "ultra-resolution terrain audit failed: " + ", ".join(failed)
+        )
     return report
 
 
