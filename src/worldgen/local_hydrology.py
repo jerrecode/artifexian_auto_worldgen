@@ -657,6 +657,7 @@ def _meander_phase(
     seed: int,
     variant: int = 0,
     minimum_wavelength_m: float = 0.0,
+    flow_angle_rad: np.ndarray | None = None,
 ) -> np.ndarray:
     """Absolute-coordinate meander phase with adaptive multi-scale variants.
 
@@ -684,7 +685,42 @@ def _meander_phase(
         )
         return tangent
 
-    tangent0 = tangent_from_axis(rng.normal(size=3))
+    streamwise: np.ndarray | None = None
+    if flow_angle_rad is not None:
+        flow_angle = np.asarray(flow_angle_rad, dtype=np.float64)
+        if flow_angle.shape != q.shape:
+            raise ValueError("flow_angle_rad must match discharge_index")
+        z_axis = np.zeros_like(unit)
+        z_axis[..., 2] = 1.0
+        east = np.cross(z_axis, unit)
+        east_norm = np.linalg.norm(east, axis=-1, keepdims=True)
+        polar = east_norm[..., 0] < 1.0e-8
+        if np.any(polar):
+            fallback_axis = np.zeros_like(unit)
+            fallback_axis[..., 1] = 1.0
+            east[polar] = np.cross(fallback_axis[polar], unit[polar])
+            east_norm = np.linalg.norm(east, axis=-1, keepdims=True)
+        east /= np.maximum(east_norm, 1.0e-15)
+        south = -np.cross(unit, east)
+
+        valid_angle = np.isfinite(flow_angle)
+        # D16 angle is atan2(dy, dx): dy is local south and dx local east.
+        streamwise = (
+            np.sin(np.where(valid_angle, flow_angle, 0.0))[..., None] * south
+            + np.cos(np.where(valid_angle, flow_angle, 0.0))[..., None] * east
+        )
+        streamwise /= np.maximum(
+            np.linalg.norm(streamwise, axis=-1, keepdims=True),
+            1.0e-12,
+        )
+        fallback = tangent_from_axis(rng.normal(size=3))
+        streamwise = np.where(valid_angle[..., None], streamwise, fallback)
+
+    tangent0 = (
+        streamwise
+        if streamwise is not None
+        else tangent_from_axis(rng.normal(size=3))
+    )
     wavelength0_km = 18.0 + 165.0 * np.power(q, 0.72)
     _c0, s0, coh0 = phase_cell_octave_xyz(
         unit,
@@ -699,7 +735,11 @@ def _meander_phase(
     if int(variant) <= 0:
         return primary
 
-    tangent1 = tangent_from_axis(rng.normal(size=3))
+    tangent1 = (
+        streamwise
+        if streamwise is not None
+        else tangent_from_axis(rng.normal(size=3))
+    )
     wavelength_floor_km = max(float(minimum_wavelength_m), 0.0) / 1000.0
     wavelength1_km = np.maximum(
         (
@@ -723,7 +763,11 @@ def _meander_phase(
     if int(variant) == 1:
         return np.clip(0.55 * primary + 0.80 * short, -1.0, 1.0)
 
-    tangent2 = tangent_from_axis(rng.normal(size=3))
+    tangent2 = (
+        streamwise
+        if streamwise is not None
+        else tangent_from_axis(rng.normal(size=3))
+    )
     wavelength2_km = np.maximum(
         3.5 + 20.0 * np.power(q, 0.52),
         wavelength_floor_km,
@@ -1366,6 +1410,30 @@ class LocalHydrologySolver:
         )
         local0 = _normalize_log(discharge0, ~ocean)
         base_angle = _flow_angles(code0)
+        valid_base_angle = np.isfinite(base_angle)
+        phase_weight = ndimage.gaussian_filter(
+            valid_base_angle.astype(np.float64),
+            sigma=2.0,
+            mode="nearest",
+        )
+        phase_cos = ndimage.gaussian_filter(
+            np.where(valid_base_angle, np.cos(base_angle), 0.0),
+            sigma=2.0,
+            mode="nearest",
+        )
+        phase_sin = ndimage.gaussian_filter(
+            np.where(valid_base_angle, np.sin(base_angle), 0.0),
+            sigma=2.0,
+            mode="nearest",
+        )
+        smoothed_flow_angle = np.where(
+            phase_weight > 1.0e-6,
+            np.arctan2(
+                phase_sin / np.maximum(phase_weight, 1.0e-12),
+                phase_cos / np.maximum(phase_weight, 1.0e-12),
+            ),
+            base_angle,
+        )
         parent_discharge = self._parent_discharge_patch(geom)
         sample_m = approximate_meters_per_sample(
             self.pyramid.planet_radius_m,
@@ -1384,6 +1452,7 @@ class LocalHydrologySolver:
                 minimum_wavelength_m=(
                     corrective_min_wavelength_m if attempt > 0 else 0.0
                 ),
+                flow_angle_rad=smoothed_flow_angle,
             )
             slope_factor = np.exp(
                 -np.maximum(best_slope0, 0.0)
@@ -1546,6 +1615,7 @@ class LocalHydrologySolver:
             "adaptive_meander_min_wavelength_m": float(
                 corrective_min_wavelength_m
             ),
+            "meander_phase_axis": "smoothed local streamwise flow direction",
             "routing_candidate_metrics": [
                 {
                     "attempt": int(candidate["attempt"]),
