@@ -723,14 +723,14 @@ def _smoothed_flow_tangent_xyz(
     sigma = max(float(sigma_cells), 0.0)
     if sigma > 0.0:
         tangent = np.stack(
-            (
+            [
                 ndimage.gaussian_filter(
                     tangent[..., component],
                     sigma=sigma,
                     mode="nearest",
                 )
                 for component in range(3)
-            ),
+            ],
             axis=-1,
         )
 
@@ -784,7 +784,7 @@ def _meander_phase(
             - np.sum(unit * axis, axis=-1, keepdims=True) * unit
         )
     else:
-        phase_direction = np.asarray(flow_tangent_xyz, dtype=np.float64)
+        phase_direction = np.asarray(flow_tangent_xyz, dtype=np.float64).copy()
         if phase_direction.shape != unit.shape:
             raise ValueError("flow_tangent_xyz must match xyz")
 
@@ -800,6 +800,12 @@ def _meander_phase(
     fallback = fallback_axis - (
         np.sum(unit * fallback_axis, axis=-1, keepdims=True) * unit
     )
+    fallback_norm = np.linalg.norm(fallback, axis=-1, keepdims=True)
+    alternate_axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    alternate = alternate_axis - (
+        np.sum(unit * alternate_axis, axis=-1, keepdims=True) * unit
+    )
+    fallback = np.where(fallback_norm > 1.0e-10, fallback, alternate)
     phase_direction = np.where(norm > 1.0e-10, phase_direction, fallback)
     phase_direction /= np.maximum(
         np.linalg.norm(phase_direction, axis=-1, keepdims=True),
