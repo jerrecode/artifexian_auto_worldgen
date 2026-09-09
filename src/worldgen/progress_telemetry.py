@@ -94,6 +94,9 @@ class HierarchicalProgressTracker:
             "substep": defaultdict(list),
             "processing_step": defaultdict(list),
         }
+        self._subsubsteps_by_parent: dict[str, list[float]] = defaultdict(list)
+        self._attempt_started_monotonic = time.monotonic()
+        self._attempt_started_unix = time.time()
         self._all_samples: dict[str, list[float]] = {
             "subsubstep": [],
             "substep": [],
@@ -134,6 +137,10 @@ class HierarchicalProgressTracker:
                 continue
             self._samples[level][name].append(value)
             self._all_samples[level].append(value)
+            if level == "subsubstep":
+                parent = event.get("parent")
+                if parent is not None:
+                    self._subsubsteps_by_parent[str(parent)].append(value)
 
     def configure_substeps(self, *, completed: int, total: int, resumed: int = 0) -> None:
         with self._lock:
@@ -233,6 +240,8 @@ class HierarchicalProgressTracker:
             if active.level in self._samples:
                 self._samples[active.level][active.name].append(duration)
                 self._all_samples[active.level].append(duration)
+                if active.level == "subsubstep" and active.parent is not None:
+                    self._subsubsteps_by_parent[active.parent].append(duration)
             if active.level == "subsubstep":
                 self._completed_subsubsteps += 1
             elif active.level == "substep":
@@ -320,16 +329,29 @@ class HierarchicalProgressTracker:
         if active_phase is not None:
             token, item = active_phase
             elapsed = max(now - item.started_monotonic, 0.0)
+            parent_mean = (
+                _mean(self._subsubsteps_by_parent.get(item.parent, []))
+                if item.parent is not None
+                else None
+            )
             same_phase = _mean(self._samples["subsubstep"].get(item.name, []))
-            expected = same_phase if same_phase is not None else avg_subsub
+            expected = (
+                parent_mean
+                if parent_mean is not None
+                else same_phase
+                if same_phase is not None
+                else avg_subsub
+            )
             remaining = None if expected is None else max(expected - elapsed, 0.0)
             phase_payload = {
                 "token": token,
                 "name": item.name,
                 "parent": item.parent,
                 "elapsed_seconds": elapsed,
+                "mean_current_substep_subsubsteps_seconds": parent_mean,
                 "mean_same_phase_seconds": same_phase,
                 "mean_all_subsubsteps_seconds": avg_subsub,
+                "expected_duration_seconds": expected,
                 "eta_seconds": remaining,
             }
 
@@ -394,8 +416,11 @@ class HierarchicalProgressTracker:
             tail = avg_process * future_processing_steps
             whole_job_eta = tail if whole_job_eta is None else whole_job_eta + tail
 
+        attempt_elapsed = max(time.monotonic() - self._attempt_started_monotonic, 0.0)
         return {
             "scope": self.scope,
+            "attempt_started_unix": self._attempt_started_unix,
+            "attempt_elapsed_seconds": attempt_elapsed,
             "current_processing_step": self._current_processing_step,
             "parallelism": self.parallelism,
             "counts": {
@@ -418,6 +443,7 @@ class HierarchicalProgressTracker:
                 "current_processing_step_from_subsubsteps": step_eta_from_subsubsteps,
                 "current_processing_step_from_substeps": step_eta_from_substeps,
                 "current_processing_step": processing_step_eta,
+                "current_shard": whole_job_eta,
                 "whole_job": whole_job_eta,
             },
         }
@@ -470,6 +496,7 @@ class HierarchicalProgressTracker:
             [
                 "step_eta="
                 + self._fmt(etas["current_processing_step"]),
+                "shard_eta=" + self._fmt(etas["current_shard"]),
                 "job_eta=" + self._fmt(etas["whole_job"]),
             ]
         )
