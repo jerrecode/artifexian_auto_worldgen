@@ -1512,7 +1512,55 @@ def reconstruct_fullview_maps(
     )
     _remove_fullview_temp(native_drainage, native_discharge, native_streams)
 
+    # Emit the high-precision native height product before climate/surface
+    # materialization so z3 elevation can be released immediately afterwards.
+    native_elev_km = sample(
+        "native_elevation_km",
+        lambda key: _geomorph_path(pyramid, "elevation_m", key),
+        dtype="float64",
+        width=native_width,
+        height=native_height,
+        value_scale=0.001,
+    )
+    native_tiff = output / "01b_terrain_heightmap_grayscale32_native.tif"
+    native_tiff_meta = output / "01b_terrain_heightmap_grayscale32_native.json"
+    native_height_meta = write_heightmap_tiff32(
+        native_tiff,
+        np.load(native_elev_km, mmap_mode="r", allow_pickle=False),
+        metadata_path=native_tiff_meta,
+        chunk_rows=96,
+    )
+    manifest.append({
+        "file": native_tiff.name,
+        "metadata_file": native_tiff_meta.name,
+        "title": "Native final terrain heightmap",
+        "encoding": (
+            "single-channel min-is-black uint32 BigTIFF; global min->0 "
+            "global max->4294967295"
+        ),
+        "channels": 1,
+        "bits_per_sample": 32,
+        "quantization_step_m": float(native_height_meta["quantization_step_m"]),
+        "resolution": [native_width, native_height],
+    })
+    _remove_fullview_temp(native_elev_km)
+
     if cleanup_heavy_solver_caches:
+        # Ordinary 8192 scratch arrays above now contain everything still needed
+        # for terrain/erosion rendering. Climate uses reconstructed z1 elevation,
+        # so the multi-gigabyte z3 source fields can be released here.
+        for field in (
+            "elevation_m",
+            "erosion_m",
+            "procedural_detail_m",
+            "final_drainage_area_km2",
+            "final_discharge_index",
+            "final_streams",
+        ):
+            shutil.rmtree(
+                pyramid.root / "derived" / "local_geomorphology_v1" / field,
+                ignore_errors=True,
+            )
         shutil.rmtree(pyramid.root / "derived" / "local_hydrology_v1", ignore_errors=True)
         shutil.rmtree(pyramid.root / "derived" / "river_constraints_v1", ignore_errors=True)
 
@@ -1556,39 +1604,6 @@ def reconstruct_fullview_maps(
         "resolution": [plan.fullview_width, plan.fullview_height],
     })
 
-    # Authoritative high-precision grayscale deliverable. The z3 terrain is
-    # reprojected at 2x the ordinary fullview, which makes the audited four-z3-
-    # sample minimum wavelength a ~2-pixel wave / ~1-pixel half-wave.
-    native_elev_km = sample(
-        "native_elevation_km",
-        lambda key: _geomorph_path(pyramid, "elevation_m", key),
-        dtype="float64",
-        width=native_width,
-        height=native_height,
-        value_scale=0.001,
-    )
-    native_tiff = output / "01b_terrain_heightmap_grayscale32_native.tif"
-    native_tiff_meta = output / "01b_terrain_heightmap_grayscale32_native.json"
-    native_height_meta = write_heightmap_tiff32(
-        native_tiff,
-        np.load(native_elev_km, mmap_mode="r", allow_pickle=False),
-        metadata_path=native_tiff_meta,
-        chunk_rows=96,
-    )
-    manifest.insert(2, {
-        "file": native_tiff.name,
-        "metadata_file": native_tiff_meta.name,
-        "title": "Native final terrain heightmap",
-        "encoding": (
-            "single-channel min-is-black uint32 BigTIFF; global min->0 "
-            "global max->4294967295"
-        ),
-        "channels": 1,
-        "bits_per_sample": 32,
-        "quantization_step_m": float(native_height_meta["quantization_step_m"]),
-        "resolution": [native_width, native_height],
-    })
-    _remove_fullview_temp(native_elev_km)
     manifest.insert(2, _render_scalar(
         elev,
         output / "02_elevation_heatmap.png",
