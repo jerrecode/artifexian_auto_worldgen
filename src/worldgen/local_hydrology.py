@@ -507,6 +507,7 @@ def _flow_d16_open(
     *,
     preferred_angle_rad: np.ndarray | None = None,
     steering_weight: np.ndarray | None = None,
+    reference_best_slope: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Steepest-descent routing on a 16-direction queen+knight stencil.
 
@@ -514,7 +515,10 @@ def _flow_d16_open(
     only when at least one raster corridor between the source and target remains
     below the source elevation, preventing the router from jumping across a ridge.
     Optional steering rotates the preferred direction on low-gradient, high-
-    discharge reaches while every receiver remains strictly downhill.
+    discharge reaches while every receiver remains strictly downhill. When an
+    unsteered reference slope field is supplied, steering selects among plausible
+    downhill alternatives using a geometric slope/direction blend to prevent
+    long D16 lattice locking on meander-eligible reaches.
     """
     z = np.asarray(filled_elevation_m, dtype=np.float64)
     oc = np.asarray(ocean, dtype=bool)
@@ -536,6 +540,13 @@ def _flow_d16_open(
         raise ValueError("preferred_angle_rad must match elevation")
     if steer.shape != z.shape:
         raise ValueError("steering_weight must match elevation")
+    reference_slope = (
+        None
+        if reference_best_slope is None
+        else np.asarray(reference_best_slope, dtype=np.float64)
+    )
+    if reference_slope is not None and reference_slope.shape != z.shape:
+        raise ValueError("reference_best_slope must match elevation")
 
     best_score = np.zeros((h, w), dtype=np.float64)
     best_slope = np.zeros((h, w), dtype=np.float64)
@@ -588,10 +599,48 @@ def _flow_d16_open(
                     )
                 )
             )
-            alignment = np.square(0.5 + 0.5 * np.cos(delta))
+            alignment = np.square(
+                np.clip(0.5 + 0.5 * np.cos(delta), 1.0e-6, 1.0)
+            )
             sw = steer[sy0:sy1, sx0:sx1]
-            directional = (1.0 - sw) + sw * (0.10 + 0.90 * alignment)
-            score *= directional
+
+            if reference_slope is not None:
+                # The unsteered D16 pass supplies the locally steepest admissible
+                # downhill slope. Meander steering may choose a different route,
+                # but only among genuinely downhill alternatives that retain a
+                # substantial fraction of that slope. A geometric blend makes
+                # high-meander alluvial reaches responsive to the continuously
+                # varying preferred angle without allowing uphill motion.
+                ref = np.maximum(
+                    reference_slope[sy0:sy1, sx0:sx1],
+                    1.0e-15,
+                )
+                relative_slope = np.clip(slope / ref, 0.0, 1.0)
+                effective_sw = np.clip(1.30 * sw, 0.0, 0.92)
+                minimum_relative_slope = np.clip(
+                    1.0 - 0.70 * effective_sw,
+                    0.35,
+                    1.0,
+                )
+                valid &= relative_slope >= minimum_relative_slope
+                slope_factor = np.power(
+                    np.maximum(relative_slope, 1.0e-12),
+                    1.0 - effective_sw,
+                )
+                direction_factor = np.power(
+                    alignment,
+                    effective_sw,
+                )
+                score = np.where(
+                    valid,
+                    slope_factor * direction_factor,
+                    0.0,
+                )
+            else:
+                # Backward-compatible one-pass steering when no raw-slope
+                # reference is supplied.
+                directional = (1.0 - sw) + sw * (0.10 + 0.90 * alignment)
+                score *= directional
 
         view_best = best_score[sy0:sy1, sx0:sx1]
         better = score > view_best
@@ -1256,6 +1305,7 @@ class LocalHydrologySolver:
             self.pyramid.planet_radius_m,
             preferred_angle_rad=preferred,
             steering_weight=meander,
+            reference_best_slope=best_slope0,
         )
         drainage, discharge = _accumulate_open(
             filled, receiver, runoff, area, ocean
