@@ -953,51 +953,6 @@ def generate_finest_geomorphology(
             local_solver = solver()
             local_solver.solve(key)
 
-        # Keep only fields required by final scientific products/audits.  These
-        # retained fields are the durable restart authority for this tile.
-        for field in (
-            "deposition_m",
-            "hillslope_adjustment_m",
-            "procedural_coherence",
-            "tectonic_microdetail_m",
-            "channel_incision_m",
-            "final_flow_direction_d16",
-            "final_meander_potential",
-            "major_river_constraint",
-        ):
-            local_solver._path(key, field).unlink(missing_ok=True)
-
-        for field in (
-            "filled_elevation_m",
-            "flow_direction_d8",
-            "flow_direction_d16",
-            "flow_angle_rad",
-            "meander_potential",
-            "runoff_mm_year",
-            "drainage_area_km2",
-            "discharge_index",
-            "streams",
-            "inherited_major_river",
-        ):
-            local_solver.hydrology._path(key, field).unlink(missing_ok=True)
-        local_solver.hydrology._metadata_path(key).unlink(missing_ok=True)
-
-        for field in (
-            "major_river_mask",
-            "parent_stream_order",
-            "parent_discharge_index",
-            "parent_width_proxy",
-            "constraint_strength",
-            "channel_floor_m",
-        ):
-            local_solver.rivers._path(key, field).unlink(missing_ok=True)
-        local_solver.rivers._metadata_path(key).unlink(missing_ok=True)
-
-        # Base elevation can always be re-evaluated exactly from global authority +
-        # absolute-coordinate microrelief; do not retain a second tile copy.
-        pyramid._field_path(key, "elevation_m").unlink(missing_ok=True)
-        pyramid._metadata_path(key).unlink(missing_ok=True)
-
             cleanup_token = f"{tile_id}:cleanup_checkpoint"
             telemetry.begin(
                 "subsubstep",
@@ -1008,6 +963,52 @@ def generate_finest_geomorphology(
                 total=9,
                 meta={"tile": tile_id},
             )
+
+            # Keep only fields required by final scientific products/audits. These
+            # retained fields are the durable restart authority for this tile.
+            for field in (
+                "deposition_m",
+                "hillslope_adjustment_m",
+                "procedural_coherence",
+                "tectonic_microdetail_m",
+                "channel_incision_m",
+                "final_flow_direction_d16",
+                "final_meander_potential",
+                "major_river_constraint",
+            ):
+                local_solver._path(key, field).unlink(missing_ok=True)
+
+            for field in (
+                "filled_elevation_m",
+                "flow_direction_d8",
+                "flow_direction_d16",
+                "flow_angle_rad",
+                "meander_potential",
+                "runoff_mm_year",
+                "drainage_area_km2",
+                "discharge_index",
+                "streams",
+                "inherited_major_river",
+            ):
+                local_solver.hydrology._path(key, field).unlink(missing_ok=True)
+            local_solver.hydrology._metadata_path(key).unlink(missing_ok=True)
+
+            for field in (
+                "major_river_mask",
+                "parent_stream_order",
+                "parent_discharge_index",
+                "parent_width_proxy",
+                "constraint_strength",
+                "channel_floor_m",
+            ):
+                local_solver.rivers._path(key, field).unlink(missing_ok=True)
+            local_solver.rivers._metadata_path(key).unlink(missing_ok=True)
+
+            # Base elevation can always be re-evaluated exactly from global authority +
+            # absolute-coordinate microrelief; do not retain a second tile copy.
+            pyramid._field_path(key, "elevation_m").unlink(missing_ok=True)
+            pyramid._metadata_path(key).unlink(missing_ok=True)
+
             if not _tile_resume_valid(
                 pyramid,
                 key,
@@ -1016,12 +1017,13 @@ def generate_finest_geomorphology(
                 repair_marker=True,
             ):
                 raise RuntimeError(f"completed tile failed restart validation: {key!r}")
+
             telemetry.end(cleanup_token, meta={"tile": tile_id})
             telemetry.end(tile_token, meta={"tile": tile_id})
             return key
         except Exception:
-            # Leave active spans visible in the final telemetry snapshot.  The
-            # checkpoint validator on the next run decides whether the tile can resume.
+            # Active spans remain visible in the persisted telemetry snapshot.
+            # On retry, restart validation decides whether this tile is reusable.
             raise
 
     def publish(last: TileKey | None, state: str) -> None:
