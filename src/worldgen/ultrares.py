@@ -58,8 +58,11 @@ class UltraResolutionTilePyramid(PlanetTilePyramid):
     same global field for every one of the 96 deepest tiles.
     """
 
+    authority_sampling_revision = "metric-isotropic-elevation-v1"
+
     def __init__(self, *args, **kwargs) -> None:
         self._ultra_source_cache: dict[str, np.ndarray] = {}
+        self._ultra_derived_source_cache: dict[str, np.ndarray] = {}
         super().__init__(*args, **kwargs)
 
     def _load_source_array(self, name: str) -> np.ndarray:
@@ -74,6 +77,78 @@ class UltraResolutionTilePyramid(PlanetTilePyramid):
             values = np.asarray(z[name])
         self._ultra_source_cache[name] = values
         return values
+
+    def _metric_isotropic_elevation_source(self) -> np.ndarray:
+        """Return elevation prefiltered to an approximately isotropic physical bandwidth.
+
+        The global authority is stored on an equirectangular grid.  Its east-west
+        cell spacing shrinks with cos(latitude), while north-south spacing does not.
+        Direct bilinear sampling therefore exposes progressively finer zonal
+        wavelengths toward the poles than the source can resolve meridionally.
+        A row-wise periodic Gaussian in Fourier space equalizes that bandwidth
+        before cube-sphere sampling.  Row means are exactly preserved.
+        """
+        cache_key = "metric_isotropic_elevation_km_v1"
+        cached = self._ultra_derived_source_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        source = np.asarray(self._load_source_array("elevation_km"), dtype=np.float64)
+        if source.ndim != 2:
+            self._ultra_derived_source_cache[cache_key] = source
+            return source
+
+        h, w = source.shape
+        if h < 2 or w < 4:
+            self._ultra_derived_source_cache[cache_key] = source
+            return source
+
+        latitude_rad = np.deg2rad(
+            90.0 - (np.arange(h, dtype=np.float64) + 0.5) * (180.0 / float(h))
+        )
+        cos_lat = np.maximum(np.abs(np.cos(latitude_rad)), 1.0e-6)
+        # Ratio of meridional sample spacing to zonal sample spacing.
+        spacing_ratio = (float(w) / (2.0 * float(h))) / cos_lat
+        # Half-cell Gaussian scale: enough to suppress frequencies that exist only
+        # because longitude pixels crowd together physically near the poles while
+        # retaining equatorial authority essentially unchanged.
+        sigma_x = 0.5 * np.sqrt(np.maximum(np.square(spacing_ratio) - 1.0, 0.0))
+        sigma_x = np.minimum(sigma_x, float(w) / 4.0)
+
+        omega = 2.0 * np.pi * np.fft.rfftfreq(w)
+        spectrum = np.fft.rfft(source, axis=-1)
+        damping = np.exp(
+            -0.5 * np.square(sigma_x[:, None] * omega[None, :])
+        )
+        filtered = np.fft.irfft(spectrum * damping, n=w, axis=-1)
+        filtered = np.asarray(filtered, dtype=np.float64)
+        # FFT round-off should not alter the exact row mean used by the global
+        # authority. Correct that tiny residual explicitly.
+        filtered += (
+            np.mean(source, axis=-1, keepdims=True)
+            - np.mean(filtered, axis=-1, keepdims=True)
+        )
+        self._ultra_derived_source_cache[cache_key] = filtered
+        return filtered
+
+    def _sample_source_field(self, field: str, geom: TileGeometry) -> np.ndarray:
+        if field != "elevation_m" or self.source_kind != "base_npz":
+            return super()._sample_source_field(field, geom)
+        (h, w), source_fields = self._source_metadata()
+        if "elevation_km" not in source_fields:
+            raise KeyError(
+                "source field 'elevation_km' is not present in selected source level "
+                f"{self.source_level}"
+            )
+        sy, sx = self._source_coordinates(geom)
+        sampled = self._sample_array(
+            self._metric_isotropic_elevation_source(),
+            sy=sy,
+            sx=sx,
+            source_shape=(h, w),
+            mode="linear",
+        )
+        return np.asarray(sampled, dtype=np.float64) * 1000.0
 
     def _source_hash(self) -> str:
         """Prefer the stable semantic authority fingerprint when available."""
@@ -768,6 +843,13 @@ def _tile_resume_valid(
         return False
     if metadata.get("spec") != expected_spec:
         return False
+    expected_sampling_revision = getattr(
+        pyramid,
+        "authority_sampling_revision",
+        "legacy",
+    )
+    if metadata.get("authority_sampling_revision") != expected_sampling_revision:
+        return False
 
     expected_shape = (int(pyramid.spec.tile_size) + 1,) * 2
     expected_dtypes = {
@@ -796,6 +878,7 @@ def _tile_resume_valid(
         "schema_version": 1,
         "key": asdict(key),
         "source_sha256": expected_source,
+        "authority_sampling_revision": expected_sampling_revision,
         "geomorphology_spec": expected_spec,
         "retained_fields": list(ULTRARES_RESUME_FIELDS),
         "tile_size": int(pyramid.spec.tile_size),
@@ -1976,7 +2059,13 @@ def _prepare_ultra_resolution(
                 ),
                 "restart": (
                     "deepest tiles are independently checkpointed after retained scientific "
-                    "outputs are validated against the exact source hash and geomorphology spec"
+                    "outputs are validated against the exact source hash, authority sampling "
+                    "revision and geomorphology spec"
+                ),
+                "source_antialiasing": (
+                    "equirectangular source elevation is row-wise low-pass filtered in "
+                    "longitude to approximately equalize physical east-west and north-south "
+                    "bandwidth before cube-sphere sampling"
                 ),
             },
         },
