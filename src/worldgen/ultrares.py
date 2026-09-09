@@ -662,10 +662,57 @@ def generate_finest_geomorphology(
         return value
 
     def run_one(key: TileKey) -> TileKey:
-        # With TilePyramidSpec.elevation_detail_strength=0 this is strictly the
-        # inherited source terrain before the two erosion operators add new detail.
+        # The base tile already contains seamless absolute-XYZ tectonic microrelief.
+        # Hydrology/geomorphology then consume that field at native LOD.
         pyramid.generate_tile(key, ("elevation_m",))
-        solver().solve(key)
+        local_solver = solver()
+        local_solver.solve(key)
+
+        # z3 contains 384 x 1025² tiles. Keep only fields required by the final
+        # scientific products/audit and delete reproducible scratch state per tile,
+        # otherwise temporary D16 hydrology would exceed hosted-runner disk.
+        for field in (
+            "deposition_m",
+            "hillslope_adjustment_m",
+            "procedural_coherence",
+            "tectonic_microdetail_m",
+            "channel_incision_m",
+            "final_flow_direction_d16",
+            "final_meander_potential",
+            "major_river_constraint",
+        ):
+            local_solver._path(key, field).unlink(missing_ok=True)
+
+        for field in (
+            "filled_elevation_m",
+            "flow_direction_d8",
+            "flow_direction_d16",
+            "flow_angle_rad",
+            "meander_potential",
+            "runoff_mm_year",
+            "drainage_area_km2",
+            "discharge_index",
+            "streams",
+            "inherited_major_river",
+        ):
+            local_solver.hydrology._path(key, field).unlink(missing_ok=True)
+        local_solver.hydrology._metadata_path(key).unlink(missing_ok=True)
+
+        for field in (
+            "major_river_mask",
+            "parent_stream_order",
+            "parent_discharge_index",
+            "parent_width_proxy",
+            "constraint_strength",
+            "channel_floor_m",
+        ):
+            local_solver.rivers._path(key, field).unlink(missing_ok=True)
+        local_solver.rivers._metadata_path(key).unlink(missing_ok=True)
+
+        # Base elevation can always be re-evaluated exactly from global authority +
+        # absolute-coordinate microrelief; do not retain a second 384-tile copy.
+        pyramid._field_path(key, "elevation_m").unlink(missing_ok=True)
+        pyramid._metadata_path(key).unlink(missing_ok=True)
         return key
 
     def publish(last: TileKey | None, state: str) -> None:
