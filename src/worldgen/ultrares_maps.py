@@ -1536,6 +1536,7 @@ def reconstruct_fullview_maps(
             lambda key, field=field: _field_path(root, "climate_surface", field, key),
             mode=mode,
             dtype=dtype,
+            level=plan.base_level,
         )
 
     # Terrain render now uses slope recomputed against final eroded terrain.
@@ -1776,6 +1777,7 @@ def reconstruct_fullview_maps(
             lambda key, field=field: _field_path(root, "weather", field, key),
             mode="nearest" if field == "dominant_weather_code" else "linear",
             dtype="uint8" if field == "dominant_weather_code" else "float32",
+            level=plan.base_level,
         )
     weather_labels = {i: name.replace("_", " ") for i, name in enumerate(WEATHER_GROUPS)}
     manifest.append(
@@ -1817,6 +1819,7 @@ def reconstruct_fullview_maps(
             lambda key, field=field: _field_path(root, "resources", field, key),
             mode="nearest" if field == "dominant_resource_code" else "linear",
             dtype="uint8" if field == "dominant_resource_code" else "float32",
+            level=plan.base_level,
         )
     resource_labels = {i: name.replace("_", " / ") for i, name in enumerate(RESOURCE_GROUPS)}
     manifest.append(
