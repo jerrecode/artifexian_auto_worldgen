@@ -22,6 +22,7 @@ claiming that an arbitrary local tile has independent global boundary conditions
 
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
+import hashlib
 import json
 import math
 import os
@@ -73,6 +74,21 @@ class UltraResolutionTilePyramid(PlanetTilePyramid):
             values = np.asarray(z[name])
         self._ultra_source_cache[name] = values
         return values
+
+    def _source_hash(self) -> str:
+        """Prefer the stable semantic authority fingerprint when available."""
+        if self._source_sha256 is None and self.source_kind == "base_npz":
+            report_path = self.world_root / "ultrares" / "authority_compaction.json"
+            try:
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, OSError, json.JSONDecodeError):
+                report = {}
+            value = report.get("semantic_sha256")
+            if isinstance(value, str):
+                candidate = value.strip().lower()
+                if len(candidate) == 64 and all(ch in "0123456789abcdef" for ch in candidate):
+                    self._source_sha256 = candidate
+        return super()._source_hash()
 
 
     def _xyz_geometry(self, xyz: np.ndarray) -> TileGeometry:
@@ -365,6 +381,23 @@ ULTRARES_OPTIONAL_AUTHORITY_FIELDS = (
     "stress_field",
 )
 
+def _semantic_authority_sha256(arrays: Mapping[str, np.ndarray]) -> str:
+    """Hash authority semantics, independent of NPZ/ZIP container metadata."""
+    digest = hashlib.sha256()
+    digest.update(b"worldgen-ultrares-authority-v1\0")
+    for name in sorted(arrays):
+        values = np.ascontiguousarray(np.asarray(arrays[name]))
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(values.dtype.str.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(",".join(str(int(v)) for v in values.shape).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(memoryview(values).cast("B"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 
 def compact_world_authority(
     world_root: str | Path,
@@ -395,6 +428,8 @@ def compact_world_authority(
         )
         arrays = {name: np.asarray(z[name]) for name in selected}
 
+    semantic_sha256 = _semantic_authority_sha256(arrays)
+
     tmp = root / ".world_arrays.ultrares.npz"
     np.savez(tmp, **arrays)
     os.replace(tmp, source)
@@ -422,6 +457,8 @@ def compact_world_authority(
         "fields": list(arrays),
         "source_resolution": [int(len(arrays["lon"])), int(len(arrays["lat"]))],
         "npz_bytes": int(source.stat().st_size),
+        "semantic_sha256": semantic_sha256,
+        "fingerprint_schema": "worldgen-ultrares-authority-v1",
         "rendered_source_maps": sorted(
             path.name for path in source_maps.iterdir() if path.is_file()
         ),
