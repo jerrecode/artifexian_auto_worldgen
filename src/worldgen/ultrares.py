@@ -650,19 +650,195 @@ def _progress_path(world_root: Path) -> Path:
     return world_root / "ultrares" / "progress.json"
 
 
+ULTRARES_RESUME_FIELDS = (
+    "elevation_m",
+    "erosion_m",
+    "procedural_detail_m",
+    "final_drainage_area_km2",
+    "final_discharge_index",
+    "final_streams",
+)
+
+
+def _tile_checkpoint_path(world_root: Path, key: TileKey) -> Path:
+    return (
+        world_root
+        / "ultrares"
+        / "tile_checkpoints"
+        / f"z{key.level:02d}"
+        / key.face
+        / f"x{key.x:08d}"
+        / f"y{key.y:08d}.json"
+    )
+
+
+def _geomorph_metadata_path(pyramid: PlanetTilePyramid, key: TileKey) -> Path:
+    return (
+        pyramid.root
+        / "derived"
+        / "local_geomorphology_v1"
+        / "metadata"
+        / f"z{key.level:02d}"
+        / key.face
+        / f"x{key.x:08d}"
+        / f"y{key.y:08d}.json"
+    )
+
+
+def _select_shard_keys(
+    keys: Iterable[TileKey],
+    *,
+    shard_index: int = 0,
+    shard_count: int = 1,
+) -> tuple[TileKey, ...]:
+    count = int(shard_count)
+    index = int(shard_index)
+    if count < 1:
+        raise ValueError("shard_count must be >= 1")
+    if index < 0 or index >= count:
+        raise ValueError("shard_index must satisfy 0 <= shard_index < shard_count")
+    return tuple(key for ordinal, key in enumerate(keys) if ordinal % count == index)
+
+
+def _tile_resume_valid(
+    pyramid: PlanetTilePyramid,
+    key: TileKey,
+    geomorphology_spec: LocalGeomorphologySpec,
+    *,
+    source_sha256: str | None = None,
+    repair_marker: bool = True,
+) -> bool:
+    """Validate a retained deepest-tile solution strongly enough for safe resume.
+
+    A marker alone is never trusted.  The retained scientific arrays and the
+    local-geomorphology metadata must still exist and match the exact source hash,
+    key and geomorphology specification.  This also adopts valid tiles produced by
+    older runs that predate explicit tile checkpoint markers.
+    """
+    expected_source = source_sha256 or pyramid._source_hash()
+    expected_spec = asdict(geomorphology_spec)
+    metadata_path = _geomorph_metadata_path(pyramid, key)
+    if not metadata_path.exists():
+        return False
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if metadata.get("key") != asdict(key):
+        return False
+    if metadata.get("source_sha256") != expected_source:
+        return False
+    if metadata.get("spec") != expected_spec:
+        return False
+
+    expected_shape = (int(pyramid.spec.tile_size) + 1,) * 2
+    for field in ULTRARES_RESUME_FIELDS:
+        path = _geomorph_path(pyramid, key, field)
+        if not path.exists() or path.stat().st_size <= 0:
+            return False
+        try:
+            values = np.load(path, mmap_mode="r", allow_pickle=False)
+        except (OSError, ValueError):
+            return False
+        if tuple(values.shape) != expected_shape:
+            return False
+
+    marker_path = _tile_checkpoint_path(pyramid.world_root, key)
+    marker = {
+        "schema_version": 1,
+        "key": asdict(key),
+        "source_sha256": expected_source,
+        "geomorphology_spec": expected_spec,
+        "retained_fields": list(ULTRARES_RESUME_FIELDS),
+        "tile_size": int(pyramid.spec.tile_size),
+        "state": "complete",
+    }
+    if repair_marker:
+        try:
+            current = json.loads(marker_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            current = None
+        if current != marker:
+            _atomic_json(marker_path, marker)
+    return True
+
+
+def validate_finest_geomorphology_checkpoints(
+    pyramid: PlanetTilePyramid,
+    plan: UltraResolutionPlan,
+    geomorphology_spec: LocalGeomorphologySpec,
+) -> int:
+    """Require a complete, source/spec-matched deepest-tile authority set."""
+    source_sha256 = pyramid._source_hash()
+    missing: list[TileKey] = []
+    completed = 0
+    for key in _level_keys(plan.finest_level):
+        if _tile_resume_valid(
+            pyramid,
+            key,
+            geomorphology_spec,
+            source_sha256=source_sha256,
+            repair_marker=True,
+        ):
+            completed += 1
+        else:
+            missing.append(key)
+    if missing:
+        preview = ", ".join(
+            f"{key.face}/z{key.level}/x{key.x}/y{key.y}" for key in missing[:12]
+        )
+        suffix = "" if len(missing) <= 12 else f", ... (+{len(missing) - 12} more)"
+        raise RuntimeError(
+            f"ultra-resolution authority is incomplete: {completed}/{plan.finest_tile_count} "
+            f"tiles validated; missing/invalid: {preview}{suffix}"
+        )
+    return completed
+
+
 def generate_finest_geomorphology(
     pyramid: PlanetTilePyramid,
     plan: UltraResolutionPlan,
     geomorphology_spec: LocalGeomorphologySpec,
     *,
     workers: int = 2,
+    resume: bool = True,
+    shard_index: int = 0,
+    shard_count: int = 1,
 ) -> int:
-    """Generate every deepest terrain subsection with bounded parallelism."""
-    keys = tuple(_level_keys(plan.finest_level))
+    """Generate a deterministic shard of deepest terrain with tile-level resume."""
+    all_keys = tuple(_level_keys(plan.finest_level))
+    keys = _select_shard_keys(
+        all_keys,
+        shard_index=shard_index,
+        shard_count=shard_count,
+    )
     worker_count = max(1, int(workers))
     thread_state = local()
-    completed = 0
-    progress_path = _progress_path(pyramid.world_root)
+    source_sha256 = pyramid._source_hash()
+    resumed_keys: set[TileKey] = set()
+    if resume:
+        resumed_keys = {
+            key
+            for key in keys
+            if _tile_resume_valid(
+                pyramid,
+                key,
+                geomorphology_spec,
+                source_sha256=source_sha256,
+                repair_marker=True,
+            )
+        }
+    todo = tuple(key for key in keys if key not in resumed_keys)
+    completed = len(resumed_keys)
+    newly_completed = 0
+    progress_path = (
+        pyramid.world_root
+        / "ultrares"
+        / f"progress-shard-{int(shard_index):03d}-of-{int(shard_count):03d}.json"
+    )
+    # Preserve the historical path for the ordinary one-shard/full run.
+    if int(shard_count) == 1 and int(shard_index) == 0:
+        progress_path = _progress_path(pyramid.world_root)
     started = time.monotonic()
 
     def solver() -> LocalGeomorphologySolver:
@@ -679,9 +855,8 @@ def generate_finest_geomorphology(
         local_solver = solver()
         local_solver.solve(key)
 
-        # z3 contains 384 x 1025² tiles. Keep only fields required by the final
-        # scientific products/audit and delete reproducible scratch state per tile,
-        # otherwise temporary D16 hydrology would exceed hosted-runner disk.
+        # Keep only fields required by final scientific products/audits.  These
+        # retained fields are the durable restart authority for this tile.
         for field in (
             "deposition_m",
             "hillslope_adjustment_m",
@@ -721,53 +896,69 @@ def generate_finest_geomorphology(
         local_solver.rivers._metadata_path(key).unlink(missing_ok=True)
 
         # Base elevation can always be re-evaluated exactly from global authority +
-        # absolute-coordinate microrelief; do not retain a second 384-tile copy.
+        # absolute-coordinate microrelief; do not retain a second tile copy.
         pyramid._field_path(key, "elevation_m").unlink(missing_ok=True)
         pyramid._metadata_path(key).unlink(missing_ok=True)
+
+        if not _tile_resume_valid(
+            pyramid,
+            key,
+            geomorphology_spec,
+            source_sha256=source_sha256,
+            repair_marker=True,
+        ):
+            raise RuntimeError(f"completed tile failed restart validation: {key!r}")
         return key
 
     def publish(last: TileKey | None, state: str) -> None:
         elapsed = max(time.monotonic() - started, 0.0)
-        rate = completed / elapsed if completed > 0 and elapsed > 0.0 else 0.0
+        rate = newly_completed / elapsed if newly_completed > 0 and elapsed > 0.0 else 0.0
         remaining = max(len(keys) - completed, 0)
-        eta_seconds = remaining / rate if rate > 0.0 else None
+        eta_seconds = remaining / rate if rate > 0.0 else (0.0 if remaining == 0 else None)
         payload = {
             "state": state,
             "completed": completed,
-            "total": len(keys),
+            "newly_completed": newly_completed,
+            "resumed": len(resumed_keys),
+            "selected_total": len(keys),
+            "global_total": len(all_keys),
+            "remaining": remaining,
             "last_key": asdict(last) if last is not None else None,
             "finest_level": int(plan.finest_level),
             "tile_size": int(plan.tile_size),
+            "shard_index": int(shard_index),
+            "shard_count": int(shard_count),
+            "resume_enabled": bool(resume),
             "elapsed_seconds": elapsed,
-            "tiles_per_second": rate,
+            "new_tiles_per_second": rate,
             "eta_seconds": eta_seconds,
         }
         _atomic_json(progress_path, payload)
-        if completed > 0 or state != "running":
-            eta_text = (
-                "unknown"
-                if eta_seconds is None
-                else f"{eta_seconds / 60.0:.1f} min"
-            )
-            print(
-                "[ultrares] "
-                f"{state}: {completed}/{len(keys)} tiles "
-                f"({100.0 * completed / max(len(keys), 1):.1f}%), "
-                f"{elapsed / 60.0:.1f} min elapsed, ETA {eta_text}",
-                flush=True,
-            )
+        eta_text = "unknown" if eta_seconds is None else f"{eta_seconds / 60.0:.1f} min"
+        print(
+            "[ultrares] "
+            f"{state}: shard {int(shard_index) + 1}/{int(shard_count)}, "
+            f"{completed}/{len(keys)} selected tiles "
+            f"({100.0 * completed / max(len(keys), 1):.1f}%), "
+            f"{len(resumed_keys)} resumed, {newly_completed} new, "
+            f"{elapsed / 60.0:.1f} min elapsed, ETA {eta_text}",
+            flush=True,
+        )
 
     last_key: TileKey | None = None
     publish(None, "running")
     if worker_count == 1:
-        for key in keys:
+        for key in todo:
             last_key = run_one(key)
             completed += 1
-            if completed % 8 == 0 or completed == len(keys):
-                publish(last_key, "running")
+            newly_completed += 1
+            publish(last_key, "running")
     else:
-        iterator = iter(keys)
-        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="worldgen-ultrares") as executor:
+        iterator = iter(todo)
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="worldgen-ultrares",
+        ) as executor:
             pending: dict[Future[TileKey], TileKey] = {}
 
             def fill() -> None:
@@ -785,12 +976,11 @@ def generate_finest_geomorphology(
                     pending.pop(future)
                     last_key = future.result()
                     completed += 1
-                    if completed % 8 == 0 or completed == len(keys):
-                        publish(last_key, "running")
+                    newly_completed += 1
+                    publish(last_key, "running")
                 fill()
     publish(last_key, "complete")
     return completed
-
 
 def _geomorph_path(
     pyramid: PlanetTilePyramid, key: TileKey, field: str
@@ -1574,21 +1764,15 @@ def audit_ultra_resolution(
     return report
 
 
-def run_ultra_resolution(
+def _prepare_ultra_resolution(
     world_root: str | Path,
-    *,
-    spec: UltraResolutionSpec | None = None,
-) -> UltraResolutionReport:
-    """Execute the complete deepest-first terrain refinement/reconstruction chain."""
-    cfg = (spec or UltraResolutionSpec()).validate()
+    cfg: UltraResolutionSpec,
+) -> tuple[UltraResolutionTilePyramid, UltraResolutionPlan, LocalGeomorphologySpec]:
     root = Path(world_root).expanduser().resolve()
     pyramid = UltraResolutionTilePyramid(
         root,
         spec=TilePyramidSpec(
             tile_size=int(cfg.tile_size),
-            # This is not interpolation/noise-for-pixels: UltraResolutionTilePyramid
-            # overrides _spectral_detail with a globally continuous, tectonically
-            # conditioned physical microrelief field evaluated in absolute XYZ.
             elevation_detail_strength=float(cfg.terrain_detail_strength),
             detail_hurst_exponent=float(cfg.procedural_hurst_exponent),
             detail_harmonics=1,
@@ -1597,17 +1781,14 @@ def run_ultra_resolution(
     )
     plan = make_ultra_resolution_plan(pyramid, cfg)
     geomorph = derive_scale_aware_geomorphology_spec(pyramid, plan, cfg)
-    plan_path = root / "ultrares" / "plan.json"
     _atomic_json(
-        plan_path,
+        root / "ultrares" / "plan.json",
         {
             "plan": asdict(plan),
             "spec": asdict(cfg),
             "geomorphology_spec": asdict(geomorph),
             "semantics": {
-                "base_fullview": (
-                    "4x-linear terrain base reconstructed from deeper solved tiles"
-                ),
+                "base_fullview": "4x-linear terrain base reconstructed from deeper solved tiles",
                 "subsections": (
                     "requested >=3x subsection refinement selects the next power-of-two LOD; "
                     "for the Earth production profile this is z3, 4x finer than the 8192 base"
@@ -1617,13 +1798,71 @@ def run_ultra_resolution(
                     "frequencies before hydrology; legacy stream-power and phase-cell erosion "
                     "then operate on that refined terrain"
                 ),
+                "restart": (
+                    "deepest tiles are independently checkpointed after retained scientific "
+                    "outputs are validated against the exact source hash and geomorphology spec"
+                ),
             },
         },
     )
-    completed = generate_finest_geomorphology(
-        pyramid, plan, geomorph, workers=cfg.workers
+    return pyramid, plan, geomorph
+
+
+def run_ultra_resolution_shard(
+    world_root: str | Path,
+    *,
+    spec: UltraResolutionSpec | None = None,
+    shard_index: int = 0,
+    shard_count: int = 1,
+    resume: bool = True,
+) -> dict[str, Any]:
+    """Generate one deterministic deepest-tile shard without reconstruction."""
+    cfg = (spec or UltraResolutionSpec()).validate()
+    pyramid, plan, geomorph = _prepare_ultra_resolution(world_root, cfg)
+    selected = _select_shard_keys(
+        _level_keys(plan.finest_level),
+        shard_index=shard_index,
+        shard_count=shard_count,
     )
-    audit = audit_ultra_resolution(pyramid, plan, geomorph, cfg)
+    completed = generate_finest_geomorphology(
+        pyramid,
+        plan,
+        geomorph,
+        workers=cfg.workers,
+        resume=resume,
+        shard_index=shard_index,
+        shard_count=shard_count,
+    )
+    report = {
+        "state": "complete",
+        "shard_index": int(shard_index),
+        "shard_count": int(shard_count),
+        "selected_tiles": len(selected),
+        "completed_tiles": int(completed),
+        "global_finest_tile_count": int(plan.finest_tile_count),
+        "resume_enabled": bool(resume),
+        "plan": asdict(plan),
+    }
+    _atomic_json(
+        Path(world_root).expanduser().resolve()
+        / "ultrares"
+        / f"shard-{int(shard_index):03d}-of-{int(shard_count):03d}.json",
+        report,
+    )
+    return report
+
+
+def finalize_ultra_resolution(
+    world_root: str | Path,
+    *,
+    spec: UltraResolutionSpec | None = None,
+) -> UltraResolutionReport:
+    """Validate gathered tile checkpoints, then audit and reconstruct exactly once."""
+    cfg = (spec or UltraResolutionSpec()).validate()
+    root = Path(world_root).expanduser().resolve()
+    pyramid, plan, geomorph = _prepare_ultra_resolution(root, cfg)
+    completed = validate_finest_geomorphology_checkpoints(pyramid, plan, geomorph)
+    audit_ultra_resolution(pyramid, plan, geomorph, cfg)
     reconstruction_root = reconstruct_parent_levels(pyramid, plan)
     fullview = reconstruct_fullview(pyramid, plan, cfg)
     return UltraResolutionReport(
@@ -1635,6 +1874,22 @@ def run_ultra_resolution(
         reconstruction_root=str(reconstruction_root),
     )
 
+
+def run_ultra_resolution(
+    world_root: str | Path,
+    *,
+    spec: UltraResolutionSpec | None = None,
+) -> UltraResolutionReport:
+    """Backward-compatible all-in-one run, now restartable at completed tile granularity."""
+    cfg = (spec or UltraResolutionSpec()).validate()
+    run_ultra_resolution_shard(
+        world_root,
+        spec=cfg,
+        shard_index=0,
+        shard_count=1,
+        resume=True,
+    )
+    return finalize_ultra_resolution(world_root, spec=cfg)
 
 __all__ = [
     "ULTRARES_AUTHORITY_FIELDS",
@@ -1650,6 +1905,9 @@ __all__ = [
     "make_ultra_resolution_plan",
     "reconstruct_fullview",
     "reconstruct_parent_levels",
+    "finalize_ultra_resolution",
     "run_ultra_resolution",
+    "run_ultra_resolution_shard",
     "source_equatorial_meters_per_sample",
+    "validate_finest_geomorphology_checkpoints",
 ]
