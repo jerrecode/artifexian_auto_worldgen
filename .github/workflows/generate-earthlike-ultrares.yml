@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - terrain-fidelity-rivers-v2
+      - terrain-fidelity-rivers-v2-next
     paths:
       - '.github/workflows/generate-earthlike-ultrares.yml'
       - 'src/worldgen/ultrares.py'
