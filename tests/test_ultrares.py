@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import json
 import math
 
@@ -7,9 +8,15 @@ import numpy as np
 
 from worldgen.planet_tiles import PlanetTilePyramid, TileKey, TilePyramidSpec, tile_geometry
 from worldgen.ultrares import (
+    ULTRARES_RESUME_FIELDS,
     UltraResolutionSpec,
     UltraResolutionTilePyramid,
+    _geomorph_metadata_path,
+    _geomorph_path,
     _merge_children_downsample,
+    _select_shard_keys,
+    _tile_checkpoint_path,
+    _tile_resume_valid,
     derive_scale_aware_geomorphology_spec,
     make_ultra_resolution_plan,
 )
@@ -197,3 +204,118 @@ def test_xyz_microrelief_is_nontrivial_and_exactly_shared_across_tile_edge(tmp_p
         rtol=0.0,
         atol=1.0e-9,
     )
+
+
+
+def test_ultrares_shards_partition_keys_exactly_once():
+    keys = tuple(TileKey("px", 3, i % 8, i // 8) for i in range(37))
+    shards = [
+        _select_shard_keys(keys, shard_index=index, shard_count=7)
+        for index in range(7)
+    ]
+    flattened = [key for shard in shards for key in shard]
+
+    assert len(flattened) == len(keys)
+    assert len(set(flattened)) == len(keys)
+    assert set(flattened) == set(keys)
+    for index, shard in enumerate(shards):
+        assert shard == tuple(
+            key for ordinal, key in enumerate(keys) if ordinal % 7 == index
+        )
+
+
+def test_ultrares_resume_requires_matching_retained_authority(tmp_path):
+    _write_source(tmp_path)
+    cfg = UltraResolutionSpec(
+        base_linear_multiplier=4.0,
+        subsection_linear_multiplier=2.0,
+        tile_size=32,
+        terrain_detail_strength=1.0,
+    )
+    pyramid = UltraResolutionTilePyramid(
+        tmp_path,
+        spec=TilePyramidSpec(
+            tile_size=32,
+            elevation_detail_strength=1.0,
+            maximum_level=6,
+        ),
+    )
+    plan = make_ultra_resolution_plan(pyramid, cfg)
+    geom = derive_scale_aware_geomorphology_spec(pyramid, plan, cfg)
+    key = TileKey("px", plan.finest_level, 0, 0)
+    shape = (33, 33)
+
+    for field in ULTRARES_RESUME_FIELDS:
+        path = _geomorph_path(pyramid, key, field)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        values = (
+            np.zeros(shape, dtype=np.bool_)
+            if field == "final_streams"
+            else np.zeros(shape, dtype=np.float32)
+        )
+        np.save(path, values, allow_pickle=False)
+
+    metadata_path = _geomorph_metadata_path(pyramid, key)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "key": asdict(key),
+                "source_sha256": pyramid._source_hash(),
+                "spec": asdict(geom),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert _tile_resume_valid(pyramid, key, geom)
+    marker = _tile_checkpoint_path(tmp_path, key)
+    assert marker.exists()
+
+    _geomorph_path(pyramid, key, "erosion_m").unlink()
+    assert not _tile_resume_valid(pyramid, key, geom)
+
+
+def test_ultrares_resume_rejects_stale_spec_even_with_marker(tmp_path):
+    _write_source(tmp_path)
+    cfg = UltraResolutionSpec(
+        base_linear_multiplier=4.0,
+        subsection_linear_multiplier=2.0,
+        tile_size=32,
+        terrain_detail_strength=1.0,
+    )
+    pyramid = UltraResolutionTilePyramid(
+        tmp_path,
+        spec=TilePyramidSpec(
+            tile_size=32,
+            elevation_detail_strength=1.0,
+            maximum_level=6,
+        ),
+    )
+    plan = make_ultra_resolution_plan(pyramid, cfg)
+    geom = derive_scale_aware_geomorphology_spec(pyramid, plan, cfg)
+    key = TileKey("px", plan.finest_level, 0, 0)
+    shape = (33, 33)
+
+    for field in ULTRARES_RESUME_FIELDS:
+        path = _geomorph_path(pyramid, key, field)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(path, np.zeros(shape, dtype=np.float32), allow_pickle=False)
+
+    metadata = {
+        "schema_version": 2,
+        "key": asdict(key),
+        "source_sha256": pyramid._source_hash(),
+        "spec": asdict(geom),
+    }
+    metadata["spec"]["max_fluvial_erosion_m"] += 1.0
+    metadata_path = _geomorph_metadata_path(pyramid, key)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    marker = _tile_checkpoint_path(tmp_path, key)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"state": "complete"}), encoding="utf-8")
+
+    assert not _tile_resume_valid(pyramid, key, geom)
