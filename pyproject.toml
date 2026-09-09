@@ -38,6 +38,7 @@ thermodynamics = [
 ]
 render = [
   "Pillow>=10.4",
+  "tifffile>=2024.8",
 ]
 dev = [
   "pytest>=8.0",
