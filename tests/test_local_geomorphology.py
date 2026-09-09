@@ -5,6 +5,7 @@ import json
 import numpy as np
 
 from worldgen.local_geomorphology import (
+    LOCAL_GEOMORPHOLOGY_ALGORITHM_REVISION,
     LocalGeomorphologySolver,
     _grid_angular_moments,
 )
@@ -163,3 +164,30 @@ def test_terrain_eighth_moment_catches_balanced_axis_diagonal_grid():
     metrics = _grid_angular_moments(field)
     assert metrics["local_fourth_magnitude"] < 0.25
     assert metrics["local_eighth_magnitude"] > 0.80
+
+
+
+def test_local_geomorphology_cache_rejects_algorithm_revision_mismatch(tmp_path):
+    _write_world(tmp_path)
+    pyramid = PlanetTilePyramid(
+        tmp_path,
+        spec=TilePyramidSpec(
+            tile_size=16,
+            elevation_detail_strength=0.20,
+            maximum_level=8,
+        ),
+    )
+    # Plain PlanetTilePyramid uses the legacy sampling revision; that is still a
+    # valid explicitly-versioned cache identity for this unit test.
+    key = TileKey("px", 2, 1, 1)
+    solver = LocalGeomorphologySolver(pyramid)
+    result = solver.solve(key)
+    assert result.metadata["algorithm_revision"] == LOCAL_GEOMORPHOLOGY_ALGORITHM_REVISION
+    assert solver._load_cached(key) is not None
+
+    meta_path = solver._metadata_path(key)
+    metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    metadata["algorithm_revision"] = "obsolete-algorithm"
+    meta_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    assert solver._load_cached(key) is None
