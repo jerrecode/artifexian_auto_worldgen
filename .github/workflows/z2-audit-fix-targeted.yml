@@ -130,6 +130,15 @@ jobs:
                   "routing_candidate_metrics": meta.get(
                       "routing_candidate_metrics"
                   ),
+                  "pre_channel_routing_metrics": meta.get(
+                      "pre_channel_routing_metrics"
+                  ),
+                  "pre_channel_adaptive_meander_attempt": meta.get(
+                      "pre_channel_adaptive_meander_attempt"
+                  ),
+                  "pre_channel_routing_candidate_metrics": meta.get(
+                      "pre_channel_routing_candidate_metrics"
+                  ),
               },
           }
           out = root / "targeted-z2-fix-validation.json"
