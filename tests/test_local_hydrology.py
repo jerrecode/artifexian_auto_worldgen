@@ -624,66 +624,120 @@ def test_local_hydrology_rejects_stale_algorithm_revision(tmp_path):
 
 
 
-def test_meander_phase_evolves_along_streamwise_flow():
-    from worldgen.local_hydrology import _meander_phase
 
-    h, w = 48, 160
+
+
+def test_competitive_d16_selector_prefers_aligned_near_tie_and_stays_downhill():
+    h = w = 80
     yy, xx = np.meshgrid(
-        np.linspace(-0.025, 0.025, h),
-        np.linspace(-0.16, 0.16, w),
+        np.arange(h, dtype=np.float64),
+        np.arange(w, dtype=np.float64),
         indexing="ij",
     )
-    xyz = np.stack((xx, yy, np.ones_like(xx)), axis=-1)
+    scale = 2.0e-5
+    xyz = np.stack(
+        (
+            (xx - w / 2.0) * scale,
+            (yy - h / 2.0) * scale,
+            np.ones((h, w), dtype=np.float64),
+        ),
+        axis=-1,
+    )
     xyz /= np.linalg.norm(xyz, axis=-1, keepdims=True)
-    q = np.full((h, w), 0.88, dtype=np.float64)
 
-    # Local eastward flow: atan2(dy=0, dx=1) = 0.
-    flow = np.zeros((h, w), dtype=np.float64)
-    phase = _meander_phase(
+    # East is the true steepest direction. The D16 (dy=1, dx=2) knight move is
+    # still about 94% as steep, matching the measured production flat-reach case.
+    z = 3000.0 - 2.0 * xx - 0.20 * yy
+    ocean = np.zeros((h, w), dtype=bool)
+    receiver0, code0, max_slope = _flow_d16_open(
+        z, ocean, xyz, 1.0e6
+    )
+    centre = (h // 2, w // 2)
+    assert int(code0[centre]) == 4  # east
+
+    preferred = np.full(
+        (h, w),
+        np.arctan2(1.0, 2.0),
+        dtype=np.float64,
+    )
+    steer = np.full((h, w), 0.25, dtype=np.float64)
+    receiver, code, _ = _flow_d16_open(
+        z,
+        ocean,
         xyz,
-        6.4e6,
-        q,
-        seed=2026090707,
-        variant=2,
-        minimum_wavelength_m=12_000.0,
-        flow_angle_rad=flow,
+        1.0e6,
+        preferred_angle_rad=preferred,
+        steering_weight=steer,
+        steering_score_floor=0.018,
+        competitive_slope_fraction=0.90,
+        reference_max_slope=max_slope,
+        competitive_alignment_weight=0.96,
     )
 
-    centre = phase[h // 2]
-    assert np.isfinite(phase).all()
-    assert float(np.std(centre)) > 0.08
-    # The field must vary repeatedly downstream, not remain nearly constant
-    # along a river that happens to be orthogonal to an arbitrary global axis.
-    signs = np.signbit(centre)
-    transitions = int(np.count_nonzero(signs[1:] != signs[:-1]))
-    assert transitions >= 2
+    assert int(code[centre]) == 13  # (dy=1, dx=2)
+    flat = z.ravel()
+    active = receiver >= 0
+    sources = np.flatnonzero(active)
+    assert np.all(flat[receiver[active]] < flat[sources])
+
+    with pytest.raises(ValueError):
+        _flow_d16_open(
+            z,
+            ocean,
+            xyz,
+            1.0e6,
+            preferred_angle_rad=preferred,
+            steering_weight=steer,
+            competitive_slope_fraction=0.90,
+            reference_max_slope=None,
+        )
 
 
-def test_meander_phase_streamwise_axis_is_deterministic():
-    from worldgen.local_hydrology import _meander_phase
-
-    h = w = 36
+def test_competitive_selector_does_not_admit_materially_worse_descent():
+    h = w = 64
     yy, xx = np.meshgrid(
-        np.linspace(-0.08, 0.08, h),
-        np.linspace(-0.08, 0.08, w),
+        np.arange(h, dtype=np.float64),
+        np.arange(w, dtype=np.float64),
         indexing="ij",
     )
-    xyz = np.stack((xx, yy, np.ones_like(xx)), axis=-1)
+    scale = 2.0e-5
+    xyz = np.stack(
+        (
+            (xx - w / 2.0) * scale,
+            (yy - h / 2.0) * scale,
+            np.ones((h, w), dtype=np.float64),
+        ),
+        axis=-1,
+    )
     xyz /= np.linalg.norm(xyz, axis=-1, keepdims=True)
-    q = np.linspace(0.2, 1.0, w, dtype=np.float64)[None, :]
-    q = np.broadcast_to(q, (h, w))
-    flow = np.full((h, w), np.pi / 4.0, dtype=np.float64)
 
-    a = _meander_phase(
-        xyz, 6.4e6, q,
-        seed=77, variant=1,
-        minimum_wavelength_m=10_000.0,
-        flow_angle_rad=flow,
+    # Pure eastward slope: the preferred diagonal/knight directions are well
+    # below the 90% competitive threshold, so steering cannot override relief.
+    z = 2000.0 - 2.0 * xx
+    ocean = np.zeros((h, w), dtype=bool)
+    _r0, code0, max_slope = _flow_d16_open(
+        z, ocean, xyz, 1.0e6
     )
-    b = _meander_phase(
-        xyz, 6.4e6, q,
-        seed=77, variant=1,
-        minimum_wavelength_m=10_000.0,
-        flow_angle_rad=flow,
+    preferred = np.full(
+        (h, w),
+        np.pi / 4.0,
+        dtype=np.float64,
     )
-    np.testing.assert_array_equal(a, b)
+    receiver, code, _ = _flow_d16_open(
+        z,
+        ocean,
+        xyz,
+        1.0e6,
+        preferred_angle_rad=preferred,
+        steering_weight=np.ones((h, w), dtype=np.float64),
+        steering_score_floor=0.0,
+        competitive_slope_fraction=0.90,
+        reference_max_slope=max_slope,
+        competitive_alignment_weight=1.0,
+    )
+    centre = (h // 2, w // 2)
+    assert int(code[centre]) == int(code0[centre]) == 4
+    flat = z.ravel()
+    active = receiver >= 0
+    sources = np.flatnonzero(active)
+    assert np.all(flat[receiver[active]] < flat[sources])
