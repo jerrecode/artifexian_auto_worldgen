@@ -814,6 +814,213 @@ class LocalHydrologySolver:
         )
         return inherited >= 0.5
 
+    def _parent_discharge_patch(self, geom: TileGeometry) -> np.ndarray:
+        _shape, fields = self.pyramid._source_metadata()
+        if "discharge_index" not in fields:
+            return np.zeros(geom.latitude_deg.shape, dtype=np.float64)
+        return np.clip(
+            np.asarray(
+                self.pyramid._sample_source_field("discharge_index", geom),
+                dtype=np.float64,
+            ),
+            0.0,
+            1.0,
+        )
+
+    def _route_elevation(
+        self,
+        key: TileKey,
+        geom: TileGeometry,
+        elevation_m: np.ndarray,
+    ) -> tuple[dict[str, np.ndarray], dict[str, object], np.ndarray]:
+        cfg = self.spec
+        elevation = np.asarray(elevation_m, dtype=np.float64)
+        if elevation.shape != geom.latitude_deg.shape:
+            raise ValueError("elevation_m and tile geometry shapes differ")
+        ocean = elevation < 0.0
+        inherited_river = self._major_river_patch(geom) & ~ocean
+        guide = _major_river_guide(
+            inherited_river,
+            corridor_cells=int(cfg.major_river_corridor_cells),
+        )
+        # The low-resolution global river is a topology corridor, not a raster
+        # centreline. Lower only the routing potential within the corridor so the
+        # high-resolution network can find its own valley-conforming path.
+        routing_surface = elevation - (
+            float(cfg.major_river_guide_depth_m) * guide * (~ocean)
+        )
+        filled = _priority_flood_open(
+            routing_surface,
+            ocean,
+            epsilon_m=float(cfg.priority_flood_epsilon_m),
+        )
+
+        runoff, runoff_semantics = self._runoff_patch(geom, elevation)
+        runoff = np.asarray(runoff, dtype=np.float64)
+        runoff[ocean] = 0.0
+        area = _sample_area_km2(geom.xyz, self.pyramid.planet_radius_m)
+
+        receiver0, code0, best_slope0 = _flow_d16_open(
+            filled,
+            ocean,
+            geom.xyz,
+            self.pyramid.planet_radius_m,
+        )
+        drainage0, discharge0 = _accumulate_open(
+            filled, receiver0, runoff, area, ocean
+        )
+        local0 = _normalize_log(discharge0, ~ocean)
+        base_angle = _flow_angles(code0)
+        phase = _meander_phase(
+            geom.xyz,
+            self.pyramid.planet_radius_m,
+            local0,
+            seed=int(self.pyramid._read_seed()),
+        )
+        meander = (
+            float(cfg.meander_strength)
+            * np.power(np.clip(local0, 0.0, 1.0), float(cfg.meander_discharge_power))
+            * np.exp(
+                -np.maximum(best_slope0, 0.0)
+                / max(float(cfg.meander_slope_scale), 1.0e-12)
+            )
+            * (~ocean)
+        )
+        # Major-river corridors permit a little more lateral migration because
+        # kilometre-scale alluvial channels are not expected to occupy the exact
+        # coarse parent-raster centreline.
+        meander *= 0.82 + 0.18 * guide
+        preferred = np.where(
+            np.isfinite(base_angle),
+            base_angle
+            + np.deg2rad(float(cfg.meander_max_turn_deg)) * phase * meander,
+            0.0,
+        )
+
+        receiver, code16, _best_slope = _flow_d16_open(
+            filled,
+            ocean,
+            geom.xyz,
+            self.pyramid.planet_radius_m,
+            preferred_angle_rad=preferred,
+            steering_weight=meander,
+        )
+        drainage, discharge = _accumulate_open(
+            filled, receiver, runoff, area, ocean
+        )
+        local_discharge = _normalize_log(discharge, ~ocean)
+
+        parent_discharge = self._parent_discharge_patch(geom)
+        # Preserve continental topology as a soft discharge prior, but only where
+        # the locally routed terrain already carries water. This avoids stamping
+        # the straight low-resolution parent mask into the refined stream raster.
+        parent_support = (
+            parent_discharge
+            * guide
+            * (0.28 + 0.72 * np.sqrt(np.clip(local_discharge, 0.0, 1.0)))
+        )
+        channel_score = np.maximum(local_discharge, parent_support)
+        land_values = channel_score[~ocean]
+        if land_values.size:
+            threshold = float(np.quantile(land_values, cfg.stream_quantile))
+            streams = (~ocean) & (
+                channel_score >= max(threshold, 1.0e-12)
+            )
+        else:
+            threshold = 1.0
+            streams = np.zeros_like(ocean)
+
+        corridor = (guide >= 0.28) & (~ocean) & (parent_discharge >= 0.12)
+        if np.any(corridor):
+            routed = local_discharge[corridor]
+            if routed.size:
+                corridor_threshold = float(np.quantile(routed, 0.76))
+                streams |= corridor & (
+                    local_discharge >= max(corridor_threshold, 1.0e-12)
+                )
+
+        streams = _connect_stream_knight_moves(streams, receiver, code16)
+        code8 = _compat_d8_codes(code16)
+        angle = _flow_angles(code16)
+        metrics = _routing_metrics(
+            receiver,
+            code16,
+            streams,
+            local_discharge,
+            geom.xyz,
+            self.pyramid.planet_radius_m,
+        )
+        arrays = {
+            "filled_elevation_m": np.asarray(filled, dtype=np.float32),
+            "flow_direction_d8": np.asarray(code8, dtype=np.int8),
+            "flow_direction_d16": np.asarray(code16, dtype=np.int8),
+            "flow_angle_rad": np.asarray(angle, dtype=np.float32),
+            "meander_potential": np.asarray(meander, dtype=np.float32),
+            "runoff_mm_year": np.asarray(runoff, dtype=np.float32),
+            "drainage_area_km2": np.asarray(drainage, dtype=np.float32),
+            "discharge_index": np.asarray(local_discharge, dtype=np.float32),
+            "streams": np.asarray(streams, dtype=np.bool_),
+            "inherited_major_river": np.asarray(inherited_river, dtype=np.bool_),
+        }
+        route_meta: dict[str, object] = {
+            "runoff_semantics": runoff_semantics,
+            "stream_threshold_discharge_index": threshold,
+            "major_river_guide_cells": int(np.count_nonzero(guide > 0.05)),
+            "inherited_major_river_cells": int(np.count_nonzero(inherited_river)),
+            "local_stream_cells": int(np.count_nonzero(streams)),
+            "routing_metrics": metrics,
+            "flow_direction_semantics": {
+                "type": "D16 queen+knight direction code with low-gradient meander steering",
+                "codes": {
+                    str(i): [dy, dx] for i, (dy, dx) in enumerate(_D16)
+                },
+                "compatibility_d8_field": "flow_direction_d8",
+                "outlet": -1,
+                "strictly_downhill_receivers": True,
+                "long_move_ridge_jump_guard": True,
+                "not_global_flow_to": True,
+            },
+        }
+        return arrays, route_meta, receiver
+
+    def solve_elevation(
+        self,
+        key: TileKey,
+        elevation_m: np.ndarray,
+    ) -> LocalHydrologyResult:
+        """Route directly over a supplied final terrain tile without caching.
+
+        This second-pass API is used after geomorphic displacement so the visible
+        river network is guaranteed to conform to the final terrain rather than to
+        the pre-erosion parent surface.
+        """
+        key.validate()
+        n = int(self.pyramid.spec.tile_size)
+        elevation = np.asarray(elevation_m, dtype=np.float64)
+        if elevation.shape != (n + 1, n + 1):
+            raise ValueError(
+                f"final terrain shape must be {(n + 1, n + 1)}, got {elevation.shape}"
+            )
+        geom = tile_geometry(key, n)
+        arrays, route_meta, _receiver = self._route_elevation(
+            key, geom, elevation
+        )
+        metadata = {
+            "schema_version": 2,
+            "key": asdict(key),
+            "spec": asdict(self.spec),
+            "source_sha256": self.pyramid._source_hash(),
+            "patch_shape": [n + 1, n + 1],
+            "core_shape": [n + 1, n + 1],
+            **route_meta,
+            "boundary_semantics": (
+                "final-terrain reroute uses the tile perimeter as an open outlet; "
+                "continental topology is retained as a broad parent-river corridor"
+            ),
+            "terrain_semantics": "routing evaluated after all local terrain detail and erosion",
+        }
+        return LocalHydrologyResult(metadata=metadata, **arrays)
+
     def solve(self, key: TileKey) -> LocalHydrologyResult:
         key.validate()
         cached = self._load_cached(key)
@@ -823,72 +1030,30 @@ class LocalHydrologySolver:
         halo = int(self.spec.halo_cells)
         geom = _patch_geometry(key, n, halo)
         elevation = _resolved_elevation_patch(self.pyramid, key, geom)
-        ocean = elevation < 0.0
-        filled = _priority_flood_open(
-            elevation,
-            ocean,
-            epsilon_m=float(self.spec.priority_flood_epsilon_m),
+        arrays_patch, route_meta, _receiver = self._route_elevation(
+            key, geom, elevation
         )
-        receiver, direction = _flow_d8_open(
-            filled,
-            ocean,
-            geom.xyz,
-            self.pyramid.planet_radius_m,
-        )
-        runoff, runoff_semantics = self._runoff_patch(geom, elevation)
-        runoff[ocean] = 0.0
-        area = _sample_area_km2(geom.xyz, self.pyramid.planet_radius_m)
-        drainage, discharge = _accumulate_open(
-            filled, receiver, runoff, area, ocean
-        )
-        local_discharge = _normalize_log(discharge, ~ocean)
-        inherited_river = self._major_river_patch(geom) & ~ocean
-        land_values = local_discharge[~ocean]
-        if land_values.size:
-            threshold = float(np.quantile(land_values, self.spec.stream_quantile))
-            streams = (~ocean) & (local_discharge >= max(threshold, 1.0e-12))
-        else:
-            threshold = 1.0
-            streams = np.zeros_like(ocean)
-        streams |= inherited_river
 
         core = (slice(halo, halo + n + 1), slice(halo, halo + n + 1))
         arrays = {
-            "filled_elevation_m": np.asarray(filled[core], dtype=np.float32),
-            "flow_direction_d8": np.asarray(direction[core], dtype=np.int8),
-            "runoff_mm_year": np.asarray(runoff[core], dtype=np.float32),
-            "drainage_area_km2": np.asarray(drainage[core], dtype=np.float32),
-            "discharge_index": np.asarray(local_discharge[core], dtype=np.float32),
-            "streams": np.asarray(streams[core], dtype=np.bool_),
-            "inherited_major_river": np.asarray(inherited_river[core], dtype=np.bool_),
+            name: np.asarray(values[core], dtype=values.dtype)
+            for name, values in arrays_patch.items()
         }
         metadata = {
-            "schema_version": 1,
+            "schema_version": 2,
             "key": asdict(key),
             "spec": asdict(self.spec),
             "source_sha256": self.pyramid._source_hash(),
             "patch_shape": [int(elevation.shape[0]), int(elevation.shape[1])],
             "core_shape": [n + 1, n + 1],
-            "runoff_semantics": runoff_semantics,
-            "stream_threshold_discharge_index": threshold,
-            "inherited_major_river_cells": int(np.count_nonzero(arrays["inherited_major_river"])),
-            "local_stream_cells": int(np.count_nonzero(arrays["streams"])),
+            **route_meta,
             "boundary_semantics": (
-                "halo patch has open non-periodic perimeter; continental/global basin topology "
-                "is inherited rather than inferred from the tile"
+                "halo patch has open non-periodic perimeter; global basin topology "
+                "is a soft corridor rather than a stamped centreline"
             ),
-            "flow_direction_semantics": {
-                "type": "D8 direction code",
-                "codes": {
-                    str(i): [dy, dx] for i, (dy, dx) in enumerate(_D8)
-                },
-                "outlet": -1,
-                "not_global_flow_to": True,
-            },
             "limitations": [
                 "local stream accumulation can terminate at halo perimeter and is not a substitute for continental drainage area",
                 "cube-face-edge halos use normalized extension of the tile face parameterization and are boundary context only",
-                "terrain erosion is not applied by this diagnostic drainage solve",
             ],
         }
         for name, values in arrays.items():
