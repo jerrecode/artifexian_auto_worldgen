@@ -22,12 +22,15 @@ import tempfile
 from typing import Mapping
 
 import numpy as np
+from scipy import ndimage
 
+from .procedural_erosion import phase_cell_octave_xyz
 from .planet_tiles import (
     PlanetTilePyramid,
     TileGeometry,
     TileKey,
     _cube_direction,
+    tile_geometry,
 )
 
 
@@ -43,12 +46,59 @@ _D8 = (
 )
 
 
+_D16 = _D8 + (
+    (-2, -1),
+    (-2, 1),
+    (-1, -2),
+    (-1, 2),
+    (1, -2),
+    (1, 2),
+    (2, -1),
+    (2, 1),
+)
+
+_D16_ANGLES = np.asarray(
+    [math.atan2(float(dy), float(dx)) for dy, dx in _D16],
+    dtype=np.float64,
+)
+
+_D16_TO_D8 = np.asarray(
+    [
+        int(
+            np.argmin(
+                np.abs(
+                    np.angle(
+                        np.exp(
+                            1j
+                            * (
+                                math.atan2(float(dy), float(dx))
+                                - np.asarray(
+                                    [math.atan2(float(ddy), float(ddx)) for ddy, ddx in _D8]
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        )
+        for dy, dx in _D16
+    ],
+    dtype=np.int8,
+)
+
+
 @dataclass(slots=True, frozen=True)
 class LocalHydrologySpec:
     halo_cells: int = 16
     priority_flood_epsilon_m: float = 0.01
     stream_quantile: float = 0.985
     fallback_runoff_base_fraction: float = 0.24
+    meander_strength: float = 0.78
+    meander_max_turn_deg: float = 55.0
+    meander_slope_scale: float = 0.012
+    meander_discharge_power: float = 0.65
+    major_river_corridor_cells: int = 7
+    major_river_guide_depth_m: float = 4.0
 
     def validate(self) -> "LocalHydrologySpec":
         if not 2 <= int(self.halo_cells) <= 256:
@@ -61,6 +111,18 @@ class LocalHydrologySpec:
             raise ValueError("stream_quantile must be in [0.5, 1)")
         if not 0.0 <= float(self.fallback_runoff_base_fraction) <= 1.0:
             raise ValueError("fallback_runoff_base_fraction must be in [0, 1]")
+        if not 0.0 <= float(self.meander_strength) <= 1.0:
+            raise ValueError("meander_strength must be in [0,1]")
+        if not 0.0 <= float(self.meander_max_turn_deg) <= 80.0:
+            raise ValueError("meander_max_turn_deg must be in [0,80]")
+        if not math.isfinite(float(self.meander_slope_scale)) or self.meander_slope_scale <= 0.0:
+            raise ValueError("meander_slope_scale must be positive")
+        if not 0.0 < float(self.meander_discharge_power) <= 2.0:
+            raise ValueError("meander_discharge_power must be in (0,2]")
+        if not 1 <= int(self.major_river_corridor_cells) <= 64:
+            raise ValueError("major_river_corridor_cells must be in [1,64]")
+        if not 0.0 <= float(self.major_river_guide_depth_m) <= 50.0:
+            raise ValueError("major_river_guide_depth_m must be in [0,50]")
         return self
 
 
@@ -68,6 +130,9 @@ class LocalHydrologySpec:
 class LocalHydrologyResult:
     filled_elevation_m: np.ndarray
     flow_direction_d8: np.ndarray
+    flow_direction_d16: np.ndarray
+    flow_angle_rad: np.ndarray
+    meander_potential: np.ndarray
     runoff_mm_year: np.ndarray
     drainage_area_km2: np.ndarray
     discharge_index: np.ndarray
@@ -352,6 +417,9 @@ class LocalHydrologySolver:
         fields = {
             "filled_elevation_m": np.float32,
             "flow_direction_d8": np.int8,
+            "flow_direction_d16": np.int8,
+            "flow_angle_rad": np.float32,
+            "meander_potential": np.float32,
             "runoff_mm_year": np.float32,
             "drainage_area_km2": np.float32,
             "discharge_index": np.float32,
