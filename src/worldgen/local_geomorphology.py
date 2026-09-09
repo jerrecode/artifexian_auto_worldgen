@@ -156,6 +156,55 @@ def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
             pass
 
 
+def _fourfold_grid_moment(field: np.ndarray) -> dict[str, float]:
+    """Measure systematic 0/45/90-degree imprint relative to the tile lattice.
+
+    The complex fourth angular moment cancels physically oriented ridges across
+    differently oriented tiles but reinforces square-grid alignment.  We retain
+    the unnormalized sums so the planet-wide audit can combine tiles correctly.
+    """
+    a = np.asarray(field, dtype=np.float64)
+    if min(a.shape) > 24:
+        a = a[8:-8:3, 8:-8:3]
+    if min(a.shape) < 3:
+        return {
+            "real": 0.0,
+            "imag": 0.0,
+            "weight": 0.0,
+            "local_magnitude": 0.0,
+        }
+    gy, gx = np.gradient(a)
+    weight = np.hypot(gx, gy)
+    finite = np.isfinite(weight) & np.isfinite(gx) & np.isfinite(gy)
+    if not np.any(finite):
+        return {
+            "real": 0.0,
+            "imag": 0.0,
+            "weight": 0.0,
+            "local_magnitude": 0.0,
+        }
+    threshold = float(np.percentile(weight[finite], 45.0))
+    active = finite & (weight > max(threshold, 1.0e-12))
+    if not np.any(active):
+        return {
+            "real": 0.0,
+            "imag": 0.0,
+            "weight": 0.0,
+            "local_magnitude": 0.0,
+        }
+    angle = np.arctan2(gy[active], gx[active])
+    w = weight[active]
+    moment = np.sum(w * np.exp(4j * angle))
+    total = float(np.sum(w))
+    normalized = moment / max(total, 1.0e-30)
+    return {
+        "real": float(np.real(moment)),
+        "imag": float(np.imag(moment)),
+        "weight": total,
+        "local_magnitude": float(abs(normalized)),
+    }
+
+
 class LocalGeomorphologySolver:
     def __init__(
         self,
@@ -469,6 +518,21 @@ class LocalGeomorphologySolver:
         final_routing_metrics = dict(
             final_hydro.metadata.get("routing_metrics", {})
         )
+        grid_moment = _fourfold_grid_moment(tectonic_microdetail)
+        _final_normal, final_slope_deg, _ge, _gs = terrain_frame(
+            geom.xyz, anchored, self.pyramid.planet_radius_m
+        )
+        final_land = anchored >= 0.0
+        land_area_m2 = float(np.sum(area_m2 * final_land))
+        mountain_area_1500_m2 = float(
+            np.sum(area_m2 * final_land * (anchored >= 1500.0))
+        )
+        mountain_area_2500_m2 = float(
+            np.sum(area_m2 * final_land * (anchored >= 2500.0))
+        )
+        rugged_area_m2 = float(
+            np.sum(area_m2 * final_land * (final_slope_deg >= 10.0))
+        )
         arrays = {
             # Preserve native numerical height precision. Derived display rasters
             # may quantize explicitly, but the authoritative terrain does not.
@@ -544,6 +608,11 @@ class LocalGeomorphologySolver:
             "tectonic_microdetail_max_abs_m": float(
                 np.max(np.abs(tectonic_microdetail))
             ) if tectonic_microdetail.size else 0.0,
+            "terrain_grid_fourfold_moment": grid_moment,
+            "land_area_m2": land_area_m2,
+            "mountain_area_above_1500_m_m2": mountain_area_1500_m2,
+            "mountain_area_above_2500_m_m2": mountain_area_2500_m2,
+            "rugged_land_area_slope_ge_10deg_m2": rugged_area_m2,
             "combined_geomorphic_rms_m": float(
                 np.sqrt(np.mean(np.square(anchored - inherited_source)))
             ) if anchored.size else 0.0,
