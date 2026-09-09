@@ -58,16 +58,30 @@ def _delta(old: float | None, new: float | None, *, lower_is_better: bool) -> di
             "absolute_change": None,
             "relative_change": None,
             "improved": None,
+            "regressed": None,
+            "unchanged": None,
         }
     change = new - old
     relative = change / abs(old) if abs(old) > 1.0e-30 else None
-    improved = new < old if lower_is_better else new > old
+    scale = max(abs(old), abs(new), 1.0)
+    unchanged = abs(change) <= 1.0e-12 * scale
+    if unchanged:
+        improved = False
+        regressed = False
+    elif lower_is_better:
+        improved = new < old
+        regressed = new > old
+    else:
+        improved = new > old
+        regressed = new < old
     return {
         "old": old,
         "new": new,
         "absolute_change": change,
         "relative_change": relative,
         "improved": bool(improved),
+        "regressed": bool(regressed),
+        "unchanged": bool(unchanged),
     }
 
 
@@ -140,7 +154,7 @@ def compare(old: Mapping[str, Any], new: Mapping[str, Any]) -> dict[str, Any]:
     }
 
     comparable = [
-        item["improved"]
+        item
         for item in [*metrics.values(), *sampling.values()]
         if item["improved"] is not None
     ]
@@ -163,8 +177,9 @@ def compare(old: Mapping[str, Any], new: Mapping[str, Any]) -> dict[str, Any]:
         "metrics": metrics,
         "critical_new_checks": critical_new_checks,
         "comparable_metric_count": len(comparable),
-        "improved_metric_count": int(sum(bool(value) for value in comparable)),
-        "regressed_metric_count": int(sum(not bool(value) for value in comparable)),
+        "improved_metric_count": int(sum(bool(item["improved"]) for item in comparable)),
+        "regressed_metric_count": int(sum(bool(item["regressed"]) for item in comparable)),
+        "unchanged_metric_count": int(sum(bool(item["unchanged"]) for item in comparable)),
         "note": (
             "Individual metrics have different physical trade-offs. This comparison "
             "does not replace the new run's absolute acceptance gates or visual review."
