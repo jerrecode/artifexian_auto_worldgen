@@ -6,6 +6,7 @@ from worldgen.fingerprints import fingerprint_source_files, stage_source_files
 def test_astronomy_checkpoint_does_not_depend_on_renderer():
     files = set(stage_source_files("astronomy"))
     assert "astronomy.py" in files
+    assert "identity.py" in files
     assert "render.py" not in files
     assert "climate.py" not in files
 
