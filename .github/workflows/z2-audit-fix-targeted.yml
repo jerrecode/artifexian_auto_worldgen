@@ -17,6 +17,10 @@ permissions:
   contents: read
   actions: read
 
+concurrency:
+  group: z2-audit-fix-targeted-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   MPLBACKEND: Agg
   WORLDGEN_DISTANCE_CACHE_MB: '128'
