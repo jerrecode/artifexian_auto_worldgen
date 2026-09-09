@@ -48,26 +48,44 @@ REQUIRED_TERRAIN_CHECKS = (
 )
 
 
-def _fourfold_gradient_anisotropy(values: np.ndarray) -> dict[str, float]:
+def _gradient_angular_anisotropy(
+    values: np.ndarray,
+    *,
+    orders: tuple[int, ...] = (4, 8),
+) -> dict[str, float]:
     a = np.asarray(values, dtype=np.float64)
     if a.ndim != 2 or min(a.shape) < 3:
         raise ValueError("directional diagnostic requires a 2-D raster of at least 3x3")
     gy, gx = np.gradient(a)
     weight = np.hypot(gx, gy)
     finite = np.isfinite(weight) & np.isfinite(gx) & np.isfinite(gy)
+    result = {f"angular_moment_{order}": 0.0 for order in orders}
     if not np.any(finite):
-        return {"fourfold_anisotropy": 0.0, "gradient_weight": 0.0}
+        result["gradient_weight"] = 0.0
+        return result
     threshold = float(np.percentile(weight[finite], 55.0))
     active = finite & (weight > max(threshold, 1.0e-12))
     if not np.any(active):
-        return {"fourfold_anisotropy": 0.0, "gradient_weight": 0.0}
+        result["gradient_weight"] = 0.0
+        return result
     angle = np.arctan2(gy[active], gx[active])
     w = weight[active]
-    moment = np.sum(w * np.exp(4j * angle))
     total = float(np.sum(w))
+    for order in orders:
+        moment = np.sum(w * np.exp(1j * int(order) * angle))
+        result[f"angular_moment_{order}"] = float(
+            abs(moment) / max(total, 1.0e-30)
+        )
+    result["gradient_weight"] = total
+    return result
+
+
+def _fourfold_gradient_anisotropy(values: np.ndarray) -> dict[str, float]:
+    """Backward-compatible wrapper used by focused tests."""
+    metrics = _gradient_angular_anisotropy(values, orders=(4,))
     return {
-        "fourfold_anisotropy": float(abs(moment) / max(total, 1.0e-30)),
-        "gradient_weight": total,
+        "fourfold_anisotropy": float(metrics["angular_moment_4"]),
+        "gradient_weight": float(metrics["gradient_weight"]),
     }
 
 
@@ -288,7 +306,7 @@ def inspect_height_tiff(
             )
             stride = max(1, int(sample_stride))
             sampled = np.asarray(data[::stride, ::stride], dtype=np.float64)
-            result["sampled_directional"] = _fourfold_gradient_anisotropy(sampled)
+            result["sampled_directional"] = _gradient_angular_anisotropy(sampled)
         return result
 
 
@@ -326,7 +344,7 @@ def inspect_river_png(
         "bytes": int(path.stat().st_size),
         "dimension_contract_ok": original_size == (expected_width, expected_height),
         "diagnostic_resolution": [int(target_w), int(target_h)],
-        "render_directional": _fourfold_gradient_anisotropy(residual),
+        "render_directional": _gradient_angular_anisotropy(residual),
         "projected_internal_tile_seams": _river_tile_seam_diagnostic(
             residual,
             level=deepest_level,
