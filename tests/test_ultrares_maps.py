@@ -100,3 +100,47 @@ def test_deepest_cube_tiles_reproject_to_fullview_without_missing_pixels(tmp_pat
     }
     assert set(np.unique(out)).issubset(valid)
     assert len(np.unique(out)) >= 6
+
+
+def test_deepest_reprojection_supports_native_resolution_and_value_scaling(tmp_path: Path):
+    plan = UltraResolutionPlan(
+        source_width=4,
+        source_height=2,
+        source_equatorial_m_per_sample=100.0,
+        fullview_width=8,
+        fullview_height=4,
+        base_level=0,
+        finest_level=0,
+        base_m_per_sample=25.0,
+        finest_m_per_sample=25.0,
+        actual_base_multiplier=4.0,
+        actual_subsection_multiplier=1.0,
+        finest_tile_count=6,
+        tile_size=4,
+    )
+    for face_i, face in enumerate(CUBE_FACES):
+        path = tmp_path / face / "x0" / "y0.npy"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(path, np.full((5, 5), 1000.0 + 100.0 * face_i, dtype=np.float64))
+
+    def resolver(key: TileKey) -> Path:
+        return tmp_path / key.face / "x0" / "y0.npy"
+
+    out_path = tmp_path / "native.npy"
+    _sample_deepest_to_npy(
+        plan,
+        resolver,
+        out_path,
+        mode="nearest",
+        output_dtype="float64",
+        width=16,
+        height=8,
+        value_scale=0.001,
+        chunk_rows=2,
+    )
+    out = np.load(out_path, allow_pickle=False)
+    assert out.shape == (8, 16)
+    assert out.dtype == np.float64
+    assert np.isfinite(out).all()
+    assert float(out.min()) >= 1.0
+    assert float(out.max()) <= 1.5
