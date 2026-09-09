@@ -8,8 +8,11 @@ on:
       - '.github/workflows/resume-checkpoint-ci.yml'
       - '.github/workflows/generate-earthlike-ultrares.yml'
       - 'src/worldgen/ultrares.py'
+      - 'src/worldgen/progress_telemetry.py'
+      - 'src/worldgen/local_geomorphology.py'
       - 'scripts/run_ultrares_earth.py'
       - 'tests/test_ultrares.py'
+      - 'tests/test_progress_telemetry.py'
   pull_request:
     paths:
       - '.github/workflows/generate-earthlike-ultrares.yml'
@@ -44,8 +47,8 @@ jobs:
       - name: Compile changed Python
         run: |
           set -euxo pipefail
-          python -m py_compile src/worldgen/ultrares.py scripts/run_ultrares_earth.py tests/test_ultrares.py
+          python -m py_compile src/worldgen/ultrares.py src/worldgen/progress_telemetry.py src/worldgen/local_geomorphology.py scripts/run_ultrares_earth.py tests/test_ultrares.py tests/test_progress_telemetry.py
       - name: Run focused ultra-resolution tests
         run: |
           set -euxo pipefail
-          python -m pytest -q tests/test_ultrares.py
+          python -m pytest -q tests/test_ultrares.py tests/test_progress_telemetry.py
