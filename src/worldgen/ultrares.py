@@ -862,6 +862,14 @@ def generate_finest_geomorphology(
         total=len(keys),
         resumed=len(resumed_keys),
     )
+    telemetry.begin(
+        "processing_step",
+        "terrain_generation",
+        token="processing:terrain_generation",
+        index=2,
+        total=3,
+        meta={"selected_tiles": len(keys), "parallelism": worker_count},
+    )
     telemetry.start_heartbeat()
 
     todo = tuple(key for key in keys if key not in resumed_keys)
@@ -1096,10 +1104,15 @@ def generate_finest_geomorphology(
                     publish(last_key, "running")
                 fill()
     publish(last_key, "complete")
+    telemetry.end(
+        "processing:terrain_generation",
+        meta={"completed_tiles": completed, "selected_tiles": len(keys)},
+    )
+    finalize_started = time.monotonic()
     telemetry.observe(
         "processing_step",
         "shard_finalize",
-        0.0,
+        max(time.monotonic() - finalize_started, 0.0),
         meta={"completed_tiles": completed, "selected_tiles": len(keys)},
     )
     telemetry.close()
