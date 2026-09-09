@@ -459,3 +459,62 @@ def test_resume_rejects_pre_sampling_revision_checkpoint(tmp_path):
     )
 
     assert not _tile_resume_valid(pyramid, key, geom)
+
+
+
+def test_metric_isotropic_source_reduces_high_latitude_cube_seam_derivative(tmp_path):
+    _write_source(tmp_path)
+    source_path = tmp_path / "world_arrays.npz"
+    with np.load(source_path, allow_pickle=False) as z:
+        arrays = {name: np.asarray(z[name]) for name in z.files}
+
+    h, w = arrays["elevation_km"].shape
+    lat = np.asarray(arrays["lat"], dtype=np.float64)
+    x = np.arange(w, dtype=np.float64)
+    high_latitude = np.abs(lat) >= 70.0
+    zonal = 8.0 * np.sin(2.0 * np.pi * x / 4.0)
+    elevation = np.zeros((h, w), dtype=np.float32)
+    elevation[high_latitude, :] = zonal[None, :]
+    arrays["elevation_km"] = elevation
+    np.savez(source_path, **arrays)
+
+    raw = PlanetTilePyramid(
+        tmp_path,
+        spec=TilePyramidSpec(
+            tile_size=64,
+            elevation_detail_strength=0.0,
+            maximum_level=6,
+        ),
+    )
+    filtered = UltraResolutionTilePyramid(
+        tmp_path,
+        spec=TilePyramidSpec(
+            tile_size=64,
+            elevation_detail_strength=0.0,
+            maximum_level=6,
+        ),
+    )
+    a_key = TileKey("nz", 2, 1, 1)
+    b_key = TileKey("nz", 2, 1, 2)
+    a_geom = tile_geometry(a_key, 64)
+    b_geom = tile_geometry(b_key, 64)
+
+    raw_a = np.asarray(raw._sample_source_field("elevation_m", a_geom), dtype=np.float64)
+    raw_b = np.asarray(raw._sample_source_field("elevation_m", b_geom), dtype=np.float64)
+    filt_a = np.asarray(
+        filtered._sample_source_field("elevation_m", a_geom), dtype=np.float64
+    )
+    filt_b = np.asarray(
+        filtered._sample_source_field("elevation_m", b_geom), dtype=np.float64
+    )
+
+    np.testing.assert_allclose(raw_a[-1, :], raw_b[0, :], rtol=0.0, atol=1.0e-9)
+    np.testing.assert_allclose(filt_a[-1, :], filt_b[0, :], rtol=0.0, atol=1.0e-9)
+
+    raw_diff = (raw_a[-1, :] - raw_a[-2, :]) - (raw_b[1, :] - raw_b[0, :])
+    filt_diff = (filt_a[-1, :] - filt_a[-2, :]) - (filt_b[1, :] - filt_b[0, :])
+    raw_rms = float(np.sqrt(np.mean(np.square(raw_diff))))
+    filt_rms = float(np.sqrt(np.mean(np.square(filt_diff))))
+
+    assert raw_rms > 100.0
+    assert filt_rms < 0.35 * raw_rms
