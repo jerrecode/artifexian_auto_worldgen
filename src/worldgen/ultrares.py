@@ -2015,6 +2015,20 @@ def audit_ultra_resolution(
             "max_coarsest_procedural_wavelength_m": max_coarsest,
         },
         "checks": checks,
+        "check_measurements": {
+            "river_straight_runs_bounded": {
+                "measured_max_straight_run_cells": int(max_straight_run),
+                "maximum_allowed_cells": 220,
+            },
+            "same_face_derivative_seams_bounded": {
+                "measured_rms_m": float(seam_gradient_rms),
+                "maximum_allowed_rms_m": 80.0,
+            },
+            "same_face_tile_seams_watertight": {
+                "measured_max_abs_m": float(seam_max),
+                "maximum_allowed_abs_m": 1.0e-5,
+            },
+        },
         "all_checks_passed": bool(all(checks.values())),
         "tiles": rows,
     }
@@ -2022,8 +2036,17 @@ def audit_ultra_resolution(
     _atomic_json(out, report)
     if not report["all_checks_passed"]:
         failed = [name for name, passed in checks.items() if not passed]
+        details: list[str] = []
+        for name in failed:
+            measurement = report["check_measurements"].get(name)
+            if measurement is not None:
+                details.append(
+                    name + "=" + json.dumps(measurement, sort_keys=True)
+                )
+            else:
+                details.append(name)
         raise RuntimeError(
-            "ultra-resolution terrain audit failed: " + ", ".join(failed)
+            "ultra-resolution terrain audit failed: " + "; ".join(details)
         )
     return report
 
