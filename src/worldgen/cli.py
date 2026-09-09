@@ -10,6 +10,7 @@ from typing import Any
 
 import yaml
 
+from . import __version__
 from .config import load_config
 from .logging_utils import configure_logging
 from .progress import RecursiveProgress, StageProgress, expected_pipeline_stages
@@ -92,7 +93,7 @@ def _parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("generate", nargs="?", default="generate", help=argparse.SUPPRESS)
-    p.add_argument("--version", action="version", version="%(prog)s 0.4.0")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
     io = p.add_argument_group("configuration and output")
     io.add_argument("--config", type=Path, default=None, help="YAML configuration file")
