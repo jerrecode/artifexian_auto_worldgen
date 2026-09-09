@@ -814,6 +814,12 @@ def _routing_metrics(
             "stream_transition_count": 0,
             "stream_turn_fraction_gt10deg": 0.0,
             "max_straight_run_cells": 0,
+            "max_straight_run_direction_code": None,
+            "max_straight_run_start_flat": None,
+            "max_straight_run_end_flat": None,
+            "max_straight_run_start_yx": None,
+            "max_straight_run_end_yx": None,
+            "max_straight_run_distance_m": 0.0,
             "median_sampled_sinuosity": None,
         }
 
@@ -841,6 +847,9 @@ def _routing_metrics(
         turn_fraction = 0.0
 
     max_straight = 0
+    max_straight_start: int | None = None
+    max_straight_end: int | None = None
+    max_straight_direction: int | None = None
     for start in nodes.tolist():
         direction = int(code[start])
         cur = int(start)
@@ -858,7 +867,27 @@ def _routing_metrics(
             cur = target
             if int(code[cur]) != direction:
                 break
-        max_straight = max(max_straight, run)
+        if run > max_straight:
+            max_straight = run
+            max_straight_start = int(start)
+            max_straight_end = int(cur)
+            max_straight_direction = int(direction)
+
+    max_straight_distance_m = 0.0
+    if max_straight_start is not None and max_straight > 0:
+        cur = int(max_straight_start)
+        for _ in range(int(max_straight)):
+            target = int(receiver[cur])
+            if target < 0 or target >= stream.size:
+                break
+            max_straight_distance_m += float(
+                _great_circle_distance_m(
+                    unit[cur][None, :],
+                    unit[target][None, :],
+                    radius_m,
+                )[0]
+            )
+            cur = target
 
     candidates = nodes[np.argsort(q[nodes], kind="stable")[-min(160, len(nodes)):]]
     sinuosity: list[float] = []
@@ -904,6 +933,26 @@ def _routing_metrics(
         "stream_transition_count": transition_count,
         "stream_turn_fraction_gt10deg": turn_fraction,
         "max_straight_run_cells": int(max_straight),
+        "max_straight_run_direction_code": max_straight_direction,
+        "max_straight_run_start_flat": max_straight_start,
+        "max_straight_run_end_flat": max_straight_end,
+        "max_straight_run_start_yx": (
+            None
+            if max_straight_start is None
+            else [
+                int(max_straight_start // np.asarray(streams).shape[1]),
+                int(max_straight_start % np.asarray(streams).shape[1]),
+            ]
+        ),
+        "max_straight_run_end_yx": (
+            None
+            if max_straight_end is None
+            else [
+                int(max_straight_end // np.asarray(streams).shape[1]),
+                int(max_straight_end % np.asarray(streams).shape[1]),
+            ]
+        ),
+        "max_straight_run_distance_m": float(max_straight_distance_m),
         "median_sampled_sinuosity": (
             float(np.median(sinuosity)) if sinuosity else None
         ),
