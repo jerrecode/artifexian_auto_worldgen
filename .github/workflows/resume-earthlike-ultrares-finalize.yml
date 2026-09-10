@@ -1,0 +1,310 @@
+name: Resume Earth-like ultra-resolution finalize
+
+on:
+  push:
+    branches:
+      - terrain-fidelity-rivers-v2-next
+    paths:
+      - '.github/workflows/resume-earthlike-ultrares-finalize.yml'
+
+permissions:
+  contents: read
+  actions: read
+
+# Deliberately shares the production concurrency key. Starting this recovery
+# retires any redundant full-regeneration run on the same branch.
+concurrency:
+  group: earthlike-ultrares-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MPLBACKEND: Agg
+  WORLDGEN_DISTANCE_CACHE_MB: '128'
+  OMP_NUM_THREADS: '1'
+  OPENBLAS_NUM_THREADS: '1'
+  MKL_NUM_THREADS: '1'
+  NUMEXPR_MAX_THREADS: '1'
+  NUMBA_CACHE_DIR: ${{ github.workspace }}/.numba-cache
+  SEED: '2026090707'
+  ROOT: output/earthlike-ultrares-2026090707
+  CONFIG: validation-configs/earthlike-ultrares-2026090707.yaml
+  SOURCE_RUN_ID: '34402301815'
+
+jobs:
+  finalize-resume:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install production stack
+        run: |
+          set -euxo pipefail
+          python -m pip install --disable-pip-version-check -e '.[performance,jit,storage,thermodynamics,render]'
+          python -m pip install --disable-pip-version-check pytest
+          python -m pip check
+
+      - name: Verify renderer recovery regression
+        run: |
+          set -euxo pipefail
+          python -m py_compile scripts/render_ultrares_maps.py
+          python -m pytest -q tests/test_ultrares_maps.py tests/test_heightmap.py
+
+      - name: Restore compact source authority from completed run
+        uses: actions/download-artifact@v4
+        with:
+          name: earthlike-ultrares-source-2026090707
+          path: ${{ env.ROOT }}
+          github-token: ${{ github.token }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+
+      - name: Restore all 12 completed terrain shard authorities
+        uses: actions/download-artifact@v4
+        with:
+          pattern: earthlike-ultrares-terrain-shard-*-of-12
+          path: ${{ env.ROOT }}
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+
+      - name: Verify persisted work before resume
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -f "$ROOT/world_arrays.npz"
+          test -d "$ROOT/tiles/cubesphere_v1/derived/local_geomorphology_v1"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          root = Path(os.environ['ROOT'])
+          checkpoints = sorted((root / 'ultrares' / 'tile_checkpoints').rglob('*.json'))
+          shard_reports = sorted((root / 'ultrares').glob('shard-*.json'))
+          progress = sorted((root / 'ultrares').glob('progress-shard-*.json'))
+          print(json.dumps({
+              'source_run_id': os.environ['SOURCE_RUN_ID'],
+              'checkpoint_json_count': len(checkpoints),
+              'shard_report_count': len(shard_reports),
+              'progress_report_count': len(progress),
+              'resume_mode': 'finalize-only; no source or terrain regeneration',
+          }, indent=2))
+          if len(shard_reports) < 12:
+              raise SystemExit(f'expected >=12 shard reports, found {len(shard_reports)}')
+          PY
+
+      - name: Rebuild deterministic source profile for provenance
+        run: |
+          set -euxo pipefail
+          mkdir -p validation-configs
+          python scripts/build_ultrares_earth_config.py \
+            --base config/ultra_detail.yaml \
+            --out "$CONFIG" \
+            --seed "$SEED"
+
+      - name: Reconstruct and revalidate existing 96-tile authority
+        shell: bash
+        run: |
+          set -euxo pipefail
+          /usr/bin/time -v python scripts/run_ultrares_earth.py "$ROOT" \
+            --mode finalize \
+            --workers 2 \
+            --tile-size 1024 \
+            --base-multiplier 4 \
+            --subsection-multiplier 2 \
+            --min-samples-per-wavelength 4 \
+            --terrain-detail-strength 1.15 \
+            2>&1 | tee "$ROOT/ultrares-finalize.log"
+
+      - name: Verify exact persisted tile spec selected for rendering
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          from scripts.render_ultrares_maps import _persisted_tile_spec
+
+          root = Path(os.environ['ROOT'])
+          spec = _persisted_tile_spec(root)
+          if spec is None:
+              raise SystemExit('no persisted tile spec found after authority restore')
+          print(json.dumps({
+              'tile_size': spec.tile_size,
+              'elevation_detail_strength': spec.elevation_detail_strength,
+              'detail_hurst_exponent': spec.detail_hurst_exponent,
+              'detail_harmonics': spec.detail_harmonics,
+              'maximum_level': spec.maximum_level,
+          }, indent=2))
+          PY
+
+      - name: Enforce final ultra-resolution contract
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          import numpy as np
+          from PIL import Image
+
+          root = Path(os.environ['ROOT'])
+          audit = json.loads((root / 'ultrares' / 'terrain_detail_audit.json').read_text())
+          plan = json.loads((root / 'ultrares' / 'plan.json').read_text())['plan']
+          assert audit['all_checks_passed'], audit['checks']
+          assert plan['fullview_width'] == 8192 and plan['fullview_height'] == 4096
+          assert plan['finest_level'] == 2 and plan['finest_tile_count'] == 96
+          assert audit['sampling']['native_output_resolution'] == [16384, 8192]
+          height = root / 'ultrares' / 'fullview' / 'height_grayscale_16bit.png'
+          with Image.open(height) as im:
+              assert im.size == (8192, 4096)
+              assert im.mode in {'I;16', 'I'}
+          elev = np.load(root / 'ultrares' / 'fullview' / 'elevation_m.npy', mmap_mode='r')
+          assert elev.shape == (4096, 8192) and np.isfinite(elev).all()
+          print(json.dumps({'checks': audit['checks'], 'aggregate': audit['aggregate']}, indent=2))
+          PY
+
+      - name: Release reproducible reconstruction scratch before map rebuild
+        run: |
+          set -euxo pipefail
+          rm -rf "$ROOT/ultrares/reconstructed/erosion_m"
+          rm -rf "$ROOT/ultrares/reconstructed/procedural_detail_m"
+          rm -rf "$ROOT/ultrares/fullview"
+          df -h .
+
+      - name: Resume full-view map rebuild from persisted deepest tiles
+        shell: bash
+        run: |
+          set -euxo pipefail
+          /usr/bin/time -v python scripts/render_ultrares_maps.py "$ROOT" \
+            2>&1 | tee "$ROOT/ultrares-map-render.log"
+
+      - name: Validate resumed map suite
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import json, os, struct
+          from pathlib import Path
+          import numpy as np
+          from PIL import Image
+          import tifffile
+
+          root = Path(os.environ['ROOT'])
+          maps = root / 'ultrares' / 'fullview_maps'
+          manifest = json.loads((maps / 'map_manifest.json').read_text())
+          assert manifest['resolution'] == [8192, 4096]
+          assert manifest['deepest_tile_count'] == 96
+          rows = manifest['files']
+          assert len(rows) >= 40, len(rows)
+          names = {row['file'] for row in rows}
+          required = {
+              '00_terrain_relief.png',
+              '01_terrain_heightmap_grayscale16.png',
+              '01b_terrain_heightmap_grayscale32_native.tif',
+              '04_rivers_final_d16.png',
+              '04a_rivers_final_d16_native.png',
+              '17_biome_ecoregime_with_legend.png',
+              '19_true_color_refined.png',
+              '22_erosion_combined_legacy_procedural_delta.png',
+              '23_weather_hazards_with_legend.png',
+              '30_resources_dominant_with_legend.png',
+          }
+          assert required <= names, sorted(required - names)
+          for row in rows:
+              p = maps / row['file']
+              assert p.exists() and p.stat().st_size > 0, p
+              if p.suffix.lower() == '.png':
+                  expected = (16384, 8192) if p.name == '04a_rivers_final_d16_native.png' else (8192, 4096)
+                  with Image.open(p) as im:
+                      assert im.size == expected, (p.name, im.size, expected)
+          with tifffile.TiffFile(maps / '01b_terrain_heightmap_grayscale32_native.tif') as tif:
+              page = tif.pages[0]
+              assert tuple(page.shape) == (8192, 16384)
+              assert page.dtype == np.dtype(np.uint32)
+              assert int(page.samplesperpixel) == 1
+          print(json.dumps({'map_count': len(rows), 'files': sorted(names)}, indent=2))
+          PY
+
+      - name: Upload native 32-bit heightmap
+        uses: actions/upload-artifact@v4
+        with:
+          name: earthlike-native-height-16384x8192-u32
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            ${{ env.ROOT }}/ultrares/fullview_maps/01b_terrain_heightmap_grayscale32_native.tif
+            ${{ env.ROOT }}/ultrares/fullview_maps/01b_terrain_heightmap_grayscale32_native.json
+            ${{ env.ROOT }}/ultrares/fullview_maps/map_manifest.json
+
+      - name: Upload native final D16 river map
+        uses: actions/upload-artifact@v4
+        with:
+          name: earthlike-native-rivers-16384x8192
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            ${{ env.ROOT }}/ultrares/fullview_maps/04a_rivers_final_d16_native.png
+            ${{ env.ROOT }}/ultrares/fullview_maps/map_manifest.json
+
+      - name: Upload core full-view maps
+        uses: actions/upload-artifact@v4
+        with:
+          name: earthlike-ultrares-core-maps-8192x4096
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            ${{ env.ROOT }}/ultrares/fullview_maps/0*.png
+            ${{ env.ROOT }}/ultrares/fullview_maps/1*.png
+            ${{ env.ROOT }}/ultrares/fullview_maps/2[0-2]_*.png
+            ${{ env.ROOT }}/ultrares/fullview_maps/*.json
+            ${{ env.ROOT }}/ultrares/fullview_maps/elevation_m.npy
+
+      - name: Upload weather maps
+        uses: actions/upload-artifact@v4
+        with:
+          name: earthlike-ultrares-weather-maps-8192x4096
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            ${{ env.ROOT }}/ultrares/fullview_maps/2[3-9]_*.png
+            ${{ env.ROOT }}/ultrares/fullview_maps/map_manifest.json
+
+      - name: Upload resource maps
+        uses: actions/upload-artifact@v4
+        with:
+          name: earthlike-ultrares-resource-maps-8192x4096
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            ${{ env.ROOT }}/ultrares/fullview_maps/3*.png
+            ${{ env.ROOT }}/ultrares/fullview_maps/map_manifest.json
+
+      - name: Upload resume provenance and telemetry
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: earthlike-ultrares-resume-provenance-2026090707
+          compression-level: 6
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            ${{ env.ROOT }}/ultrares/plan.json
+            ${{ env.ROOT }}/ultrares/terrain_detail_audit.json
+            ${{ env.ROOT }}/ultrares/reconstruction.json
+            ${{ env.ROOT }}/ultrares/authority_compaction.json
+            ${{ env.ROOT }}/ultrares/tile_checkpoints/
+            ${{ env.ROOT }}/ultrares/telemetry/
+            ${{ env.ROOT }}/ultrares/shard-*.json
+            ${{ env.ROOT }}/ultrares-finalize.log
+            ${{ env.ROOT }}/ultrares-map-render.log
+            ${{ env.ROOT }}/source_scientific_audit.json
+            ${{ env.ROOT }}/source_optics_audit.json
+            ${{ env.ROOT }}/world.json
+            ${{ env.CONFIG }}
